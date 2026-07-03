@@ -249,6 +249,175 @@ func TestCodeImportGraphifySyncsGraphAndWikiWhenStoreConfigured(t *testing.T) {
 	}
 }
 
+func TestQueueAndRunQueueEndpointsUseDefaultProject(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	sourcePath := filepath.Join(t.TempDir(), "source.md")
+	if err := os.WriteFile(sourcePath, []byte("# Queue Source\n\nToken validation calls AuthService."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServerWithOptions(ServerOptions{DefaultProjectPath: root, DefaultAgent: "mock"})
+	body, _ := json.Marshal(map[string]string{
+		"source_path": sourcePath,
+		"title":       "Queue Source",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/sources/queue", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+	server.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("queue status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	req = httptest.NewRequest(http.MethodGet, "/queue/tasks", nil)
+	rr = httptest.NewRecorder()
+	server.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), "pending") {
+		t.Fatalf("tasks status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	runBody, _ := json.Marshal(map[string]any{
+		"agent":     "mock",
+		"keep_done": true,
+	})
+	req = httptest.NewRequest(http.MethodPost, "/queue/run", bytes.NewReader(runBody))
+	rr = httptest.NewRecorder()
+	server.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("run status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"processed":1`) || !strings.Contains(rr.Body.String(), `"done":1`) {
+		t.Fatalf("unexpected run body=%s", rr.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "wiki", "sources", "queue-source.md")); err != nil {
+		t.Fatalf("expected queue source wiki page: %v", err)
+	}
+}
+
+func TestValidateWikiEndpointRunsLLMCompilerFlow(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	sourcePath := filepath.Join(t.TempDir(), "source.md")
+	if err := os.WriteFile(sourcePath, []byte("# Validate Source\n\nAlpha mentions Beta."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]string{
+		"project_path": root,
+		"source_path":  sourcePath,
+		"title":        "Validate Source",
+		"agent":        "mock",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/wiki/validate", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+	NewServer().ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !strings.Contains(rr.Body.String(), `"SourceCount":1`) {
+		t.Fatalf("unexpected body=%s", rr.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, "wiki", "sources", "validate-source.md")); err != nil {
+		t.Fatalf("expected validate source wiki page: %v", err)
+	}
+}
+
+func TestPostQueryUsesJSONAndDefaultProject(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "wiki", "sources"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "wiki", "sources", "oauth.md"), []byte(`---
+type: "source-summary"
+title: "OAuth Notes"
+---
+
+# OAuth Notes
+
+Token validation calls AuthService.
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := &recordingWikiStore{}
+	agent := fakeAPIQueryAgent{
+		plan: core.QueryPlan{
+			Question:       "token auth",
+			Intent:         "answer_from_persistent_wiki",
+			ReadFirst:      []string{"wiki/sources/oauth.md"},
+			CandidateLimit: 3,
+			AnswerMode:     "llm_synthesis",
+			CanWriteBack:   true,
+		},
+	}
+	body, _ := json.Marshal(map[string]any{
+		"q":          "token auth",
+		"project_id": "project-1",
+		"save_title": "Token Auth",
+	})
+	req := httptest.NewRequest(http.MethodPost, "/query", bytes.NewReader(body))
+	rr := httptest.NewRecorder()
+	NewServerWithOptions(ServerOptions{DefaultProjectPath: root, WikiPageStore: store, QueryAgent: agent}).ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	if !hasWikiPage(store.pages, "wiki/syntheses/token-auth.md") {
+		t.Fatalf("expected JSON query writeback sync, pages=%+v", store.pages)
+	}
+}
+
+func TestReviewEndpointsListAndResolve(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	reviewsPath := filepath.Join(root, "wiki", "reviews.md")
+	if err := os.MkdirAll(filepath.Dir(reviewsPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := `# Reviews
+
+## [2026-07-02] missing-page | Alpha
+
+- Source: ` + "`raw/sources/a.md`" + `
+- Status: open
+
+### Affected Pages
+
+- ` + "`wiki/sources/a.md`" + `
+### Detail
+
+Create Alpha.
+`
+	if err := os.WriteFile(reviewsPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServerWithOptions(ServerOptions{DefaultProjectPath: root, DefaultProjectID: "project-1"})
+	req := httptest.NewRequest(http.MethodGet, "/reviews?status=open", nil)
+	rr := httptest.NewRecorder()
+	server.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK || !strings.Contains(rr.Body.String(), `"count":1`) {
+		t.Fatalf("reviews status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	items := wiki.ParseReviewItems("project-1", content)
+	body, _ := json.Marshal(map[string]string{
+		"id":     items[0].ID,
+		"status": "resolved",
+	})
+	req = httptest.NewRequest(http.MethodPost, "/reviews/resolve", bytes.NewReader(body))
+	rr = httptest.NewRecorder()
+	server.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("resolve status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	updated, err := os.ReadFile(reviewsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(updated), "- Status: resolved") {
+		t.Fatalf("review not resolved:\n%s", updated)
+	}
+}
+
 type recordingWikiStore struct {
 	pages                 []core.WikiPage
 	sources               []core.Source

@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/hejw/knowledge-core/internal/config"
 )
 
 type OpenAICompatibleEmbeddingProvider struct {
@@ -22,12 +24,12 @@ func (p OpenAICompatibleEmbeddingProvider) EmbeddingModel() string {
 }
 
 func NewEnvEmbeddingProvider() (EmbeddingProvider, bool, error) {
-	apiKey := firstEnv("KB_CORE_EMBEDDING_API_KEY", "OPENAI_API_KEY", "KB_CORE_LLM_API_KEY")
-	model := firstEnv("KB_CORE_EMBEDDING_MODEL", "OPENAI_EMBEDDING_MODEL")
+	apiKey := config.Value("KB_CORE_EMBEDDING_API_KEY", "OPENAI_API_KEY", "KB_CORE_LLM_API_KEY")
+	model := config.Value("KB_CORE_EMBEDDING_MODEL", "OPENAI_EMBEDDING_MODEL")
 	if apiKey == "" || model == "" {
 		return nil, false, nil
 	}
-	baseURL := firstEnv("KB_CORE_EMBEDDING_BASE_URL", "OPENAI_BASE_URL", "KB_CORE_LLM_BASE_URL")
+	baseURL := config.Value("KB_CORE_EMBEDDING_BASE_URL", "OPENAI_BASE_URL", "KB_CORE_LLM_BASE_URL")
 	if baseURL == "" {
 		baseURL = "https://api.openai.com/v1"
 	}

@@ -4,11 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
 	"strings"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
+	"github.com/hejw/knowledge-core/internal/config"
 	"github.com/hejw/knowledge-core/internal/core"
 	"github.com/hejw/knowledge-core/internal/postgres"
 )
@@ -44,7 +44,7 @@ func envOrValue(value, envKey string) string {
 	if strings.TrimSpace(value) != "" {
 		return value
 	}
-	return strings.TrimSpace(os.Getenv(envKey))
+	return config.Value(envKey)
 }
 
 func requireProjectID(projectID string) (string, error) {

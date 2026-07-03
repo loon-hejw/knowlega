@@ -5,9 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"os"
 	"strings"
 	"time"
+
+	"github.com/hejw/knowledge-core/internal/config"
 )
 
 type OpenAICompatibleProvider struct {
@@ -18,12 +19,12 @@ type OpenAICompatibleProvider struct {
 }
 
 func NewEnvProvider() (Provider, bool, error) {
-	apiKey := firstEnv("KB_CORE_LLM_API_KEY", "OPENAI_API_KEY")
-	model := firstEnv("KB_CORE_LLM_MODEL", "OPENAI_MODEL")
+	apiKey := config.Value("KB_CORE_LLM_API_KEY", "OPENAI_API_KEY")
+	model := config.Value("KB_CORE_LLM_MODEL", "OPENAI_MODEL")
 	if apiKey == "" || model == "" {
 		return nil, false, nil
 	}
-	baseURL := firstEnv("KB_CORE_LLM_BASE_URL", "OPENAI_BASE_URL")
+	baseURL := config.Value("KB_CORE_LLM_BASE_URL", "OPENAI_BASE_URL")
 	if baseURL == "" {
 		baseURL = "https://api.openai.com/v1"
 	}
@@ -175,13 +176,4 @@ type chatCompletionResponse struct {
 	Error struct {
 		Message string `json:"message"`
 	} `json:"error"`
-}
-
-func firstEnv(keys ...string) string {
-	for _, key := range keys {
-		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
-			return value
-		}
-	}
-	return ""
 }

@@ -1,0 +1,48 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Backend: kbcore serve (LLM)",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/kbcore",
+      "args": [
+        "serve",
+        "--addr",
+        "127.0.0.1:19829",
+        "--project",
+        "${input:projectPath}",
+        "--agent",
+        "llm"
+      ],
+      "envFile": "${workspaceFolder}/.env.local",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Frontend: Vite Web",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npm run dev -- --host 127.0.0.1",
+      "cwd": "${workspaceFolder}/web"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Full Stack: LLM + Web",
+      "configurations": [
+        "Backend: kbcore serve (LLM)",
+        "Frontend: Vite Web"
+      ],
+      "stopAll": true
+    }
+  ],
+  "inputs": [
+    {
+      "id": "projectPath",
+      "type": "promptString",
+      "description": "Knowledge Core project path",
+      "default": "/tmp/demo-kb"
+    }
+  ]
+}

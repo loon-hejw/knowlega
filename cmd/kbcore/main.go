@@ -244,10 +244,17 @@ func compilerQueueValidator(provider compiler.Provider) service.IngestQueueValid
 func runServe(args []string) error {
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	addr := fs.String("addr", "127.0.0.1:19829", "listen address")
+	project := fs.String("project", "", "default project path for API requests")
+	agentName := fs.String("agent", "auto", "default agent for service operations: auto, mock, llm")
+	worker := fs.Bool("worker", false, "run background source scan and ingest queue worker")
+	scanInterval := fs.Duration("scan-interval", 30*time.Second, "background worker scan interval")
 	dbDSN := fs.String("db-dsn", "", "PostgreSQL DSN for graph evidence; defaults to KB_CORE_DB_DSN")
 	projectIDFlag := fs.String("project-id", "", "default PostgreSQL project id; defaults to KB_CORE_PROJECT_ID")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *worker && strings.TrimSpace(*project) == "" {
+		return fmt.Errorf("serve --worker requires --project")
 	}
 	ctx := context.Background()
 	dbHandle, err := openDBStore(ctx, envOrValue(*dbDSN, "KB_CORE_DB_DSN"))
@@ -275,13 +282,84 @@ func runServe(args []string) error {
 			embeddingProvider = envEmbedding
 		}
 	}
+	projectID := envOrValue(*projectIDFlag, "KB_CORE_PROJECT_ID")
+	if *worker {
+		provider, err := ingestProvider(*agentName)
+		if err != nil {
+			return err
+		}
+		go runServeWorker(ctx, serveWorkerOptions{
+			ProjectPath:   *project,
+			ProjectID:     projectID,
+			Provider:      provider,
+			Interval:      *scanInterval,
+			SkipUnchanged: true,
+			DBDSN:         envOrValue(*dbDSN, "KB_CORE_DB_DSN"),
+		})
+	}
 	server := &http.Server{
-		Addr:              *addr,
-		Handler:           api.NewServerWithOptions(api.ServerOptions{SearchStore: searchStore, GraphStore: graphStore, CodeGraphStore: codeGraphStore, WikiPageStore: wikiPageStore, QueryLogStore: queryLogStore, EmbeddingProvider: embeddingProvider, DefaultProjectID: envOrValue(*projectIDFlag, "KB_CORE_PROJECT_ID")}),
+		Addr: *addr,
+		Handler: api.NewServerWithOptions(api.ServerOptions{
+			SearchStore:        searchStore,
+			GraphStore:         graphStore,
+			CodeGraphStore:     codeGraphStore,
+			WikiPageStore:      wikiPageStore,
+			QueryLogStore:      queryLogStore,
+			EmbeddingProvider:  embeddingProvider,
+			DefaultProjectPath: *project,
+			DefaultProjectID:   projectID,
+			DefaultAgent:       *agentName,
+		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	fmt.Println("serving", *addr)
 	return server.ListenAndServe()
+}
+
+type serveWorkerOptions struct {
+	ProjectPath   string
+	ProjectID     string
+	Provider      compiler.Provider
+	Interval      time.Duration
+	SkipUnchanged bool
+	DBDSN         string
+}
+
+func runServeWorker(ctx context.Context, opts serveWorkerOptions) {
+	if opts.Interval <= 0 {
+		opts.Interval = 30 * time.Second
+	}
+	run := func() {
+		if _, err := service.ScanRawSources(service.QueueIngestOptions{ProjectPath: opts.ProjectPath}); err != nil {
+			fmt.Fprintln(os.Stderr, "worker scan error:", err)
+			return
+		}
+		result, err := service.RunIngestQueue(service.RunIngestQueueOptions{
+			ProjectPath:   opts.ProjectPath,
+			Validator:     compilerQueueValidator(opts.Provider),
+			SkipUnchanged: opts.SkipUnchanged,
+		})
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "worker queue error:", err)
+			return
+		}
+		if result.Processed > 0 {
+			if err := syncWrittenWikiPages(ctx, opts.ProjectPath, opts.DBDSN, opts.ProjectID, []string{"wiki/index.md", "wiki/log.md", "wiki/overview.md", "wiki/reviews.md"}); err != nil {
+				fmt.Fprintln(os.Stderr, "worker sync error:", err)
+			}
+		}
+	}
+	run()
+	ticker := time.NewTicker(opts.Interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			run()
+		}
+	}
 }
 
 func runInit(args []string) error {
@@ -837,6 +915,6 @@ Commands:
   resolve-review --project PATH --id ID [--status resolved|dismissed|open]
   code-import-graphify --project PATH --repo-path PATH --graph graph.json [--repo-id ID] [--report GRAPH_REPORT.md] [--db-dsn DSN --project-id ID]
   migrate-sql
-  serve [--addr 127.0.0.1:19829] [--db-dsn DSN --project-id ID]
+  serve [--addr 127.0.0.1:19829] [--project PATH] [--agent auto|mock|llm] [--worker --scan-interval 30s] [--db-dsn DSN --project-id ID]
 `)
 }

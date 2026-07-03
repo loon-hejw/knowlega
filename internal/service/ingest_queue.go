@@ -74,18 +74,18 @@ type QueueValidateResult struct {
 type IngestQueueValidator func(QueueValidateOptions) (QueueValidateResult, error)
 
 type RunIngestQueueResult struct {
-	Processed int
-	Done      int
-	Failed    int
-	Skipped   int
-	Files     int
-	Tasks     []IngestTask
+	Processed int          `json:"processed"`
+	Done      int          `json:"done"`
+	Failed    int          `json:"failed"`
+	Skipped   int          `json:"skipped"`
+	Files     int          `json:"files"`
+	Tasks     []IngestTask `json:"tasks"`
 }
 
 type ScanSourcesResult struct {
-	Queued  int
-	Skipped int
-	Tasks   []IngestTask
+	Queued  int          `json:"queued"`
+	Skipped int          `json:"skipped"`
+	Tasks   []IngestTask `json:"tasks"`
 }
 
 func QueueIngestSource(opts QueueIngestOptions) (IngestTask, error) {

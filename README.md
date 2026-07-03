@@ -57,6 +57,11 @@ When generated wiki pages are overwritten, the previous page is archived under
   synced into PostgreSQL by the existing wiki sync path.
 - `kbcore code-import-graphify`: import a graphify `graph.json`/report snapshot
   and compile a code overview page.
+- `kbcore serve`: run the same knowledge core as a local HTTP JSON service.
+  The service exposes project init, ingest queue, LLM Wiki validate, query
+  writeback, review tasks, wiki review, PG sync, lint, and code graph import
+  endpoints. Pass `--project` for a default wiki project and `--worker` to
+  periodically scan `raw/sources/` and consume the ingest queue.
 - `kbcore migrate-sql`: print the PostgreSQL bootstrap schema.
 
 The PostgreSQL repository layer is designed around `database/sql` so the driver
@@ -189,6 +194,67 @@ go run ./cmd/kbcore lint --project /tmp/demo-kb
 bash scripts/verify-llmwiki-llm.sh
 ```
 
+## Service Mode
+
+Start a local API server:
+
+```bash
+go run ./cmd/kbcore serve --addr 127.0.0.1:19829 --project /tmp/demo-kb --agent llm
+```
+
+Add `--worker --scan-interval 30s` only when the service should continuously
+scan `raw/sources/` and process queued files. Without `--worker`, writes happen
+only through explicit API calls.
+
+Common service calls:
+
+```bash
+curl -sS http://127.0.0.1:19829/health
+
+curl -sS -X POST http://127.0.0.1:19829/sources/queue \
+  -H 'Content-Type: application/json' \
+  -d '{"source_path":"/path/to/new-file.md","title":"New File"}'
+
+curl -sS -X POST http://127.0.0.1:19829/queue/run \
+  -H 'Content-Type: application/json' \
+  -d '{"agent":"llm","skip_unchanged":true}'
+
+curl -sS -X POST http://127.0.0.1:19829/query \
+  -H 'Content-Type: application/json' \
+  -d '{"q":"女儿国 唐僧 八戒","agent":"llm","save_title":"女儿国 synthesis"}'
+
+curl -sS 'http://127.0.0.1:19829/reviews?status=open'
+```
+
+The service is local-first and has no built-in authentication. Keep the default
+loopback binding or put it behind an authenticated reverse proxy before exposing
+it on a network.
+
+## Web UI
+
+The `web/` app is a Vite + React + TypeScript frontend using Ant Design. It
+talks to `kbcore serve` through the Vite `/api` proxy during development.
+
+```bash
+go run ./cmd/kbcore serve --addr 127.0.0.1:19829 --project /tmp/demo-kb --agent llm
+
+cd web
+npm install
+npm run dev
+```
+
+Open the Vite URL and set the project path, project id, and agent in Settings.
+The UI supports health checks, queueing sources, scanning `raw/sources/`, running
+the ingest queue, querying with optional synthesis writeback, resolving review
+items, linting, LLM wiki review, validate flow, and PostgreSQL sync.
+
+Production build:
+
+```bash
+cd web
+npm run build
+```
+
 `scripts/verify-xiyouji.sh` is the local deterministic validation path for the
 split `tst/xiyouji-chapters` corpus. It creates a temporary project, runs mock
 LLM Wiki ingest over all 100 chapter files, checks the expected `sources=100`,
@@ -214,16 +280,32 @@ go run ./cmd/kbcore query --project /tmp/demo-kb --project-id "$KB_CORE_PROJECT_
 To run ingest/query with a real OpenAI-compatible LLM planner/synthesizer:
 
 ```bash
-export KB_CORE_LLM_BASE_URL=https://api.openai.com/v1
-export KB_CORE_LLM_API_KEY=...
-export KB_CORE_LLM_MODEL=...
-export KB_CORE_EMBEDDING_MODEL=text-embedding-3-small
+cp .env.local.example .env.local
+$EDITOR .env.local
 go run ./cmd/kbcore validate-llmwiki --project /tmp/demo-kb --source ./tst/xiyouji-chapters/chapter-054.txt --agent llm
 go run ./cmd/kbcore query --project /tmp/demo-kb --q "女儿国 唐僧 八戒" --agent llm
 go run ./cmd/kbcore query --project /tmp/demo-kb --q "女儿国 唐僧 八戒" --agent llm --save-title "女儿国 synthesis"
 go run ./cmd/kbcore lint --project /tmp/demo-kb --agent llm
 go run ./cmd/kbcore review-wiki --project /tmp/demo-kb --agent llm
 ```
+
+LLM, embedding, and PostgreSQL settings can live in `.env.local`, `kbcore.env`,
+or `.kbcore/config.env` in the current working directory. Set `KB_CORE_CONFIG`
+to point at a different config file. Shell environment variables still take
+precedence over file values.
+
+For the internal modelgate setup, `.env.local` can contain:
+
+```dotenv
+KB_CORE_LLM_BASE_URL=https://modelgate.bhidi.com/v1
+KB_CORE_LLM_API_KEY=replace-with-your-key
+KB_CORE_LLM_MODEL=Qwen3.6-27B-FP8
+KB_CORE_EMBEDDING_MODEL=
+```
+
+VS Code users can run the checked-in `Full Stack: LLM + Web` compound launch.
+It starts `kbcore serve --agent llm` on `127.0.0.1:19829` and the Vite frontend
+on `127.0.0.1:5177`, using `.env.local` for local secrets.
 
 Without those variables, `--agent auto` uses the offline mock/fallback agents.
 Those are useful for tests, but they are not the final LLM Wiki behavior and

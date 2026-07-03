@@ -67,6 +67,11 @@ ingest should use an LLM provider whenever credentials are available:
 3. Validation: frontmatter, paths, source provenance, wikilinks.
 4. Merge: update existing pages without destroying prior evidence.
 
+Local runtime settings are read from environment variables first, then from
+`.env.local`, `kbcore.env`, or `.kbcore/config.env` in the current working
+directory. `KB_CORE_CONFIG=/path/to/file.env` can point at a different file.
+Do not commit real API keys.
+
 For small end-to-end LLM acceptance, use `scripts/verify-llmwiki-llm.sh`. It
 creates three fixed source files, runs `validate-llmwiki --agent llm`, checks
 generated pages, links, `wiki/overview.md`, `wiki/reviews.md`, deterministic
@@ -182,6 +187,15 @@ Borrow these behaviors:
   source provenance into PG before returning success. Code graph imports should
   also sync graph facts and the generated code overview page before returning
   success.
+- Service mode is the primary integration surface for applications. Keep HTTP
+  handlers thin and reuse the same compiler/service/wiki functions as CLI
+  commands. Do not create separate service-only persistence formats.
+- `serve --worker` may scan `raw/sources/` and consume the ingest queue, but it
+  must stay opt-in so starting the service does not unexpectedly spend LLM
+  tokens.
+- The `web/` frontend is a Vite + React + TypeScript + Ant Design application.
+  Keep it as an API client over `kbcore serve`; do not duplicate LLM Wiki
+  compile, query, review, or persistence logic in the browser.
 - Wiki page sync should run inside `WithWikiPageStoreTx` when the backing store
   supports it, so page rows and embedding metadata do not partially commit on
   sync errors. The remaining production extension is making these PG sync
