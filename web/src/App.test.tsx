@@ -26,6 +26,7 @@ const activeStatus = {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  window.history.replaceState({}, "", "/");
 });
 
 describe("application startup", () => {
@@ -38,25 +39,25 @@ describe("application startup", () => {
   it("loads and selects the configured active project", async () => {
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => responseFor(input)));
     render(<App />);
+    expect(await screen.findByRole("heading", { name: "继续你的研究" })).toBeInTheDocument();
+    expect(screen.getByText("知识库可用")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /管理/ }));
     expect((await screen.findAllByText("/private/tmp/kbcore-xiyouji-wiki")).length).toBeGreaterThan(0);
-    expect(screen.queryByText("未选择项目")).not.toBeInTheDocument();
   });
 
-  it("exposes the wiki, sources, graph, reviews, chat, and settings workspaces", async () => {
+  it("exposes separate browse and admin workspaces", async () => {
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => responseFor(input)));
     render(<App />);
-    await screen.findByText("LLM Wiki Workspace");
-    for (const [menu, title] of [
-      ["Wiki", "Wiki 工作台"],
-      ["来源", "来源与队列"],
-      ["图谱与研究", "图谱与研究"],
-      ["审核", "审核"],
-      ["Chat", "Chat"],
-      ["设置", "设置"],
-    ]) {
-      fireEvent.click(screen.getByRole("menuitem", { name: new RegExp(`${menu}$`) }));
-      expect(await screen.findByRole("heading", { name: title })).toBeInTheDocument();
+    await screen.findByRole("heading", { name: "继续你的研究" });
+    for (const menu of ["搜索与提问", "Wiki 知识库", "主题与实体", "系统与代码", "知识集合", "知识图谱"]) {
+      expect(screen.getByRole("menuitem", { name: new RegExp(`${menu}$`) })).toBeInTheDocument();
     }
+    fireEvent.click(screen.getByRole("button", { name: /管理/ }));
+    for (const menu of ["统一来源库", "Wiki 治理", "代码仓库", "审阅中心", "任务中心", "质量治理", "系统诊断"]) {
+      expect(await screen.findByRole("menuitem", { name: new RegExp(`${menu}$`) })).toBeInTheDocument();
+    }
+    fireEvent.click(screen.getByRole("menuitem", { name: /任务中心$/ }));
+    expect(await screen.findByRole("heading", { name: "任务中心", level: 2 })).toBeInTheDocument();
   });
 
   it("shows background bootstrap source and stage progress", async () => {
@@ -102,7 +103,7 @@ describe("application startup", () => {
     expect(await screen.findByText("无法加载活动项目")).toBeInTheDocument();
     expect(screen.getByText("backend unavailable")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: /重试/ }));
-    await waitFor(() => expect(screen.getAllByText("/private/tmp/kbcore-xiyouji-wiki").length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getByRole("heading", { name: "继续你的研究" })).toBeInTheDocument());
   });
 });
 

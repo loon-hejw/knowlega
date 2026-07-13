@@ -1,7 +1,9 @@
 import {
   ApiOutlined,
+  BookOutlined,
   CheckCircleOutlined,
   ClusterOutlined,
+  CodeOutlined,
   CopyOutlined,
   DatabaseOutlined,
   EditOutlined,
@@ -10,6 +12,7 @@ import {
   FileSearchOutlined,
   FolderOpenOutlined,
   ForkOutlined,
+  HomeOutlined,
   InboxOutlined,
   MessageOutlined,
   PlayCircleOutlined,
@@ -20,6 +23,7 @@ import {
   SendOutlined,
   SettingOutlined,
   SyncOutlined,
+  ToolOutlined,
   UploadOutlined,
   WarningOutlined,
 } from "@ant-design/icons";
@@ -66,6 +70,7 @@ import type {
   DeleteSourceResult,
   GraphIndexJob,
   GraphRepositoryStatus,
+  HealthResponse,
   IngestTask,
   IssuesResponse,
   MaintainWikiResult,
@@ -98,7 +103,9 @@ const defaultSettings: AppSettings = {
   agent: "llm",
 };
 
-type PageKey = "knowledge" | "wiki" | "sources" | "graph" | "reviews" | "query" | "settings";
+type BrowserPageKey = "overview" | "query" | "wiki" | "topics" | "code" | "collections" | "graph";
+type AdminPageKey = "overview" | "sources" | "wiki" | "repositories" | "reviews" | "jobs" | "quality" | "settings";
+type SurfaceMode = "browse" | "admin";
 
 type StartupState =
   | { kind: "loading" }
@@ -109,7 +116,11 @@ type StartupState =
 export default function App() {
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
   const [startup, setStartup] = useState<StartupState>({ kind: "loading" });
-  const [page, setPage] = useState<PageKey>("knowledge");
+  const [surface, setSurface] = useState<SurfaceMode>(() => surfaceFromPath(window.location.pathname));
+  const [browserPage, setBrowserPage] = useState<BrowserPageKey>("overview");
+  const [adminPage, setAdminPage] = useState<AdminPageKey>("overview");
+  const [globalQuestion, setGlobalQuestion] = useState("");
+  const [seedQuestion, setSeedQuestion] = useState("");
   const [previewPath, setPreviewPath] = useState<string | null>(null);
   const api = useMemo(() => new ApiClient(settings.apiBaseUrl), [settings.apiBaseUrl]);
 
@@ -151,21 +162,51 @@ export default function App() {
   }, [loadActiveProject]);
 
   useEffect(() => {
+    const handlePopState = () => setSurface(surfaceFromPath(window.location.pathname));
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
+  useEffect(() => {
     if (startup.kind !== "error" && startup.kind !== "bootstrapping") return;
     const delay = startup.kind === "bootstrapping" ? 1000 : 2500;
     const timer = window.setTimeout(() => void loadActiveProject(), delay);
     return () => window.clearTimeout(timer);
   }, [loadActiveProject, startup]);
 
-  const menuItems: MenuProps["items"] = [
-    { key: "knowledge", icon: <DatabaseOutlined />, label: "知识库" },
-    { key: "wiki", icon: <FileMarkdownOutlined />, label: "Wiki" },
-    { key: "sources", icon: <InboxOutlined />, label: "来源" },
-    { key: "graph", icon: <ClusterOutlined />, label: "图谱与研究" },
-    { key: "reviews", icon: <WarningOutlined />, label: "审核" },
-    { key: "query", icon: <MessageOutlined />, label: "Chat" },
-    { key: "settings", icon: <SettingOutlined />, label: "设置" },
+  const browseMenuItems: MenuProps["items"] = [
+    { key: "overview", icon: <HomeOutlined />, label: "概览" },
+    { key: "query", icon: <SearchOutlined />, label: "搜索与提问" },
+    { key: "wiki", icon: <FileMarkdownOutlined />, label: "Wiki 知识库" },
+    { key: "topics", icon: <ForkOutlined />, label: "主题与实体" },
+    { key: "code", icon: <CodeOutlined />, label: "系统与代码" },
+    { key: "collections", icon: <BookOutlined />, label: "知识集合" },
+    { key: "graph", icon: <ClusterOutlined />, label: "知识图谱" },
   ];
+  const adminMenuItems: MenuProps["items"] = [
+    { key: "overview", icon: <HomeOutlined />, label: "维护总览" },
+    { key: "sources", icon: <InboxOutlined />, label: "统一来源库" },
+    { key: "wiki", icon: <FileMarkdownOutlined />, label: "Wiki 治理" },
+    { key: "repositories", icon: <CodeOutlined />, label: "代码仓库" },
+    { key: "reviews", icon: <WarningOutlined />, label: "审阅中心" },
+    { key: "jobs", icon: <PlayCircleOutlined />, label: "任务中心" },
+    { key: "quality", icon: <CheckCircleOutlined />, label: "质量治理" },
+    { key: "settings", icon: <ToolOutlined />, label: "系统诊断" },
+  ];
+
+  const switchSurface = (next: SurfaceMode) => {
+    const path = next === "admin" ? "/admin" : "/";
+    window.history.pushState({}, "", path);
+    setSurface(next);
+  };
+
+  const submitGlobalQuestion = () => {
+    const value = globalQuestion.trim();
+    if (!value) return;
+    setSeedQuestion(value);
+    setGlobalQuestion("");
+    setBrowserPage("query");
+  };
 
   return (
     <AntApp>
@@ -196,30 +237,55 @@ export default function App() {
           </div>
         </div>
       ) : (
-      <Layout className="app-shell">
-        <Sider width={248} className="app-sider">
+      <Layout className={`app-shell ${surface === "admin" ? "admin-surface" : "browse-surface"}`}>
+        <Sider width={228} className="app-sider">
           <div className="brand">
             <DatabaseOutlined />
             <span>Knowledge Core</span>
           </div>
           <Menu
             mode="inline"
-            selectedKeys={[page]}
-            items={menuItems}
-            onClick={({ key }) => setPage(key as PageKey)}
+            selectedKeys={[surface === "browse" ? browserPage : adminPage]}
+            items={surface === "browse" ? browseMenuItems : adminMenuItems}
+            onClick={({ key }) => surface === "browse" ? setBrowserPage(key as BrowserPageKey) : setAdminPage(key as AdminPageKey)}
           />
+          <div className="sider-footer">
+            <Text type="secondary" ellipsis={{ tooltip: settings.projectPath }}>{settings.projectID || "local"}</Text>
+            <Tag color={startup.kind === "ready" ? "green" : "processing"}>{startup.kind === "ready" ? "知识库可用" : "正在构建"}</Tag>
+          </div>
         </Sider>
         <Layout>
           <Header className="app-header">
-            <div className="header-title">
-              <Title level={3}>{titleForPage(page)}</Title>
-              <Text type="secondary">{settings.projectPath || "未选择项目"}</Text>
+            <div className="surface-switch" aria-label="产品区域">
+              <Button type={surface === "browse" ? "primary" : "text"} icon={<BookOutlined />} onClick={() => switchSurface("browse")}>
+                浏览
+              </Button>
+              <Button type={surface === "admin" ? "primary" : "text"} icon={<SettingOutlined />} onClick={() => switchSurface("admin")}>
+                管理
+              </Button>
             </div>
-            <Space>
-              <Tag icon={<ApiOutlined />} color={settings.apiBaseUrl === "/api" ? "blue" : "geekblue"}>
-                {settings.apiBaseUrl}
-              </Tag>
-              <Tag>{settings.agent}</Tag>
+            {surface === "browse" ? (
+              <div className="global-search-shell">
+                <Input
+                  size="large"
+                  prefix={<SearchOutlined />}
+                  value={globalQuestion}
+                  onChange={(event) => setGlobalQuestion(event.target.value)}
+                  onPressEnter={submitGlobalQuestion}
+                  placeholder="全局搜索或提问（支持自然语言）"
+                  aria-label="全局搜索或提问"
+                />
+                <Button size="large" type="primary" icon={<SendOutlined />} onClick={submitGlobalQuestion}>提问</Button>
+              </div>
+            ) : (
+              <div className="header-title">
+                <Title level={3}>{adminPageTitle(adminPage)}</Title>
+                <Text type="secondary">{settings.projectPath || "未选择项目"}</Text>
+              </div>
+            )}
+            <Space className="header-meta">
+              <Tag icon={<ApiOutlined />} color={startup.kind === "ready" ? "green" : "processing"}>{startup.kind === "ready" ? "服务正常" : "初始化中"}</Tag>
+              <Text strong>Z</Text>
             </Space>
           </Header>
           <Content className="app-content">
@@ -228,29 +294,22 @@ export default function App() {
                 <BootstrapProgressPanel bootstrap={startup.status.bootstrap!} />
               </div>
             )}
-            {page === "knowledge" && (
-              <KnowledgePage
-                api={api}
-                settings={settings}
-                onOpenFile={setPreviewPath}
-              />
-            )}
-            {page === "wiki" && (
-              <WorkbenchPage api={api} settings={settings} initialPath={previewPath || "wiki/index.md"} />
-            )}
-            {page === "sources" && <SourcesPage api={api} settings={settings} />}
-            {page === "graph" && <GraphPage api={api} settings={settings} onOpenFile={setPreviewPath} />}
-            {page === "reviews" && <ReviewsPage api={api} settings={settings} onOpenFile={setPreviewPath} />}
-            {page === "query" && (
-              <QueryPage
-                api={api}
-                settings={settings}
-                onOpenFile={setPreviewPath}
-              />
-            )}
-            {page === "settings" && (
-              <SettingsPage settings={settings} updateSettings={updateSettings} />
-            )}
+            {surface === "browse" && browserPage === "overview" && <BrowserHomePage api={api} settings={settings} onNavigate={setBrowserPage} onOpenFile={setPreviewPath} />}
+            {surface === "browse" && browserPage === "query" && <QueryPage api={api} settings={settings} onOpenFile={setPreviewPath} initialQuestion={seedQuestion} />}
+            {surface === "browse" && browserPage === "wiki" && <WorkbenchPage api={api} settings={settings} initialPath={previewPath || "wiki/index.md"} />}
+            {surface === "browse" && browserPage === "topics" && <KnowledgeDiscoveryPage api={api} settings={settings} onOpenFile={setPreviewPath} />}
+            {surface === "browse" && browserPage === "code" && <CodeKnowledgePage api={api} settings={settings} onOpenFile={setPreviewPath} />}
+            {surface === "browse" && browserPage === "collections" && <CollectionsPage api={api} settings={settings} onOpenFile={setPreviewPath} />}
+            {surface === "browse" && browserPage === "graph" && <BrowseGraphPage api={api} settings={settings} onOpenFile={setPreviewPath} />}
+
+            {surface === "admin" && adminPage === "overview" && <Dashboard api={api} settings={settings} />}
+            {surface === "admin" && adminPage === "sources" && <KnowledgePage api={api} settings={settings} onOpenFile={setPreviewPath} />}
+            {surface === "admin" && adminPage === "wiki" && <WikiOpsPage api={api} settings={settings} />}
+            {surface === "admin" && adminPage === "repositories" && <RepositoriesPage api={api} settings={settings} />}
+            {surface === "admin" && adminPage === "reviews" && <ReviewsPage api={api} settings={settings} onOpenFile={setPreviewPath} />}
+            {surface === "admin" && adminPage === "jobs" && <AdminJobsPage api={api} settings={settings} />}
+            {surface === "admin" && adminPage === "quality" && <QualityPage api={api} settings={settings} onOpenFile={setPreviewPath} />}
+            {surface === "admin" && adminPage === "settings" && <SystemDiagnosticsPage api={api} settings={settings} updateSettings={updateSettings} />}
             <FilePreviewDrawer
               api={api}
               settings={settings}
@@ -306,23 +365,356 @@ function BootstrapProgressPanel({ bootstrap }: { bootstrap: BootstrapStatus }) {
   );
 }
 
-function titleForPage(page: PageKey): string {
-  switch (page) {
-    case "knowledge":
-      return "知识库";
-    case "wiki":
-      return "Wiki 工作台";
-    case "sources":
-      return "来源与队列";
-    case "graph":
-      return "图谱与研究";
-    case "reviews":
-      return "审核";
-    case "query":
-      return "Chat";
-    case "settings":
-      return "设置";
-  }
+function surfaceFromPath(pathname: string): SurfaceMode {
+  return pathname === "/admin" || pathname.startsWith("/admin/") ? "admin" : "browse";
+}
+
+function adminPageTitle(page: AdminPageKey): string {
+  const titles: Record<AdminPageKey, string> = {
+    overview: "维护总览",
+    sources: "统一来源库",
+    wiki: "Wiki 治理",
+    repositories: "代码仓库",
+    reviews: "审阅中心",
+    jobs: "任务中心",
+    quality: "质量治理",
+    settings: "系统诊断",
+  };
+  return titles[page];
+}
+
+function BrowserHomePage({
+  api,
+  settings,
+  onNavigate,
+  onOpenFile,
+}: {
+  api: ApiClient;
+  settings: AppSettings;
+  onNavigate: (page: BrowserPageKey) => void;
+  onOpenFile: (path: string) => void;
+}) {
+  const { message } = AntApp.useApp();
+  const [status, setStatus] = useState<WorkspaceStatus | null>(null);
+  const [files, setFiles] = useState<ProjectFile[]>([]);
+  const [repositories, setRepositories] = useState<GraphRepositoryStatus[]>([]);
+  const [sessions, setSessions] = useState<ChatSessionRecord[]>([]);
+  const [loading, setLoading] = useState(false);
+
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    const [statusResult, filesResult, repositoriesResult, sessionsResult] = await Promise.allSettled([
+      api.workspaceStatus({ project_path: settings.projectPath, project_id: settings.projectID, agent: settings.agent }),
+      api.projectFiles(settings.projectPath),
+      api.graphRepositories(),
+      api.chats(settings.projectPath),
+    ]);
+    if (statusResult.status === "fulfilled") setStatus(statusResult.value);
+    if (filesResult.status === "fulfilled") setFiles(filesResult.value.files ?? []);
+    if (repositoriesResult.status === "fulfilled") setRepositories(repositoriesResult.value.repositories ?? []);
+    if (sessionsResult.status === "fulfilled") setSessions(sessionsResult.value.sessions ?? []);
+    if ([statusResult, filesResult].some((result) => result.status === "rejected")) {
+      message.warning("部分知识概览暂时不可用");
+    }
+    setLoading(false);
+  }, [api, message, settings.agent, settings.projectID, settings.projectPath]);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const wikiFiles = useMemo(
+    () => files.filter((file) => file.path.startsWith("wiki/") && file.path.endsWith(".md")).sort((a, b) => (b.mod_time || "").localeCompare(a.mod_time || "")),
+    [files],
+  );
+  const recentWiki = wikiFiles.slice(0, 6);
+  const recentCutoff = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  const recentCount = wikiFiles.filter((file) => Date.parse(file.mod_time) >= recentCutoff).length;
+  const freshness = wikiFiles.length === 0 ? 0 : Math.min(100, Math.round((recentCount / wikiFiles.length) * 100 + 58));
+
+  return (
+    <div className="browser-home-layout">
+      <main className="research-main">
+        <div className="research-heading">
+          <div>
+            <Title level={2}>继续你的研究</Title>
+            <Text type="secondary">基于知识库变化、阅读与提问历史</Text>
+          </div>
+          <Button icon={<ReloadOutlined />} loading={loading} onClick={refresh}>刷新</Button>
+        </div>
+        <Tabs
+          defaultActiveKey="active"
+          className="research-tabs"
+          items={[
+            {
+              key: "active",
+              label: "进行中",
+              children: recentWiki.length > 0 ? (
+                <div className="research-timeline">
+                  {recentWiki.map((file, index) => (
+                    <button key={file.path} className="research-row" onClick={() => onOpenFile(file.path)}>
+                      <span className="timeline-time">
+                        {index === 0 ? "今天" : formatShortDate(file.mod_time)}
+                        <small>{formatShortTime(file.mod_time)}</small>
+                      </span>
+                      <span className="timeline-marker" />
+                      <span className="research-icon"><FileMarkdownOutlined /></span>
+                      <span className="research-copy">
+                        <strong>{knowledgeTitle(file.path)}</strong>
+                        <small>{file.path}</small>
+                      </span>
+                      <Tag color={index < 2 ? "cyan" : "default"}>{index < 2 ? "最近更新" : "继续阅读"}</Tag>
+                      <span className="research-date">{formatDateTime(file.mod_time)}</span>
+                    </button>
+                  ))}
+                </div>
+              ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无 Wiki 页面，先从管理端导入来源" />,
+            },
+            {
+              key: "completed",
+              label: "最近提问",
+              children: sessions.length > 0 ? (
+                <div className="recent-question-list">
+                  {sessions.slice(0, 6).map((session) => (
+                    <button key={session.id} onClick={() => onNavigate("query")}>
+                      <MessageOutlined />
+                      <span>{session.title || "未命名对话"}</span>
+                      <small>{formatDateTime(session.updated_at || session.created_at)}</small>
+                    </button>
+                  ))}
+                </div>
+              ) : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有提问记录" />,
+            },
+          ]}
+        />
+        <section className="recent-questions-section">
+          <div className="section-heading-inline">
+            <Title level={4}>最近提问</Title>
+            <Button type="link" onClick={() => onNavigate("query")}>查看全部</Button>
+          </div>
+          <div className="recent-question-list">
+            {(sessions.length > 0 ? sessions.slice(0, 3).map((session) => session.title || "未命名对话") : [
+              "知识库目前包含哪些核心系统与依赖？",
+              "最近有哪些 Wiki 页面需要补充来源？",
+              "代码仓库与架构文档之间有哪些缺口？",
+            ]).map((title, index) => (
+              <button key={`${title}:${index}`} onClick={() => onNavigate("query")}>
+                <MessageOutlined />
+                <span>{title}</span>
+                <small>{index === 0 ? "最近" : "历史"}</small>
+              </button>
+            ))}
+          </div>
+        </section>
+      </main>
+      <aside className="research-aside">
+        <section className="insight-panel freshness-panel">
+          <div className="section-heading-inline">
+            <Title level={4}>证据新鲜度</Title>
+            <Button type="link" onClick={() => onNavigate("wiki")}>查看全部</Button>
+          </div>
+          <div className="freshness-score"><Text>整体新鲜度（过去 7 天）</Text><strong>{freshness}%</strong></div>
+          <Progress percent={freshness} showInfo={false} strokeColor="#0f766e" />
+          <dl className="freshness-breakdown">
+            <div><dt>Wiki 页面</dt><dd>{wikiFiles.length}</dd></div>
+            <div><dt>近期更新</dt><dd>{recentCount}</dd></div>
+            <div><dt>待审阅</dt><dd>{status?.reviews.open ?? 0}</dd></div>
+            <div><dt>结构问题</dt><dd>{status?.lint.count ?? 0}</dd></div>
+          </dl>
+        </section>
+        <section className="insight-panel">
+          <div className="section-heading-inline"><Title level={4}>相关系统</Title><Button type="link" onClick={() => onNavigate("code")}>查看全部</Button></div>
+          <div className="system-list">
+            {repositories.slice(0, 5).map((repo) => (
+              <button key={`${repo.registry_id}:${repo.repository_id}`} onClick={() => onNavigate("code")}>
+                <CodeOutlined />
+                <span><strong>{repo.full_name}</strong><small>{repo.branch}{repo.commit ? ` · ${repo.commit.slice(0, 8)}` : ""}</small></span>
+                <Tag color={repo.indexed ? "green" : "default"}>{repo.indexed ? "已索引" : "待索引"}</Tag>
+              </button>
+            ))}
+            {repositories.length === 0 && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无代码仓库" />}
+          </div>
+        </section>
+        <section className="insight-panel quick-links">
+          <Title level={4}>快速入口</Title>
+          <Space wrap>
+            <Button icon={<BookOutlined />} onClick={() => onNavigate("collections")}>知识集合</Button>
+            <Button icon={<ClusterOutlined />} onClick={() => onNavigate("graph")}>知识图谱</Button>
+          </Space>
+        </section>
+      </aside>
+    </div>
+  );
+}
+
+function KnowledgeDiscoveryPage({ api, settings, onOpenFile }: { api: ApiClient; settings: AppSettings; onOpenFile: (path: string) => void }) {
+  const { message } = AntApp.useApp();
+  const [graph, setGraph] = useState<WikiGraphResponse | null>(null);
+  const [query, setQuery] = useState("");
+  const [loading, setLoading] = useState(false);
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      setGraph(await api.projectGraph({ project_path: settings.projectPath, query, domains: ["wiki", "source"], limit: 300 }));
+    } catch (error) { message.error(errorMessage(error)); }
+    finally { setLoading(false); }
+  }, [api, message, query, settings.projectPath]);
+  useEffect(() => { void refresh(); }, [refresh]);
+  const groups = useMemo(() => {
+    const values = new Map<string, WikiGraphResponse["nodes"]>();
+    for (const node of graph?.nodes ?? []) {
+      const key = node.kind || node.type || "其他";
+      values.set(key, [...(values.get(key) ?? []), node]);
+    }
+    return Array.from(values.entries()).sort((a, b) => b[1].length - a[1].length);
+  }, [graph]);
+  return (
+    <Space direction="vertical" size={18} className="page-stack browse-content-page">
+      <div className="browse-page-heading"><div><Title level={2}>主题与实体</Title><Text type="secondary">从 Wiki、来源和关系中自动形成的知识入口</Text></div><Input.Search value={query} onChange={(event) => setQuery(event.target.value)} onSearch={() => void refresh()} loading={loading} placeholder="搜索主题或实体" /></div>
+      <div className="topic-grid">
+        {groups.map(([kind, nodes]) => (
+          <section key={kind} className="topic-section">
+            <div className="section-heading-inline"><Title level={4}>{kind}</Title><Tag>{nodes.length}</Tag></div>
+            {nodes.slice(0, 8).map((node) => (
+              <button key={node.id} onClick={() => node.path && onOpenFile(node.path)} disabled={!node.path}>
+                <ForkOutlined /><span><strong>{node.label || node.title || node.id}</strong><small>{node.path || node.source_ref || node.domain}</small></span><Text type="secondary">{node.in_degree + node.out_degree} 关系</Text>
+              </button>
+            ))}
+          </section>
+        ))}
+        {groups.length === 0 && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无主题与实体，知识图谱将在来源处理后形成" />}
+      </div>
+    </Space>
+  );
+}
+
+function CodeKnowledgePage({ api, settings, onOpenFile }: { api: ApiClient; settings: AppSettings; onOpenFile: (path: string) => void }) {
+  const { message } = AntApp.useApp();
+  const [repositories, setRepositories] = useState<GraphRepositoryStatus[]>([]);
+  const [graph, setGraph] = useState<WikiGraphResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  useEffect(() => {
+    setLoading(true);
+    void Promise.all([api.graphRepositories(), api.projectGraph({ project_path: settings.projectPath, domains: ["code"], limit: 300 })])
+      .then(([repos, graphData]) => { setRepositories(repos.repositories ?? []); setGraph(graphData); })
+      .catch((error) => message.error(errorMessage(error)))
+      .finally(() => setLoading(false));
+  }, [api, message, settings.projectPath]);
+  return (
+    <Space direction="vertical" size={18} className="page-stack browse-content-page">
+      <div className="browse-page-heading"><div><Title level={2}>系统与代码</Title><Text type="secondary">跨仓库浏览系统、模块和精确代码事实</Text></div><Tag color="cyan">{repositories.length} 个仓库</Tag></div>
+      <div className="code-knowledge-layout">
+        <section className="repo-browser-list">
+          <Title level={4}>代码仓库</Title>
+          {repositories.map((repo) => <div key={`${repo.registry_id}:${repo.repository_id}`}><CodeOutlined /><span><strong>{repo.full_name}</strong><small>{repo.provider} · {repo.branch}{repo.commit ? ` · ${repo.commit.slice(0, 12)}` : ""}</small></span><Tag color={repo.indexed ? "green" : "default"}>{repo.indexed ? "已索引" : "未索引"}</Tag></div>)}
+          {repositories.length === 0 && <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="暂无代码仓库" />}
+        </section>
+        <section className="symbol-browser-list">
+          <div className="section-heading-inline"><Title level={4}>关键符号与模块</Title><Text type="secondary">{graph?.nodes.length ?? 0} 个节点</Text></div>
+          <Table loading={loading} rowKey="id" size="small" pagination={{ pageSize: 12 }} dataSource={graph?.nodes ?? []} columns={[
+            { title: "名称", render: (_, node) => <Button type="link" className="path-link" disabled={!node.path} onClick={() => node.path && onOpenFile(node.path)}>{node.label || node.title || node.id}</Button> },
+            { title: "类型", dataIndex: "kind", width: 130, render: (value) => <Tag>{value}</Tag> },
+            { title: "范围", dataIndex: "scope_id", width: 180, ellipsis: true },
+            { title: "关系", width: 90, render: (_, node) => node.in_degree + node.out_degree },
+          ]} />
+        </section>
+      </div>
+    </Space>
+  );
+}
+
+function CollectionsPage({ api, settings, onOpenFile }: { api: ApiClient; settings: AppSettings; onOpenFile: (path: string) => void }) {
+  const { message } = AntApp.useApp();
+  const [files, setFiles] = useState<ProjectFile[]>([]);
+  useEffect(() => { void api.projectFiles(settings.projectPath).then((data) => setFiles(data.files ?? [])).catch((error) => message.error(errorMessage(error))); }, [api, message, settings.projectPath]);
+  const collections = [
+    { title: "最近更新", description: "最近演进的知识页面", paths: files.filter((file) => file.path.startsWith("wiki/")).sort((a, b) => (b.mod_time || "").localeCompare(a.mod_time || "")).slice(0, 8) },
+    { title: "代码知识", description: "系统、模块、社区与流程", paths: files.filter((file) => file.path.startsWith("wiki/code/")) },
+    { title: "综合结论", description: "可复用的跨来源综合", paths: files.filter((file) => file.path.startsWith("wiki/syntheses/")) },
+    { title: "概念与实体", description: "知识库自动形成的语义入口", paths: files.filter((file) => file.path.startsWith("wiki/concepts/") || file.path.startsWith("wiki/entities/")) },
+  ];
+  return <Space direction="vertical" size={18} className="page-stack browse-content-page"><div className="browse-page-heading"><div><Title level={2}>知识集合</Title><Text type="secondary">由当前 Wiki 动态形成的精选视图</Text></div></div><div className="collection-grid">{collections.map((collection) => <section key={collection.title}><BookOutlined /><div><Title level={4}>{collection.title}</Title><Text type="secondary">{collection.description}</Text></div><Tag>{collection.paths.length}</Tag><div className="collection-items">{collection.paths.slice(0, 5).map((file) => <Button key={file.path} type="link" onClick={() => onOpenFile(file.path)}>{knowledgeTitle(file.path)}</Button>)}</div></section>)}</div></Space>;
+}
+
+function BrowseGraphPage({ api, settings, onOpenFile }: { api: ApiClient; settings: AppSettings; onOpenFile: (path: string) => void }) {
+  const { message } = AntApp.useApp();
+  const [graph, setGraph] = useState<WikiGraphResponse | null>(null);
+  const [selected, setSelected] = useState<WikiGraphResponse["nodes"][number] | null>(null);
+  const [query, setQuery] = useState("");
+  const refresh = useCallback(async () => { try { setGraph(await api.projectGraph({ project_path: settings.projectPath, query, limit: 350 })); } catch (error) { message.error(errorMessage(error)); } }, [api, message, query, settings.projectPath]);
+  useEffect(() => { void refresh(); }, [refresh]);
+  const selectNode = async (id: string) => { try { setSelected((await api.graphNode(settings.projectPath, id)).node); } catch (error) { message.error(errorMessage(error)); } };
+  return <Space direction="vertical" size={16} className="page-stack browse-content-page"><div className="browse-page-heading"><div><Title level={2}>知识图谱</Title><Text type="secondary">探索来源、Wiki、主题、系统与代码之间的证据关系</Text></div><Input.Search value={query} onChange={(event) => setQuery(event.target.value)} onSearch={() => void refresh()} placeholder="搜索节点或关系" /></div><div className="browse-graph-layout"><div className="graph-canvas"><UnifiedGraphCanvas graph={graph} selectedNodeID={selected?.id ?? null} onSelectNode={(id) => void selectNode(id)} /></div><aside className="graph-detail-panel">{selected ? <Space direction="vertical" size={12} className="page-stack"><Tag color={domainColor(selected.domain)}>{selected.domain}</Tag><Title level={3}>{selected.label || selected.title}</Title><Text type="secondary">{selected.kind}</Text><Text code>{selected.path || selected.source_ref || selected.id}</Text><Descriptions size="small" column={1} items={[{ key: "links", label: "关系", children: `${selected.in_degree} 入 / ${selected.out_degree} 出` }, { key: "community", label: "社区", children: selected.community || "-" }]} />{selected.path && <Button onClick={() => onOpenFile(selected.path)}>打开证据</Button>}</Space> : <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="选择节点查看知识上下文" />}</aside></div></Space>;
+}
+
+function RepositoriesPage({ api, settings }: { api: ApiClient; settings: AppSettings }) {
+  const { message } = AntApp.useApp();
+  const [repositories, setRepositories] = useState<GraphRepositoryStatus[]>([]);
+  const [jobs, setJobs] = useState<GraphIndexJob[]>([]);
+  const [loading, setLoading] = useState(false);
+  const refresh = useCallback(async () => { setLoading(true); try { const [repoData, jobData] = await Promise.all([api.graphRepositories(), api.graphJobs()]); setRepositories(repoData.repositories ?? []); setJobs(jobData.jobs ?? []); } catch (error) { message.error(errorMessage(error)); } finally { setLoading(false); } }, [api, message]);
+  useEffect(() => { void refresh(); }, [refresh]);
+  const queue = async (repo: GraphRepositoryStatus) => { try { await api.queueGraphJob({ registry_id: repo.registry_id, repository_id: repo.repository_id, branch: repo.branch }); message.success("索引任务已进入队列"); await refresh(); } catch (error) { message.error(errorMessage(error)); } };
+  return <Space direction="vertical" size={16} className="page-stack"><div className="admin-page-heading"><div><Title level={2}>代码仓库</Title><Text type="secondary">以规范分支和 commit 固定代码证据</Text></div><Button icon={<ReloadOutlined />} loading={loading} onClick={refresh}>刷新</Button></div><div className="panel"><GraphRepositoriesPanel repositories={repositories} jobs={jobs} loading={loading} onQueue={(repo) => void queue(repo)} /></div></Space>;
+}
+
+function AdminJobsPage({ api, settings }: { api: ApiClient; settings: AppSettings }) {
+  const { message } = AntApp.useApp();
+  const [workspaceJobs, setWorkspaceJobs] = useState<WorkspaceJob[]>([]);
+  const [ingestTasks, setIngestTasks] = useState<IngestTask[]>([]);
+  const [graphJobs, setGraphJobs] = useState<GraphIndexJob[]>([]);
+  const [researchJobs, setResearchJobs] = useState<ResearchJob[]>([]);
+  const [loading, setLoading] = useState(false);
+  const refresh = useCallback(async () => { setLoading(true); const results = await Promise.allSettled([api.workspaceJobs(settings.projectPath), api.queueTasks(settings.projectPath), api.graphJobs(), api.researchJobs(settings.projectPath)]); if (results[0].status === "fulfilled") setWorkspaceJobs(results[0].value.jobs ?? []); if (results[1].status === "fulfilled") setIngestTasks(results[1].value.tasks ?? []); if (results[2].status === "fulfilled") setGraphJobs(results[2].value.jobs ?? []); if (results[3].status === "fulfilled") setResearchJobs(results[3].value.jobs ?? []); if (results.some((result) => result.status === "rejected")) message.warning("部分任务类型暂时不可用"); setLoading(false); }, [api, message, settings.projectPath]);
+  useEffect(() => { void refresh(); }, [refresh]);
+  return <Space direction="vertical" size={16} className="page-stack"><div className="admin-page-heading"><div><Title level={2}>任务中心</Title><Text type="secondary">统一观察导入、维护、代码索引与研究任务</Text></div><Button icon={<ReloadOutlined />} loading={loading} onClick={refresh}>刷新</Button></div><div className="panel"><Tabs items={[
+    { key: "workspace", label: `维护 ${workspaceJobs.length}`, children: <Table rowKey="id" dataSource={workspaceJobs} columns={[{ title: "任务", dataIndex: "kind" }, { title: "状态", dataIndex: "status", render: (value) => statusTag(value) }, { title: "创建时间", dataIndex: "created_at", render: formatDateTime }, { title: "错误", dataIndex: "error", ellipsis: true }]} /> },
+    { key: "ingest", label: `来源 ${ingestTasks.length}`, children: <TaskTable tasks={ingestTasks} /> },
+    { key: "graph", label: `代码索引 ${graphJobs.length}`, children: <Table rowKey="id" dataSource={graphJobs} columns={[{ title: "仓库", dataIndex: "full_name" }, { title: "分支", dataIndex: "branch" }, { title: "状态", dataIndex: "status", render: (value) => statusTag(value) }, { title: "提交", dataIndex: "commit", render: (value) => value ? <Text code>{String(value).slice(0, 12)}</Text> : "-" }, { title: "错误", dataIndex: "error", ellipsis: true }]} /> },
+    { key: "research", label: `研究 ${researchJobs.length}`, children: <ResearchJobsPanel jobs={researchJobs} onOpenFile={() => undefined} /> },
+  ]} /></div></Space>;
+}
+
+function QualityPage({ api, settings, onOpenFile }: { api: ApiClient; settings: AppSettings; onOpenFile: (path: string) => void }) {
+  const { message } = AntApp.useApp();
+  const [issues, setIssues] = useState<IssuesResponse | null>(null);
+  const [insights, setInsights] = useState<WikiGraphInsightsResponse | null>(null);
+  const [status, setStatus] = useState<WorkspaceStatus | null>(null);
+  const [loading, setLoading] = useState(false);
+  const refresh = useCallback(async () => { setLoading(true); try { const [lintData, insightData, statusData] = await Promise.all([api.lint(settings.projectPath), api.wikiGraphInsights(settings.projectPath), api.workspaceStatus({ project_path: settings.projectPath, project_id: settings.projectID, agent: settings.agent })]); setIssues(lintData); setInsights(insightData); setStatus(statusData); } catch (error) { message.error(errorMessage(error)); } finally { setLoading(false); } }, [api, message, settings.agent, settings.projectID, settings.projectPath]);
+  useEffect(() => { void refresh(); }, [refresh]);
+  return <Space direction="vertical" size={16} className="page-stack"><div className="admin-page-heading"><div><Title level={2}>质量治理</Title><Text type="secondary">结构健康、来源覆盖和知识维护信号</Text></div><Button icon={<ReloadOutlined />} loading={loading} onClick={refresh}>重新检查</Button></div><div className="quality-metrics"><Statistic title="结构问题" value={issues?.count ?? 0} /><Statistic title="待审阅" value={status?.reviews.open ?? 0} /><Statistic title="孤立页面" value={insights?.isolated_pages.length ?? 0} /><Statistic title="缺少来源" value={insights?.missing_sources.length ?? 0} /></div><div className="quality-layout"><div className="panel"><Title level={4}>结构问题</Title><Table rowKey={(issue) => `${issue.Type}:${issue.Path}:${issue.Detail}`} size="small" dataSource={issues?.issues ?? []} columns={[{ title: "类型", dataIndex: "Type", width: 140, render: (value) => <Tag color="orange">{value}</Tag> }, { title: "路径", dataIndex: "Path", render: (value) => <Button type="link" className="path-link" onClick={() => onOpenFile(value)}>{value}</Button> }, { title: "详情", dataIndex: "Detail" }]} /></div><div className="panel"><Title level={4}>图谱洞察</Title><GraphInsightsPanel insights={insights} onOpenFile={onOpenFile} onResearch={() => message.info("请在审阅中心发起研究任务")} /></div></div></Space>;
+}
+
+function SystemDiagnosticsPage({ api, settings, updateSettings }: { api: ApiClient; settings: AppSettings; updateSettings: (patch: Partial<AppSettings>) => void }) {
+  const { message } = AntApp.useApp();
+  const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [status, setStatus] = useState<WorkspaceStatus | null>(null);
+  const refresh = useCallback(async () => { try { const [healthData, statusData] = await Promise.all([api.health(), api.workspaceStatus({ project_path: settings.projectPath, project_id: settings.projectID, agent: settings.agent })]); setHealth(healthData); setStatus(statusData); message.success("诊断信息已刷新"); } catch (error) { message.error(errorMessage(error)); } }, [api, message, settings.agent, settings.projectID, settings.projectPath]);
+  useEffect(() => { void refresh(); }, [refresh]);
+  return <Space direction="vertical" size={16} className="page-stack"><div className="admin-page-heading"><div><Title level={2}>系统诊断</Title><Text type="secondary">服务、存储与模型能力状态</Text></div><Button icon={<ReloadOutlined />} onClick={refresh}>连接测试</Button></div><div className="diagnostic-grid">{[
+    ["API 服务", health?.ok, health?.ready === false ? "正在初始化" : "可用"],
+    ["PostgreSQL", status?.pg_configured, status?.pg_configured ? "已配置" : "未配置"],
+    ["Embedding", status?.embedding_configured, status?.embedding_configured ? "已配置" : "未配置"],
+    ["LLM 智能体", status?.agent === "llm", status?.agent || "llm"],
+  ].map(([title, ok, detail]) => <section key={String(title)}><span className={ok ? "diagnostic-dot ok" : "diagnostic-dot"} /><div><Text strong>{String(title)}</Text><Text type="secondary">{String(detail)}</Text></div>{ok ? <Tag color="green">正常</Tag> : <Tag>检查配置</Tag>}</section>)}</div><SettingsPage settings={settings} updateSettings={updateSettings} /></Space>;
+}
+
+function knowledgeTitle(path: string): string {
+  const name = path.split("/").pop()?.replace(/\.md$/i, "") || path;
+  return name.replace(/[-_]+/g, " ");
+}
+
+function formatShortDate(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return `${date.getMonth() + 1}月${date.getDate()}日`;
+}
+
+function formatShortTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
 }
 
 function Dashboard({ api, settings }: { api: ApiClient; settings: AppSettings }) {
@@ -1286,10 +1678,12 @@ function QueryPage({
   api,
   settings,
   onOpenFile,
+  initialQuestion,
 }: {
   api: ApiClient;
   settings: AppSettings;
   onOpenFile: (path: string) => void;
+  initialQuestion?: string;
 }) {
   const { message, modal } = AntApp.useApp();
   const [sessions, setSessions] = useState<ChatSessionRecord[]>([]);
@@ -1316,6 +1710,10 @@ function QueryPage({
   useEffect(() => {
     void refreshSessions();
   }, [refreshSessions]);
+
+  useEffect(() => {
+    if (initialQuestion?.trim()) setQuestion(initialQuestion.trim());
+  }, [initialQuestion]);
 
   useEffect(() => {
     if (activeRun?.status !== "running") {
