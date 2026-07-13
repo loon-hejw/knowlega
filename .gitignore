@@ -1,9 +1,11 @@
 .DS_Store
 .env.local
 .env.*.local
+config.yaml
 
 # Go
 *.test
+__debug_bin*
 coverage.out
 
 # Frontend

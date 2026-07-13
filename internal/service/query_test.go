@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -320,6 +321,165 @@ Token validation calls the auth service.
 	}
 }
 
+func TestLLMWikiQueryDirectChatBypassesWikiEvidenceLoop(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	agent := &countingQueryAgent{
+		plan: core.QueryPlan{
+			Question:     "你好",
+			Intent:       "answer_from_persistent_wiki",
+			AnswerMode:   "llm_tool_loop",
+			CanWriteBack: true,
+		},
+	}
+	answer, err := QueryLLMWikiWithOptions(QueryOptions{
+		ProjectPath: root,
+		Question:    "你好",
+		Agent:       agent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agent.planCalled != 0 || agent.actionCalled != 0 || agent.synthCalled != 0 {
+		t.Fatalf("direct chat should not call planner/action/synthesis: %+v", agent)
+	}
+	if answer.Plan.Intent != "direct_chat" || answer.Plan.CanWriteBack {
+		t.Fatalf("plan=%+v", answer.Plan)
+	}
+	if len(answer.Citations) != 0 || len(answer.Results) != 0 || len(answer.Trace) != 0 {
+		t.Fatalf("direct chat should not produce evidence artifacts: %+v", answer)
+	}
+	if !strings.Contains(answer.Answer, "你好") {
+		t.Fatalf("answer=%q", answer.Answer)
+	}
+}
+
+func TestLLMWikiQueryPlannerDirectChatBypassesActionLoop(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	agent := &countingQueryAgent{
+		plan: core.QueryPlan{
+			Question:     "How are you?",
+			Intent:       "direct_chat",
+			AnswerMode:   "direct_chat",
+			CanWriteBack: true,
+		},
+	}
+	answer, err := QueryLLMWikiWithOptions(QueryOptions{
+		ProjectPath: root,
+		Question:    "How are you?",
+		Agent:       agent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agent.planCalled != 1 || agent.actionCalled != 0 || agent.synthCalled != 0 {
+		t.Fatalf("planner direct chat should only call planner: %+v", agent)
+	}
+	if answer.Plan.Intent != "direct_chat" || answer.Plan.CanWriteBack {
+		t.Fatalf("plan=%+v", answer.Plan)
+	}
+	if len(answer.Citations) != 0 {
+		t.Fatalf("citations=%+v", answer.Citations)
+	}
+}
+
+func TestLLMWikiQuerySystemFAQBypassesWikiEvidenceLoop(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	agent := &countingQueryAgent{
+		plan: core.QueryPlan{
+			Question:     "你能做什么",
+			Intent:       "answer_from_persistent_wiki",
+			AnswerMode:   "llm_tool_loop",
+			CanWriteBack: true,
+		},
+	}
+	var events []QueryProgressEvent
+	answer, err := QueryLLMWikiWithOptions(QueryOptions{
+		ProjectPath: root,
+		Question:    "你能做什么",
+		Agent:       agent,
+		Progress: func(event QueryProgressEvent) {
+			events = append(events, event)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agent.planCalled != 0 || agent.actionCalled != 0 || agent.synthCalled != 0 {
+		t.Fatalf("system FAQ should not call planner/action/synthesis: %+v", agent)
+	}
+	if answer.Plan.Intent != "system_faq" || answer.Plan.CanWriteBack {
+		t.Fatalf("plan=%+v", answer.Plan)
+	}
+	if !strings.Contains(answer.Answer, "Knowledge Core") {
+		t.Fatalf("answer=%q", answer.Answer)
+	}
+	if !queryProgressContains(events, "routing_started") || !queryProgressContains(events, "routing_done") {
+		t.Fatalf("expected routing events, got %+v", events)
+	}
+}
+
+func TestLLMWikiQueryGeneralAssistantBypassesWikiPlanner(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	agent := &routedQueryAgent{
+		route: QueryRouteDecision{
+			Intent:     "general_assistant",
+			Confidence: 0.9,
+			Reason:     "general programming explanation",
+		},
+		generalAnswer: "Go interface 是一组方法约束。",
+		plan: core.QueryPlan{
+			Question:     "帮我解释一下 Go interface",
+			Intent:       "answer_from_persistent_wiki",
+			AnswerMode:   "llm_tool_loop",
+			CanWriteBack: true,
+		},
+	}
+	var events []QueryProgressEvent
+	answer, err := QueryLLMWikiWithOptions(QueryOptions{
+		ProjectPath: root,
+		Question:    "帮我解释一下 Go interface",
+		Agent:       agent,
+		Progress: func(event QueryProgressEvent) {
+			events = append(events, event)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agent.routeCalled != 1 || agent.generalCalled != 1 {
+		t.Fatalf("route/general calls = %d/%d", agent.routeCalled, agent.generalCalled)
+	}
+	if agent.planCalled != 0 || agent.actionCalled != 0 || agent.synthCalled != 0 {
+		t.Fatalf("general assistant should not call wiki planner/action/synthesis: %+v", agent)
+	}
+	if answer.Plan.Intent != "general_assistant" || answer.Plan.CanWriteBack {
+		t.Fatalf("plan=%+v", answer.Plan)
+	}
+	if len(answer.Citations) != 0 || len(answer.Results) != 0 || len(answer.Trace) != 0 {
+		t.Fatalf("general assistant should not produce wiki evidence artifacts: %+v", answer)
+	}
+	if !strings.Contains(answer.Answer, "Go interface") {
+		t.Fatalf("answer=%q", answer.Answer)
+	}
+	for _, eventType := range []string{"routing_started", "routing_done", "general_answer_started", "general_answer_done"} {
+		if !queryProgressContains(events, eventType) {
+			t.Fatalf("expected %s event, got %+v", eventType, events)
+		}
+	}
+}
+
 func TestLLMWikiQueryActionLoopCanRewriteSearchTerms(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "kb")
 	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "xiyouji"}); err != nil {
@@ -523,6 +683,140 @@ Token validation calls the auth service.
 	}
 }
 
+func TestLLMWikiQueryActionFailureDegradesToSynthesisWithReadEvidence(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(root, "wiki", "concepts", "oauth.md"), `---
+type: "concept"
+title: "OAuth Token Validation"
+---
+
+# OAuth Token Validation
+
+Token validation calls AuthService.
+`)
+	agent := &failingActionAgent{
+		plan: core.QueryPlan{
+			Question:       "How is token validation handled?",
+			Intent:         "answer_from_persistent_wiki",
+			ReadFirst:      []string{"wiki/concepts/oauth.md"},
+			CandidateLimit: 5,
+			AnswerMode:     "llm_tool_loop",
+			CanWriteBack:   true,
+		},
+		actionErr: errors.New(`parse llm query action: unexpected end of JSON input: {"action":"writeback","title":"`),
+	}
+	var events []QueryProgressEvent
+	answer, err := QueryLLMWikiWithOptions(QueryOptions{
+		ProjectPath: root,
+		Question:    "How is token validation handled?",
+		Limit:       5,
+		Agent:       agent,
+		Progress: func(event QueryProgressEvent) {
+			events = append(events, event)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !agent.synthCalled {
+		t.Fatal("expected synthesis after action failure")
+	}
+	if !queryDocsContain(agent.synthInput.Docs, "wiki/concepts/oauth.md") {
+		t.Fatalf("synthesis lost read evidence: %+v", agent.synthInput.Docs)
+	}
+	if !strings.Contains(answer.Answer, "wiki/concepts/oauth.md") {
+		t.Fatalf("answer=%q", answer.Answer)
+	}
+	if len(answer.Trace) != 1 || answer.Trace[0].Action.Action != "synthesize" || !strings.Contains(answer.Trace[0].Observation, "action_retry_exhausted") {
+		t.Fatalf("expected action retry exhausted trace, got %+v", answer.Trace)
+	}
+	if !queryProgressContains(events, "action_retry_exhausted") {
+		t.Fatalf("expected action_retry_exhausted progress, got %+v", events)
+	}
+}
+
+func TestLLMWikiQueryActionFailureRecallsEvidenceBeforeSynthesis(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(root, "wiki", "concepts", "oauth.md"), `---
+type: "concept"
+title: "OAuth Token Validation"
+---
+
+# OAuth Token Validation
+
+Token validation calls AuthService.
+`)
+	agent := &failingActionAgent{
+		plan: core.QueryPlan{
+			Question:       "token validation AuthService",
+			Intent:         "answer_from_persistent_wiki",
+			CandidateLimit: 3,
+			AnswerMode:     "llm_tool_loop",
+			CanWriteBack:   true,
+		},
+		actionErr: errors.New(`parse llm query action: unexpected end of JSON input: {"action":"writeback","title":"`),
+	}
+	answer, err := QueryLLMWikiWithOptions(QueryOptions{
+		ProjectPath: root,
+		Question:    "token validation AuthService",
+		Limit:       3,
+		Agent:       agent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !queryDocsContain(agent.synthInput.Docs, "wiki/concepts/oauth.md") {
+		t.Fatalf("fallback recall did not preserve readable evidence: %+v", agent.synthInput.Docs)
+	}
+	if len(answer.Results) == 0 || answer.Results[0].Path != "wiki/concepts/oauth.md" {
+		t.Fatalf("expected fallback recall result, got %+v", answer.Results)
+	}
+}
+
+func TestLLMWikiQueryActionFailureWithoutEvidenceReturnsDegradedAnswer(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	agent := &failingActionAgent{
+		plan: core.QueryPlan{
+			Question:       "missing policy",
+			Intent:         "answer_from_persistent_wiki",
+			CandidateLimit: 3,
+			AnswerMode:     "llm_tool_loop",
+			CanWriteBack:   true,
+		},
+		actionErr: errors.New(`parse llm query action: unexpected end of JSON input: {"action":"writeback","title":"`),
+	}
+	answer, err := QueryLLMWikiWithOptions(QueryOptions{
+		ProjectPath: root,
+		Question:    "missing policy",
+		Limit:       3,
+		Agent:       agent,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if agent.synthCalled {
+		t.Fatal("should not ask LLM to synthesize without readable evidence")
+	}
+	if !strings.Contains(answer.Answer, "没有生成可靠答案") || !strings.Contains(answer.Answer, "没有读取到可用于回答") {
+		t.Fatalf("answer=%q", answer.Answer)
+	}
+	if answer.Plan.CanWriteBack {
+		t.Fatalf("degraded no-evidence answer must not be writeback eligible: %+v", answer.Plan)
+	}
+	if len(answer.Citations) != 0 {
+		t.Fatalf("expected no citations, got %+v", answer.Citations)
+	}
+}
+
 func TestLLMWikiQueryActionLoopCanListPagesBeforeRead(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "kb")
 	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
@@ -617,6 +911,47 @@ Auth Service validates tokens.
 	}
 	if len(answer.Citations) != 1 || answer.Citations[0].Path != "wiki/concepts/auth-service.md" {
 		t.Fatalf("expected alias-resolved citation, got %+v", answer.Citations)
+	}
+}
+
+func TestLLMWikiQueryReadActionResolvesWrongWikiSubdirByBasename(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(root, "wiki", "concepts", "chapter-055-concept.md"), `---
+type: "concept"
+title: "Chapter 055 Concept"
+---
+
+# Chapter 055 Concept
+
+Chapter 055 concept evidence.
+`)
+
+	agent := &scriptedActionAgent{
+		plan: core.QueryPlan{
+			Question:       "What happened in chapter 55?",
+			Intent:         "answer_from_persistent_wiki",
+			ReadFirst:      []string{"wiki/index.md"},
+			CandidateLimit: 5,
+			AnswerMode:     "llm_tool_loop",
+			CanWriteBack:   true,
+		},
+		actions: []core.QueryAction{
+			{Action: "read", Path: "wiki/entities/chapter-055-concept.md", Rationale: "read concept page with wrong subdir"},
+			{Action: "final", Answer: "Chapter 055 has concept evidence [wiki/concepts/chapter-055-concept.md].", Rationale: "read evidence is sufficient"},
+		},
+	}
+	answer, err := QueryLLMWikiWithAgent(root, "What happened in chapter 55?", 5, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(answer.Trace) != 2 || !strings.Contains(answer.Trace[0].Observation, "wiki/concepts/chapter-055-concept.md") {
+		t.Fatalf("expected basename-resolved read trace, got %+v", answer.Trace)
+	}
+	if !queryDocsContain(agent.inputs[1].Docs, "wiki/concepts/chapter-055-concept.md") {
+		t.Fatalf("final action should see basename-resolved doc: %+v", agent.inputs[1].Docs)
 	}
 }
 
@@ -889,8 +1224,8 @@ func TestLLMWikiQueryRejectsFinalThatCitesUnreadSearchResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !agent.synthCalled {
-		t.Fatal("expected fallback synthesis after rejecting unread search-result citation")
+	if agent.synthCalled {
+		t.Fatal("should not synthesize without readable evidence after rejecting unread search-result citation")
 	}
 	if !strings.Contains(answer.Trace[0].Observation, "skipped 1 unreadable candidate") {
 		t.Fatalf("expected unreadable candidate trace, got %+v", answer.Trace)
@@ -906,7 +1241,7 @@ func TestLLMWikiQueryRejectsFinalThatCitesUnreadSearchResult(t *testing.T) {
 		Title:       "Unread Search Result",
 		Answer:      answer,
 	})
-	if writeErr == nil || !strings.Contains(writeErr.Error(), "non-navigation citation") {
+	if writeErr == nil || !strings.Contains(writeErr.Error(), "not eligible") {
 		t.Fatalf("expected writeback rejection for unread search result, got %v", writeErr)
 	}
 }
@@ -934,14 +1269,17 @@ func TestLLMWikiQueryRejectsFinalWithoutReadEvidence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !agent.synthCalled {
-		t.Fatal("expected fallback synthesis after rejecting unsupported final action")
+	if agent.synthCalled {
+		t.Fatal("should not synthesize without readable evidence after repeated unsupported final actions")
 	}
-	if answer.Answer != "synthesized fallback" {
+	if !strings.Contains(answer.Answer, "没有生成可靠答案") {
 		t.Fatalf("answer=%q", answer.Answer)
 	}
-	if len(answer.Trace) == 0 || !strings.Contains(answer.Trace[0].Observation, "final rejected") {
+	if len(answer.Trace) != 2 || !strings.Contains(answer.Trace[0].Observation, "final rejected") || !strings.Contains(answer.Trace[1].Observation, "final rejected") {
 		t.Fatalf("expected final rejection trace, got %+v", answer.Trace)
+	}
+	if answer.Plan.CanWriteBack {
+		t.Fatalf("missing evidence answer must not be writeback eligible: %+v", answer.Plan)
 	}
 }
 
@@ -1262,6 +1600,32 @@ type scriptedActionAgent struct {
 	synthCalled bool
 }
 
+type failingActionAgent struct {
+	plan        core.QueryPlan
+	actionErr   error
+	inputs      []QueryActionInput
+	synthCalled bool
+	synthInput  QuerySynthesisInput
+}
+
+type countingQueryAgent struct {
+	plan         core.QueryPlan
+	planCalled   int
+	actionCalled int
+	synthCalled  int
+}
+
+type routedQueryAgent struct {
+	plan          core.QueryPlan
+	route         QueryRouteDecision
+	generalAnswer string
+	routeCalled   int
+	generalCalled int
+	planCalled    int
+	actionCalled  int
+	synthCalled   int
+}
+
 type fakeGraphEvidenceStore struct {
 	evidence  []core.GraphEvidence
 	called    int
@@ -1361,6 +1725,76 @@ func (f *scriptedActionAgent) NextQueryAction(input QueryActionInput) (core.Quer
 func (f *scriptedActionAgent) SynthesizeQuery(QuerySynthesisInput) (string, error) {
 	f.synthCalled = true
 	return "synthesized fallback", nil
+}
+
+func (f *failingActionAgent) PlanQuery(QueryPlanningInput) (core.QueryPlan, error) {
+	return f.plan, nil
+}
+
+func (f *failingActionAgent) NextQueryAction(input QueryActionInput) (core.QueryAction, error) {
+	f.inputs = append(f.inputs, input)
+	if f.actionErr != nil {
+		return core.QueryAction{}, f.actionErr
+	}
+	return core.QueryAction{}, errors.New("action failed")
+}
+
+func (f *failingActionAgent) SynthesizeQuery(input QuerySynthesisInput) (string, error) {
+	f.synthCalled = true
+	f.synthInput = input
+	if len(input.Docs) == 0 {
+		return "degraded synthesis without docs", nil
+	}
+	return "degraded synthesis from " + input.Docs[len(input.Docs)-1].Path, nil
+}
+
+func (f *countingQueryAgent) PlanQuery(QueryPlanningInput) (core.QueryPlan, error) {
+	f.planCalled++
+	return f.plan, nil
+}
+
+func (f *countingQueryAgent) NextQueryAction(QueryActionInput) (core.QueryAction, error) {
+	f.actionCalled++
+	return core.QueryAction{Action: "final", Answer: "direct final"}, nil
+}
+
+func (f *countingQueryAgent) SynthesizeQuery(QuerySynthesisInput) (string, error) {
+	f.synthCalled++
+	return "direct synthesized", nil
+}
+
+func (f *routedQueryAgent) RouteQuery(QueryRoutingInput) (QueryRouteDecision, error) {
+	f.routeCalled++
+	return f.route, nil
+}
+
+func (f *routedQueryAgent) AnswerGeneralQuery(QueryGeneralAnswerInput) (string, error) {
+	f.generalCalled++
+	return f.generalAnswer, nil
+}
+
+func (f *routedQueryAgent) PlanQuery(QueryPlanningInput) (core.QueryPlan, error) {
+	f.planCalled++
+	return f.plan, nil
+}
+
+func (f *routedQueryAgent) NextQueryAction(QueryActionInput) (core.QueryAction, error) {
+	f.actionCalled++
+	return core.QueryAction{Action: "final", Answer: "direct final"}, nil
+}
+
+func (f *routedQueryAgent) SynthesizeQuery(QuerySynthesisInput) (string, error) {
+	f.synthCalled++
+	return "direct synthesized", nil
+}
+
+func queryProgressContains(events []QueryProgressEvent, eventType string) bool {
+	for _, event := range events {
+		if event.Type == eventType {
+			return true
+		}
+	}
+	return false
 }
 
 func queryDocsContain(docs []QueryReadDocument, path string) bool {

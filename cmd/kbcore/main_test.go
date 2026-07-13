@@ -2,26 +2,46 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"flag"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/hejw/knowledge-core/internal/compiler"
+	"github.com/hejw/knowledge-core/internal/config"
+	"github.com/hejw/knowledge-core/internal/service"
 	"github.com/hejw/knowledge-core/internal/wiki"
 )
 
-func TestUsageDocumentsQueryMockAgent(t *testing.T) {
+type flakyBootstrapProvider struct{ analyzeCalls int }
+
+func (p *flakyBootstrapProvider) Analyze(input compiler.AnalysisInput) (string, error) {
+	p.analyzeCalls++
+	if p.analyzeCalls == 1 {
+		return "", errors.New("temporary provider failure")
+	}
+	return (compiler.MockProvider{}).Analyze(input)
+}
+
+func (p *flakyBootstrapProvider) Generate(analysis string, input compiler.AnalysisInput) (string, error) {
+	return (compiler.MockProvider{}).Generate(analysis, input)
+}
+
+func TestUsageDocumentsLLMAgentOnly(t *testing.T) {
 	output := captureStdout(t, usage)
 	for _, want := range []string{
 		"validate-llmwiki --project PATH --source FILE_OR_DIR",
-		"[--agent auto|mock|llm]",
+		"[--agent llm|mock]",
 		"query --project PATH --q QUERY",
-		"[--agent auto|fallback|mock|llm]",
 		"lint --project PATH [--agent structural|llm]",
 		"review-wiki --project PATH",
-		"[--agent auto|llm]",
 		"code-import-graphify",
+		"source-layout migrate",
 	} {
 		if !strings.Contains(output, want) {
 			t.Fatalf("usage missing %q:\n%s", want, output)
@@ -29,18 +49,75 @@ func TestUsageDocumentsQueryMockAgent(t *testing.T) {
 	}
 }
 
-func TestRunLintLLMAgentRequiresEnv(t *testing.T) {
-	t.Setenv("KB_CORE_LLM_API_KEY", "")
-	t.Setenv("OPENAI_API_KEY", "")
-	t.Setenv("KB_CORE_LLM_MODEL", "")
-	t.Setenv("OPENAI_MODEL", "")
+func TestRunLintLLMAgentRequiresYAMLConfig(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "kb")
 	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
 		t.Fatal(err)
 	}
-	err := run([]string{"lint", "--project", root, "--agent", "llm"})
-	if err == nil || !strings.Contains(err.Error(), "lint --agent llm requires KB_CORE_LLM_API_KEY and KB_CORE_LLM_MODEL") {
-		t.Fatalf("expected missing llm env error, got %v", err)
+	source := filepath.Join(t.TempDir(), "source.txt")
+	if err := os.WriteFile(source, []byte("source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(t.TempDir(), "config.yaml")
+	configBody := "project:\n  name: demo\n  path: " + root + "\n  bootstrap:\n    source: " + source + "\nllm:\n  api_key: \"\"\n  model: \"\"\n"
+	if err := os.WriteFile(configPath, []byte(configBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := run([]string{"--config", configPath, "lint", "--project", root, "--agent", "llm"})
+	if err == nil || !strings.Contains(err.Error(), "llm.api_key is required") {
+		t.Fatalf("expected missing llm YAML error, got %v", err)
+	}
+}
+
+func TestExplicitFlagsTracksFalseBooleanOverride(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	worker := fs.Bool("worker", true, "")
+	if err := fs.Parse([]string{"--worker=false"}); err != nil {
+		t.Fatal(err)
+	}
+	if *worker {
+		t.Fatal("explicit false did not override the configured true default")
+	}
+	if !explicitFlags(fs)["worker"] {
+		t.Fatal("explicit false flag was not recorded")
+	}
+}
+
+func TestExtractConfigFlagSupportsGlobalPositions(t *testing.T) {
+	for _, args := range [][]string{
+		{"--config", "/tmp/demo.yaml", "serve"},
+		{"serve", "--config=/tmp/demo.yaml", "--worker=false"},
+	} {
+		path, remaining, err := extractConfigFlag(args)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if path != "/tmp/demo.yaml" || len(remaining) == 0 || remaining[0] != "serve" {
+			t.Fatalf("path=%q remaining=%v", path, remaining)
+		}
+	}
+}
+
+func TestRunServeBootstrapRetriesAndResumes(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	source := filepath.Join(t.TempDir(), "source.md")
+	if err := os.WriteFile(source, []byte("# Source\n\n西游记来源"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.Project.Name = "demo"
+	cfg.Project.Path = root
+	cfg.Project.Bootstrap.Source = source
+	cfg.Project.Bootstrap.RetryInitialDelay = config.Duration{Duration: time.Millisecond}
+	cfg.Project.Bootstrap.RetryMaxDelay = config.Duration{Duration: 2 * time.Millisecond}
+	tracker := service.NewBootstrapTracker(root, 1)
+	provider := &flakyBootstrapProvider{}
+	runServeBootstrap(context.Background(), serveBootstrapOptions{
+		Config: cfg, ProjectPath: root, Provider: provider, Tracker: tracker,
+	})
+	status := tracker.Snapshot()
+	if status.Status != "succeeded" || status.Attempt != 2 || provider.analyzeCalls != 2 {
+		t.Fatalf("status=%+v analyze_calls=%d", status, provider.analyzeCalls)
 	}
 }
 

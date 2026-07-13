@@ -8,15 +8,10 @@
       "mode": "debug",
       "program": "${workspaceFolder}/cmd/kbcore",
       "args": [
-        "serve",
-        "--addr",
-        "127.0.0.1:19829",
-        "--project",
-        "${input:projectPath}",
-        "--agent",
-        "llm"
+        "--config",
+        "${workspaceFolder}/config.yaml",
+        "serve"
       ],
-      "envFile": "${workspaceFolder}/.env.local",
       "cwd": "${workspaceFolder}"
     },
     {
@@ -35,14 +30,6 @@
         "Frontend: Vite Web"
       ],
       "stopAll": true
-    }
-  ],
-  "inputs": [
-    {
-      "id": "projectPath",
-      "type": "promptString",
-      "description": "Knowledge Core project path",
-      "default": "/tmp/demo-kb"
     }
   ]
 }

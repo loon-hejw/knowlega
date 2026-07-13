@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hejw/knowledge-core/internal/core"
+	"github.com/hejw/knowledge-core/internal/sourcearchive"
 	"github.com/hejw/knowledge-core/internal/wiki"
 )
 
@@ -35,13 +36,31 @@ func IngestSource(opts IngestOptions) (IngestResult, error) {
 	if strings.TrimSpace(opts.SourcePath) == "" {
 		return IngestResult{}, fmt.Errorf("source path is required")
 	}
-	data, err := os.ReadFile(opts.SourcePath)
+	sourcePath := opts.SourcePath
+	archive, archived, err := sourcearchive.FindBySourcePath(opts.ProjectPath, sourcePath)
 	if err != nil {
 		return IngestResult{}, err
 	}
-	sum := sha256.Sum256(data)
+	if archived {
+		sourcePath = filepath.Join(opts.ProjectPath, filepath.FromSlash(archive.Metadata.ContentPath))
+	}
+	data, err := os.ReadFile(sourcePath)
+	if err != nil {
+		return IngestResult{}, err
+	}
+	originalData := data
+	if archived && archive.Metadata.ContentPath != archive.Metadata.OriginalRawPath {
+		originalData, err = os.ReadFile(filepath.Join(opts.ProjectPath, filepath.FromSlash(archive.Metadata.OriginalRawPath)))
+		if err != nil {
+			return IngestResult{}, err
+		}
+	}
+	sum := sha256.Sum256(originalData)
 	hash := hex.EncodeToString(sum[:])
 	name := filepath.Base(opts.SourcePath)
+	if archived {
+		name = archive.Metadata.OriginalName
+	}
 	slug := core.Slug(name)
 	if opts.Title == "" {
 		opts.Title = strings.TrimSuffix(name, filepath.Ext(name))
@@ -50,16 +69,28 @@ func IngestSource(opts IngestOptions) (IngestResult, error) {
 		opts.Kind = "source"
 	}
 
-	rawDir := filepath.Join(opts.ProjectPath, "raw", "sources")
-	if err := os.MkdirAll(rawDir, 0o755); err != nil {
-		return IngestResult{}, err
-	}
-	rawRel := filepath.Join("raw", "sources", hash[:12]+"-"+name)
-	rawAbs := filepath.Join(opts.ProjectPath, rawRel)
-	if _, err := os.Stat(rawAbs); os.IsNotExist(err) {
-		if err := writeFileAtomic(rawAbs, data); err != nil {
+	rawRel := ""
+	if archived {
+		rawRel = archive.Metadata.ContentPath
+	} else if sourceInsideRawSources(opts.ProjectPath, opts.SourcePath) {
+		projectAbs, _ := filepath.Abs(opts.ProjectPath)
+		sourceAbs, _ := filepath.Abs(opts.SourcePath)
+		rel, relErr := filepath.Rel(projectAbs, sourceAbs)
+		if relErr != nil {
+			return IngestResult{}, relErr
+		}
+		rawRel = filepath.ToSlash(rel)
+	} else {
+		archive, err = sourcearchive.ImportBytes(sourcearchive.ImportOptions{
+			ProjectPath:      opts.ProjectPath,
+			RelativePath:     name,
+			OriginalLocation: opts.SourcePath,
+		}, originalData)
+		if err != nil {
 			return IngestResult{}, err
 		}
+		archived = true
+		rawRel = archive.Metadata.ContentPath
 	}
 
 	body := renderSourceSummaryBody(opts.Title, rawRel, hash, string(data))
@@ -86,8 +117,11 @@ func IngestSource(opts IngestOptions) (IngestResult, error) {
 	_ = appendLog(opts.ProjectPath, "ingest", opts.Title, fmt.Sprintf("Source `%s` compiled to `%s`.", rawRel, wikiRel))
 	_ = appendIndex(opts.ProjectPath, "Sources", opts.Title, wikiRel)
 	_ = appendOverview(opts.ProjectPath, "Recent Source Updates", opts.Title, wikiRel, "source-summary")
-	if err := upsertIngestSourceManifest(opts.ProjectPath, opts.SourcePath, rawRel, opts.Title, hash, []string{filepath.ToSlash(wikiRel)}); err != nil {
+	if err := upsertIngestSourceManifest(opts.ProjectPath, opts.SourcePath, rawRel, opts.Title, hash, []string{filepath.ToSlash(wikiRel)}, archiveMetadata(archive, archived)); err != nil {
 		return IngestResult{}, err
+	}
+	if err := RefreshRelationsArtifact(opts.ProjectPath); err != nil {
+		return IngestResult{}, fmt.Errorf("refresh generated relations: %w", err)
 	}
 
 	return IngestResult{RawPath: rawRel, WikiPath: wikiRel, SHA256: hash}, nil
@@ -99,22 +133,29 @@ type ingestSourceManifest struct {
 }
 
 type ingestSourceManifestEntry struct {
-	OriginalPath string   `json:"original_path"`
-	SHA256       string   `json:"sha256"`
-	RawPath      string   `json:"raw_path"`
-	Title        string   `json:"title"`
-	Files        []string `json:"files"`
-	ReviewCount  int      `json:"review_count"`
-	UpdatedAt    string   `json:"updated_at"`
+	OriginalPath    string          `json:"original_path"`
+	PipelineVersion int             `json:"pipeline_version,omitempty"`
+	SHA256          string          `json:"sha256"`
+	RawPath         string          `json:"raw_path"`
+	ArchivePath     string          `json:"archive_path,omitempty"`
+	OriginalRawPath string          `json:"original_raw_path,omitempty"`
+	ContentPath     string          `json:"content_path,omitempty"`
+	OriginalSHA256  string          `json:"original_sha256,omitempty"`
+	ContentSHA256   string          `json:"content_sha256,omitempty"`
+	Title           string          `json:"title"`
+	Files           []string        `json:"files"`
+	ReviewCount     int             `json:"review_count"`
+	UpdatedAt       string          `json:"updated_at"`
+	Extraction      json.RawMessage `json:"extraction,omitempty"`
 }
 
-func upsertIngestSourceManifest(projectPath, sourcePath, rawRel, title, hash string, files []string) error {
+func upsertIngestSourceManifest(projectPath, sourcePath, rawRel, title, hash string, files []string, archive *sourcearchive.Metadata) error {
 	manifest, err := loadIngestSourceManifest(projectPath)
 	if err != nil {
 		return err
 	}
 	key := sourceManifestKey(sourcePath)
-	manifest.Sources[key] = ingestSourceManifestEntry{
+	entry := ingestSourceManifestEntry{
 		OriginalPath: key,
 		SHA256:       hash,
 		RawPath:      filepath.ToSlash(rawRel),
@@ -123,7 +164,37 @@ func upsertIngestSourceManifest(projectPath, sourcePath, rawRel, title, hash str
 		ReviewCount:  0,
 		UpdatedAt:    time.Now().UTC().Format(time.RFC3339),
 	}
+	if archive != nil {
+		entry.OriginalPath = key
+		entry.ArchivePath = archive.ArchivePath
+		entry.OriginalRawPath = archive.OriginalRawPath
+		entry.ContentPath = archive.ContentPath
+		entry.OriginalSHA256 = archive.OriginalSHA256
+		entry.ContentSHA256 = archive.ContentSHA256
+	}
+	manifest.Sources[key] = entry
 	return saveIngestSourceManifest(projectPath, manifest)
+}
+
+func archiveMetadata(archive sourcearchive.Archive, ok bool) *sourcearchive.Metadata {
+	if !ok {
+		return nil
+	}
+	metadata := archive.Metadata
+	return &metadata
+}
+
+func sourceInsideRawSources(projectPath, sourcePath string) bool {
+	rawRoot, err := filepath.Abs(filepath.Join(projectPath, "raw", "sources"))
+	if err != nil {
+		return false
+	}
+	sourceAbs, err := filepath.Abs(sourcePath)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(rawRoot, sourceAbs)
+	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func loadIngestSourceManifest(projectPath string) (ingestSourceManifest, error) {

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${KB_CORE_VERIFY_PROJECT:-$(mktemp -d /private/tmp/kbcore-xiyouji-verify.XXXXXX)}"
+CONFIG="${1:-config.yaml}"
+ROOT="$(mktemp -d /private/tmp/kbcore-xiyouji-verify.XXXXXX)"
 CACHE="${GOCACHE:-/private/tmp/kbcore-gocache}"
 
 run() {
-  env GOCACHE="$CACHE" go run ./cmd/kbcore "$@"
+  env GOCACHE="$CACHE" go run ./cmd/kbcore --config "$CONFIG" "$@"
 }
 
 expect_line() {
@@ -94,7 +95,7 @@ expect_line "$CODE_IMPORT_OUT" "edges=1"
 
 HGS_OUT=/tmp/kbcore-xiyouji-query-huaguoshan.out
 run query --project "$ROOT" --q 花果山 --limit 5 --agent mock >"$HGS_OUT"
-expect_line "$HGS_OUT" "intent=mock_llmwiki_tool_loop"
+expect_line "$HGS_OUT" "intent=answer_from_persistent_wiki"
 expect_line "$HGS_OUT" "mode=mock_tool_loop"
 expect_line "$HGS_OUT" "writeback=false"
 grep -q 'action=list_pages' "$HGS_OUT"
@@ -103,7 +104,7 @@ assert_chapter_result "$HGS_OUT" "花果山"
 
 HSH_OUT=/tmp/kbcore-xiyouji-query-heishuihe.out
 run query --project "$ROOT" --q 黑水河 --limit 5 --agent mock >"$HSH_OUT"
-expect_line "$HSH_OUT" "intent=mock_llmwiki_tool_loop"
+expect_line "$HSH_OUT" "intent=answer_from_persistent_wiki"
 expect_line "$HSH_OUT" "mode=mock_tool_loop"
 expect_line "$HSH_OUT" "writeback=false"
 grep -q 'action=list_pages' "$HSH_OUT"
@@ -114,7 +115,7 @@ assert_chapter_result "$HSH_OUT" "黑水河"
 
 GRAPH_QUERY_OUT=/tmp/kbcore-xiyouji-query-graph.out
 run query --project "$ROOT" --q "ValidateToken AuthService calls" --limit 5 --agent mock >"$GRAPH_QUERY_OUT"
-expect_line "$GRAPH_QUERY_OUT" "intent=mock_llmwiki_tool_loop"
+expect_line "$GRAPH_QUERY_OUT" "intent=answer_from_persistent_wiki"
 expect_line "$GRAPH_QUERY_OUT" "mode=mock_tool_loop"
 expect_line "$GRAPH_QUERY_OUT" "writeback=false"
 grep -q 'action=graph' "$GRAPH_QUERY_OUT"

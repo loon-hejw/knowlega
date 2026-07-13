@@ -1,49 +1,83 @@
 package service
 
 import (
-	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
-	"time"
 
 	"github.com/hejw/knowledge-core/internal/config"
 	"github.com/hejw/knowledge-core/internal/core"
+	"github.com/hejw/knowledge-core/internal/llmclient"
+	"github.com/hejw/knowledge-core/internal/llmretry"
+	"github.com/hejw/knowledge-core/internal/promptbudget"
 )
 
 type OpenAICompatibleQueryAgent struct {
-	BaseURL string
-	APIKey  string
-	Model   string
-	Client  *http.Client
+	Protocol         string
+	BaseURL          string
+	APIKey           string
+	Model            string
+	UserAgent        string
+	AnthropicVersion string
+	Client           *http.Client
+	MaxInputChars    int
+	MaxOutputTokens  int
+	DisableThinking  bool
+	RetryOptions     llmretry.Options
 }
 
-func NewEnvQueryAgent() (QueryAgent, bool, error) {
-	apiKey := config.Value("KB_CORE_LLM_API_KEY", "OPENAI_API_KEY")
-	model := config.Value("KB_CORE_LLM_MODEL", "OPENAI_MODEL")
-	if apiKey == "" || model == "" {
-		return nil, false, nil
+const (
+	defaultLLMMaxInputChars   = 120000
+	defaultLLMMaxOutputTokens = 4096
+)
+
+func NewQueryAgent(cfg config.LLMConfig) (QueryAgent, error) {
+	if strings.TrimSpace(cfg.APIKey) == "" {
+		return nil, fmt.Errorf("llm.api_key is required")
 	}
-	baseURL := config.Value("KB_CORE_LLM_BASE_URL", "OPENAI_BASE_URL")
-	if baseURL == "" {
-		baseURL = "https://api.openai.com/v1"
+	if strings.TrimSpace(cfg.Model) == "" {
+		return nil, fmt.Errorf("llm.model is required")
 	}
 	return OpenAICompatibleQueryAgent{
-		BaseURL: strings.TrimRight(baseURL, "/"),
-		APIKey:  apiKey,
-		Model:   model,
-		Client:  &http.Client{Timeout: 60 * time.Second},
-	}, true, nil
+		Protocol:         cfg.Protocol,
+		BaseURL:          strings.TrimRight(cfg.BaseURL, "/"),
+		APIKey:           cfg.APIKey,
+		Model:            cfg.Model,
+		UserAgent:        cfg.UserAgent,
+		AnthropicVersion: cfg.AnthropicVersion,
+		Client:           &http.Client{Timeout: cfg.Timeout.Duration},
+		MaxInputChars:    cfg.MaxInputChars,
+		MaxOutputTokens:  cfg.MaxOutputTokens,
+		DisableThinking:  cfg.DisableThinking,
+		RetryOptions: llmretry.Options{
+			Retries:   cfg.Retries,
+			BaseDelay: cfg.RetryBaseDelay.Duration,
+			MaxDelay:  cfg.RetryMaxDelay.Duration,
+		},
+	}, nil
 }
 
 func (a OpenAICompatibleQueryAgent) PlanQuery(input QueryPlanningInput) (core.QueryPlan, error) {
+	return a.PlanQueryContext(context.Background(), input)
+}
+
+func (a OpenAICompatibleQueryAgent) PlanQueryContext(ctx context.Context, input QueryPlanningInput) (core.QueryPlan, error) {
+	input = budgetQueryPlanningInput(input)
 	system := `You are the query planner for an LLM-maintained persistent wiki.
 Do not answer the question yet. Read the wiki navigation context and produce a JSON query plan.
 Searches are candidate-recall tool calls only. Expand aliases, entities, chapter names, symbols, and graph terms when justified by the wiki context.
+Intents:
+- direct_chat: short greetings, thanks, or simple social chat such as "你好", "hello", "在吗", "谢谢". Do not read or search the wiki. Set can_write_back=false.
+- answer_from_persistent_wiki: questions that need business/wiki/code/source evidence. These must read wiki/raw/graph evidence before final answers.
+- missing_evidence: questions that clearly ask for unavailable knowledge or require sources that are not present. Set can_write_back=false.
 Return only JSON with this shape:
 {"intent":"answer_from_persistent_wiki","read_first":["wiki/index.md"],"searches":[{"text":"...","weight":6,"rationale":"..."}],"candidate_limit":10,"answer_mode":"llm_synthesis","can_write_back":true}`
 	user := fmt.Sprintf(`Question:
+%s
+
+Conversation context:
 %s
 
 Purpose:
@@ -59,14 +93,21 @@ Overview:
 %s
 
 Recent log:
-%s`, input.Question, input.Purpose, input.Schema, input.Index, input.Overview, input.LogTail)
-	content, err := a.chat(system, user)
+%s`, input.Question, input.ConversationContext, input.Purpose, input.Schema, input.Index, input.Overview, input.LogTail)
+	retryOpts := a.retryOptions()
+	plan, err := llmretry.DoValue[core.QueryPlan](ctx, retryOpts, queryLLMRetryCallback(ctx), func(attempt int) (core.QueryPlan, bool, error) {
+		content, retryable, err := a.chatOnce(ctx, system, user)
+		if err != nil {
+			return core.QueryPlan{}, retryable, err
+		}
+		plan, err := decodeLLMJSONObject[core.QueryPlan](content, "llm query plan")
+		if err != nil {
+			return core.QueryPlan{}, true, err
+		}
+		return plan, false, nil
+	})
 	if err != nil {
-		return core.QueryPlan{}, err
-	}
-	var plan core.QueryPlan
-	if err := json.Unmarshal([]byte(extractJSONObject(content)), &plan); err != nil {
-		return core.QueryPlan{}, fmt.Errorf("parse llm query plan: %w: %s", err, content)
+		return fallbackQueryPlan(input.Question), nil
 	}
 	if plan.Question == "" {
 		plan.Question = input.Question
@@ -74,19 +115,51 @@ Recent log:
 	if plan.Intent == "" {
 		plan.Intent = "answer_from_persistent_wiki"
 	}
+	plan.Intent = normalizeQueryIntent(plan.Intent)
 	if plan.CandidateLimit <= 0 {
 		plan.CandidateLimit = 10
 	}
-	if len(plan.ReadFirst) == 0 {
+	if plan.Intent == "direct_chat" || plan.Intent == "missing_evidence" {
+		plan.ReadFirst = nil
+		plan.Searches = nil
+		plan.CanWriteBack = false
+	} else if len(plan.ReadFirst) == 0 {
 		plan.ReadFirst = []string{"wiki/index.md"}
 	}
 	if plan.AnswerMode == "" {
-		plan.AnswerMode = "llm_synthesis"
+		plan.AnswerMode = plan.Intent
+		if plan.AnswerMode == "answer_from_persistent_wiki" {
+			plan.AnswerMode = "llm_synthesis"
+		}
 	}
 	return plan, nil
 }
 
+func fallbackQueryPlan(question string) core.QueryPlan {
+	return core.QueryPlan{
+		Question: question,
+		Intent:   "answer_from_persistent_wiki",
+		ReadFirst: []string{
+			"wiki/index.md",
+			"wiki/overview.md",
+		},
+		Searches: []core.QuerySearch{{
+			Text:      strings.TrimSpace(question),
+			Weight:    6,
+			Rationale: "fallback plan because the LLM planner returned invalid JSON",
+		}},
+		CandidateLimit: 10,
+		AnswerMode:     "llm_synthesis_with_fallback_plan",
+		CanWriteBack:   false,
+	}
+}
+
 func (a OpenAICompatibleQueryAgent) NextQueryAction(input QueryActionInput) (core.QueryAction, error) {
+	return a.NextQueryActionContext(context.Background(), input)
+}
+
+func (a OpenAICompatibleQueryAgent) NextQueryActionContext(ctx context.Context, input QueryActionInput) (core.QueryAction, error) {
+	input = budgetQueryActionInput(input, 52000)
 	var docs strings.Builder
 	for i, doc := range input.Docs {
 		fmt.Fprintf(&docs, "\n---DOC %d---\npath: %s\nkind: %s\ntitle: %s\n\n%s\n", i+1, doc.Path, doc.Kind, doc.Title, doc.Content)
@@ -129,6 +202,9 @@ Rules:
 	user := fmt.Sprintf(`Question:
 %s
 
+Conversation context:
+%s
+
 Query plan:
 %s
 
@@ -143,23 +219,31 @@ Known search results:
 Navigation observations:
 %s
 
-Read documents:
-%s`, input.Question, mustJSON(input.Plan), input.Step, mustJSON(input.Trace), results.String(), navigation.String(), docs.String())
-	content, err := a.chat(system, user)
-	if err != nil {
-		return core.QueryAction{}, err
-	}
-	var action core.QueryAction
-	if err := json.Unmarshal([]byte(extractJSONObject(content)), &action); err != nil {
-		return core.QueryAction{}, fmt.Errorf("parse llm query action: %w: %s", err, content)
-	}
-	if action.Action == "" {
-		return core.QueryAction{}, fmt.Errorf("llm query action missing action: %s", content)
-	}
-	return action, nil
+	Read documents:
+%s`, input.Question, input.ConversationContext, mustJSON(input.Plan), input.Step, mustJSON(input.Trace), results.String(), navigation.String(), docs.String())
+	retryOpts := a.retryOptions()
+	return llmretry.DoValue[core.QueryAction](ctx, retryOpts, queryLLMRetryCallback(ctx), func(attempt int) (core.QueryAction, bool, error) {
+		content, retryable, err := a.chatOnce(ctx, system, user)
+		if err != nil {
+			return core.QueryAction{}, retryable, err
+		}
+		action, err := decodeLLMJSONObject[core.QueryAction](content, "llm query action")
+		if err != nil {
+			return core.QueryAction{}, true, err
+		}
+		if strings.TrimSpace(action.Action) == "" {
+			return core.QueryAction{}, true, fmt.Errorf("llm query action missing action: %s", content)
+		}
+		return action, false, nil
+	})
 }
 
 func (a OpenAICompatibleQueryAgent) SynthesizeQuery(input QuerySynthesisInput) (string, error) {
+	return a.SynthesizeQueryContext(context.Background(), input)
+}
+
+func (a OpenAICompatibleQueryAgent) SynthesizeQueryContext(ctx context.Context, input QuerySynthesisInput) (string, error) {
+	input = budgetQuerySynthesisInput(input, 72000)
 	var docs strings.Builder
 	for i, doc := range input.Docs {
 		fmt.Fprintf(&docs, "\n---DOC %d---\npath: %s\nkind: %s\ntitle: %s\n\n%s\n", i+1, doc.Path, doc.Kind, doc.Title, doc.Content)
@@ -170,6 +254,9 @@ If the answer reveals a reusable synthesis, end with a short "Writeback candidat
 	user := fmt.Sprintf(`Question:
 %s
 
+Conversation context:
+%s
+
 Query plan:
 %s
 
@@ -177,69 +264,74 @@ Trace:
 %s
 
 Candidate documents:
-%s`, input.Question, mustJSON(input.Plan), mustJSON(input.Trace), docs.String())
-	return a.chat(system, user)
+%s`, input.Question, input.ConversationContext, mustJSON(input.Plan), mustJSON(input.Trace), docs.String())
+	return a.chatContext(ctx, system, user)
 }
 
 func (a OpenAICompatibleQueryAgent) chat(system, user string) (string, error) {
-	client := a.Client
-	if client == nil {
-		client = &http.Client{Timeout: 60 * time.Second}
+	return a.chatContext(context.Background(), system, user)
+}
+
+func (a OpenAICompatibleQueryAgent) chatContext(ctx context.Context, system, user string) (string, error) {
+	retryOpts := a.retryOptions()
+	return llmretry.Do(ctx, retryOpts, queryLLMRetryCallback(ctx), func(attempt int) (string, bool, error) {
+		return a.chatOnce(ctx, system, user)
+	})
+}
+
+func (a OpenAICompatibleQueryAgent) retryOptions() llmretry.Options {
+	return llmretry.Normalize(a.RetryOptions)
+}
+
+func queryLLMRetryCallback(ctx context.Context) llmretry.OnRetry {
+	progress, _ := ctx.Value(queryProgressContextKey{}).(QueryProgressFunc)
+	if progress == nil {
+		return nil
 	}
-	payload := chatCompletionRequest{
-		Model: a.Model,
-		Messages: []chatMessage{
-			{Role: "system", Content: system},
-			{Role: "user", Content: user},
-		},
-		Temperature: 0.2,
+	return func(info llmretry.RetryInfo) {
+		progress(QueryProgressEvent{
+			Type:        "llm_retrying",
+			Message:     fmt.Sprintf("LLM 调用失败，%.1fs 后重试", info.Delay.Seconds()),
+			Observation: fmt.Sprintf("attempt=%d retries=%d reason=%s", info.Attempt, info.Retries, info.Reason),
+		})
 	}
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return "", err
+}
+
+func (a OpenAICompatibleQueryAgent) chatOnce(ctx context.Context, system, user string) (string, bool, error) {
+	maxInputChars := a.MaxInputChars
+	if maxInputChars <= 0 {
+		maxInputChars = defaultLLMMaxInputChars
 	}
-	req, err := http.NewRequest(http.MethodPost, a.BaseURL+"/chat/completions", bytes.NewReader(body))
-	if err != nil {
-		return "", err
+	maxOutputTokens := a.MaxOutputTokens
+	if maxOutputTokens <= 0 {
+		maxOutputTokens = defaultLLMMaxOutputTokens
 	}
-	req.Header.Set("Authorization", "Bearer "+a.APIKey)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	var parsed chatCompletionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
-		return "", err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("llm request failed: status=%d body=%s", resp.StatusCode, parsed.Error.Message)
-	}
-	if len(parsed.Choices) == 0 {
-		return "", fmt.Errorf("llm returned no choices")
-	}
-	return parsed.Choices[0].Message.Content, nil
+	system, user = promptbudget.BudgetChatInput(system, user, maxInputChars)
+	return (llmclient.Client{
+		Protocol:         a.Protocol,
+		BaseURL:          a.BaseURL,
+		APIKey:           a.APIKey,
+		Model:            a.Model,
+		UserAgent:        a.UserAgent,
+		AnthropicVersion: a.AnthropicVersion,
+		HTTPClient:       a.Client,
+	}).Chat(ctx, llmclient.ChatRequest{
+		System: system, User: user, MaxTokens: maxOutputTokens,
+		Temperature: 0.2, DisableThinking: a.DisableThinking,
+	})
 }
 
 type chatCompletionRequest struct {
-	Model       string        `json:"model"`
-	Messages    []chatMessage `json:"messages"`
-	Temperature float64       `json:"temperature"`
+	Model              string         `json:"model"`
+	Messages           []chatMessage  `json:"messages"`
+	Temperature        float64        `json:"temperature"`
+	MaxTokens          int            `json:"max_tokens,omitempty"`
+	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
 }
 
 type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
-}
-
-type chatCompletionResponse struct {
-	Choices []struct {
-		Message chatMessage `json:"message"`
-	} `json:"choices"`
-	Error struct {
-		Message string `json:"message"`
-	} `json:"error"`
 }
 
 func extractJSONObject(content string) string {
@@ -252,10 +344,116 @@ func extractJSONObject(content string) string {
 	return content
 }
 
+func decodeLLMJSONObject[T any](content string, label string) (T, error) {
+	var value T
+	if err := json.Unmarshal([]byte(extractJSONObject(content)), &value); err != nil {
+		return value, fmt.Errorf("parse %s: %w: %s", label, err, content)
+	}
+	return value, nil
+}
+
 func mustJSON(value any) string {
 	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
 		return "{}"
 	}
 	return string(data)
+}
+
+func budgetQueryPlanningInput(input QueryPlanningInput) QueryPlanningInput {
+	input.Purpose = promptbudget.TrimEnd(input.Purpose, 6000)
+	input.Schema = promptbudget.TrimEnd(input.Schema, 6000)
+	input.Index = promptbudget.TrimMiddle(input.Index, 30000)
+	input.Overview = promptbudget.TrimMiddle(input.Overview, 16000)
+	input.LogTail = tailRunes(input.LogTail, 4000)
+	return input
+}
+
+func budgetQueryActionInput(input QueryActionInput, docsBudget int) QueryActionInput {
+	input.Results = budgetQueryResults(input.Results, 12)
+	input.Docs = budgetReadDocuments(input.Docs, docsBudget)
+	input.Navigation = budgetNavigationObservations(input.Navigation, 6, 12)
+	input.Trace = budgetTrace(input.Trace, 12)
+	return input
+}
+
+func budgetQuerySynthesisInput(input QuerySynthesisInput, docsBudget int) QuerySynthesisInput {
+	input.Results = budgetQueryResults(input.Results, 12)
+	input.Docs = budgetReadDocuments(input.Docs, docsBudget)
+	input.Trace = budgetTrace(input.Trace, 16)
+	return input
+}
+
+func budgetQueryResults(results []core.QueryResult, limit int) []core.QueryResult {
+	if limit > 0 && len(results) > limit {
+		results = results[:limit]
+	}
+	out := make([]core.QueryResult, 0, len(results))
+	for _, result := range results {
+		result.Snippet = promptbudget.TrimEnd(result.Snippet, 600)
+		out = append(out, result)
+	}
+	return out
+}
+
+func budgetReadDocuments(docs []QueryReadDocument, totalContentRunes int) []QueryReadDocument {
+	if len(docs) == 0 {
+		return docs
+	}
+	out := make([]QueryReadDocument, 0, len(docs))
+	remaining := totalContentRunes
+	for _, doc := range docs {
+		if remaining <= 0 {
+			doc.Content = ""
+			out = append(out, doc)
+			continue
+		}
+		perDoc := remaining
+		if perDoc > 6000 {
+			perDoc = 6000
+		}
+		original := len([]rune(doc.Content))
+		doc.Content = promptbudget.TrimMiddle(doc.Content, perDoc)
+		remaining -= len([]rune(doc.Content))
+		if note := promptbudget.Annotation(original, len([]rune(doc.Content))); note != "" {
+			doc.Content += "\n\n[" + note + "]"
+		}
+		out = append(out, doc)
+	}
+	return out
+}
+
+func budgetNavigationObservations(observations []QueryNavigationObservation, observationLimit, pagesLimit int) []QueryNavigationObservation {
+	if observationLimit > 0 && len(observations) > observationLimit {
+		observations = observations[len(observations)-observationLimit:]
+	}
+	out := make([]QueryNavigationObservation, 0, len(observations))
+	for _, obs := range observations {
+		if pagesLimit > 0 && len(obs.Pages) > pagesLimit {
+			obs.Pages = obs.Pages[:pagesLimit]
+		}
+		if len(obs.Skipped) > 10 {
+			obs.Skipped = obs.Skipped[:10]
+		}
+		out = append(out, obs)
+	}
+	return out
+}
+
+func budgetTrace(trace []core.QueryTraceStep, limit int) []core.QueryTraceStep {
+	if limit > 0 && len(trace) > limit {
+		trace = trace[len(trace)-limit:]
+	}
+	out := make([]core.QueryTraceStep, 0, len(trace))
+	for _, step := range trace {
+		step.Observation = promptbudget.TrimEnd(step.Observation, 1000)
+		if len([]rune(step.Action.Answer)) > 2000 {
+			step.Action.Answer = promptbudget.TrimEnd(step.Action.Answer, 2000)
+		}
+		if len([]rune(step.Action.Rationale)) > 1000 {
+			step.Action.Rationale = promptbudget.TrimEnd(step.Action.Rationale, 1000)
+		}
+		out = append(out, step)
+	}
+	return out
 }

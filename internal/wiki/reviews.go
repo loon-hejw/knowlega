@@ -51,6 +51,10 @@ func ParseReviewItems(projectID, content string) []core.ReviewItem {
 }
 
 func UpdateReviewItemStatus(projectPath, projectID, id, status string, resolvedAt time.Time) (core.ReviewItem, error) {
+	return UpdateReviewItemStatusWithAction(projectPath, projectID, id, status, "", resolvedAt)
+}
+
+func UpdateReviewItemStatusWithAction(projectPath, projectID, id, status, action string, resolvedAt time.Time) (core.ReviewItem, error) {
 	path := filepath.Join(projectPath, "wiki", "reviews.md")
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -75,7 +79,7 @@ func UpdateReviewItemStatus(projectPath, projectID, id, status string, resolvedA
 			i = end - 1
 			continue
 		}
-		updatedSection := updateReviewStatusLines(lines[start:end], status, resolvedAt)
+		updatedSection := updateReviewStatusLines(lines[start:end], status, action, resolvedAt)
 		updated := append([]string{}, lines[:start]...)
 		updated = append(updated, updatedSection...)
 		updated = append(updated, lines[end:]...)
@@ -88,6 +92,7 @@ func UpdateReviewItemStatus(projectPath, projectID, id, status string, resolvedA
 			return core.ReviewItem{}, err
 		}
 		item.Status = status
+		item.ResolvedAction = action
 		if !resolvedAt.IsZero() && (status == "resolved" || status == "dismissed") {
 			item.ResolvedAt = &resolvedAt
 		}
@@ -96,10 +101,15 @@ func UpdateReviewItemStatus(projectPath, projectID, id, status string, resolvedA
 	return core.ReviewItem{}, fmt.Errorf("review item not found: %s", id)
 }
 
-func updateReviewStatusLines(lines []string, status string, resolvedAt time.Time) []string {
+func updateReviewStatusLines(lines []string, status, action string, resolvedAt time.Time) []string {
 	out := append([]string(nil), lines...)
 	statusLine := "- Status: " + status
 	statusUpdated := false
+	actionLine := ""
+	if strings.TrimSpace(action) != "" {
+		actionLine = "- Resolved action: " + strings.TrimSpace(action)
+	}
+	actionUpdated := actionLine == ""
 	resolvedLine := ""
 	if !resolvedAt.IsZero() && (status == "resolved" || status == "dismissed") {
 		resolvedLine = "- Resolved: " + resolvedAt.UTC().Format(time.RFC3339)
@@ -120,6 +130,12 @@ func updateReviewStatusLines(lines []string, status string, resolvedAt time.Time
 			}
 			resolvedUpdated = true
 		}
+		if strings.HasPrefix(trimmed, "- Resolved action:") {
+			if actionLine != "" {
+				out[i] = actionLine
+			}
+			actionUpdated = true
+		}
 		if strings.HasPrefix(trimmed, "- Source") {
 			insertAt = i + 1
 		}
@@ -130,6 +146,10 @@ func updateReviewStatusLines(lines []string, status string, resolvedAt time.Time
 	}
 	if !resolvedUpdated && resolvedLine != "" {
 		out = insertLine(out, insertAt, resolvedLine)
+		insertAt++
+	}
+	if !actionUpdated && actionLine != "" {
+		out = insertLine(out, insertAt, actionLine)
 	}
 	return out
 }
@@ -149,7 +169,9 @@ func parseReviewItemSection(projectID, dateText, reviewType, title string, lines
 	source := ""
 	status := "open"
 	resolvedAt := (*time.Time)(nil)
+	resolvedAction := ""
 	var affected []string
+	var queries []string
 	var detail strings.Builder
 	inAffected := false
 	inDetail := false
@@ -171,6 +193,10 @@ func parseReviewItemSection(projectID, dateText, reviewType, title string, lines
 			}
 			inAffected = false
 			inDetail = false
+		case strings.HasPrefix(trimmed, "- Resolved action:"):
+			resolvedAction = strings.TrimSpace(strings.TrimPrefix(trimmed, "- Resolved action:"))
+			inAffected = false
+			inDetail = false
 		case trimmed == "### Affected Pages":
 			inAffected = true
 			inDetail = false
@@ -183,6 +209,9 @@ func parseReviewItemSection(projectID, dateText, reviewType, title string, lines
 				affected = append(affected, filepath.ToSlash(page))
 			}
 		case inDetail:
+			if strings.HasPrefix(trimmed, "SEARCH:") {
+				queries = append(queries, splitSearchQueries(strings.TrimSpace(strings.TrimPrefix(trimmed, "SEARCH:")))...)
+			}
 			detail.WriteString(line)
 			detail.WriteString("\n")
 		}
@@ -193,15 +222,71 @@ func parseReviewItemSection(projectID, dateText, reviewType, title string, lines
 	}
 	description := strings.TrimSpace(detail.String())
 	return core.ReviewItem{
-		ID:            core.StableID(projectID, "review", dateText, reviewType, title, source),
-		ProjectID:     projectID,
-		Type:          reviewType,
-		Title:         title,
-		Description:   description,
-		Severity:      "info",
-		Status:        status,
-		AffectedPages: affected,
-		CreatedAt:     createdAt,
-		ResolvedAt:    resolvedAt,
+		ID:             core.StableID(projectID, "review", reviewType, normalizeReviewTitle(title)),
+		ProjectID:      projectID,
+		Type:           reviewType,
+		Title:          title,
+		Description:    description,
+		Severity:       "info",
+		Status:         status,
+		SourcePath:     source,
+		AffectedPages:  affected,
+		SearchQueries:  queries,
+		Options:        reviewOptions(reviewType),
+		ResolvedAction: resolvedAction,
+		CreatedAt:      createdAt,
+		ResolvedAt:     resolvedAt,
+	}
+}
+
+func splitSearchQueries(value string) []string {
+	var out []string
+	for _, part := range strings.Split(value, "|") {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func normalizeReviewTitle(title string) string {
+	title = strings.ToLower(strings.TrimSpace(title))
+	replacer := strings.NewReplacer(
+		"missing page:", "",
+		"missing-page:", "",
+		"缺失页面：", "",
+		"缺失页面:", "",
+		"缺少页面：", "",
+		"缺少页面:", "",
+	)
+	title = replacer.Replace(title)
+	title = strings.Join(strings.Fields(title), " ")
+	return title
+}
+
+func reviewOptions(reviewType string) []core.ReviewOption {
+	base := []core.ReviewOption{
+		{Label: "标记解决", Action: "resolve"},
+		{Label: "忽略", Action: "dismiss"},
+	}
+	switch strings.TrimSpace(reviewType) {
+	case "missing-page":
+		return append([]core.ReviewOption{
+			{Label: "生成页面草稿", Action: "create-page"},
+			{Label: "启动深度研究", Action: "deep-research"},
+			{Label: "重新检查", Action: "sweep"},
+		}, base...)
+	case "source-gap", "review-needed", "suggestion":
+		return append([]core.ReviewOption{
+			{Label: "启动深度研究", Action: "deep-research"},
+			{Label: "重新检查", Action: "sweep"},
+		}, base...)
+	case "duplicate", "contradiction":
+		return append([]core.ReviewOption{
+			{Label: "重新检查", Action: "sweep"},
+		}, base...)
+	default:
+		return base
 	}
 }

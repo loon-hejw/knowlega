@@ -1,0 +1,26 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "kbcore: wait for configured backend",
+      "type": "shell",
+      "command": "go",
+      "args": [
+        "run",
+        "./cmd/kbcore",
+        "--config",
+        "${workspaceFolder}/config.yaml",
+        "wait-ready",
+        "--timeout",
+        "2h"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "GOCACHE": "/private/tmp/kbcore-gocache"
+        }
+      },
+      "problemMatcher": []
+    }
+  ]
+}

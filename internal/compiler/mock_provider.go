@@ -10,13 +10,14 @@ import (
 )
 
 type AnalysisInput struct {
-	SourceTitle string
-	SourceRel   string
-	SourceText  string
-	Purpose     string
-	Schema      string
-	Index       string
-	Overview    string
+	SourceTitle   string
+	SourceRel     string
+	SourceText    string
+	Purpose       string
+	Schema        string
+	Index         string
+	Overview      string
+	ExistingPages string
 }
 
 type Provider interface {

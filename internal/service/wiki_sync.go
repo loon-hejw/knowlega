@@ -371,13 +371,20 @@ type sourceManifestFile struct {
 }
 
 type sourceManifestFileEntry struct {
-	OriginalPath string   `json:"original_path"`
-	SHA256       string   `json:"sha256"`
-	RawPath      string   `json:"raw_path"`
-	Title        string   `json:"title"`
-	Files        []string `json:"files"`
-	ReviewCount  int      `json:"review_count"`
-	UpdatedAt    string   `json:"updated_at"`
+	OriginalPath    string          `json:"original_path"`
+	PipelineVersion int             `json:"pipeline_version,omitempty"`
+	SHA256          string          `json:"sha256"`
+	RawPath         string          `json:"raw_path"`
+	ArchivePath     string          `json:"archive_path,omitempty"`
+	OriginalRawPath string          `json:"original_raw_path,omitempty"`
+	ContentPath     string          `json:"content_path,omitempty"`
+	OriginalSHA256  string          `json:"original_sha256,omitempty"`
+	ContentSHA256   string          `json:"content_sha256,omitempty"`
+	Title           string          `json:"title"`
+	Files           []string        `json:"files"`
+	ReviewCount     int             `json:"review_count"`
+	UpdatedAt       string          `json:"updated_at"`
+	Extraction      json.RawMessage `json:"extraction,omitempty"`
 }
 
 func loadSourceManifestEntries(projectPath, projectID string) ([]core.SourceManifestEntry, error) {
@@ -417,15 +424,21 @@ func loadSourceManifestEntries(projectPath, projectID string) ([]core.SourceMani
 			updatedAt = parsed
 		}
 		entries = append(entries, core.SourceManifestEntry{
-			ID:           core.StableID(projectID, "source-manifest", originalPath),
-			ProjectID:    projectID,
-			OriginalPath: originalPath,
-			SHA256:       entry.SHA256,
-			RawPath:      entry.RawPath,
-			Title:        entry.Title,
-			Files:        append([]string(nil), entry.Files...),
-			ReviewCount:  entry.ReviewCount,
-			UpdatedAt:    updatedAt,
+			ID:              core.StableID(projectID, "source-manifest", originalPath),
+			ProjectID:       projectID,
+			OriginalPath:    originalPath,
+			PipelineVersion: entry.PipelineVersion,
+			SHA256:          entry.SHA256,
+			RawPath:         entry.RawPath,
+			ArchivePath:     entry.ArchivePath,
+			OriginalRawPath: entry.OriginalRawPath,
+			ContentPath:     entry.ContentPath,
+			OriginalSHA256:  entry.OriginalSHA256,
+			ContentSHA256:   entry.ContentSHA256,
+			Title:           entry.Title,
+			Files:           append([]string(nil), entry.Files...),
+			ReviewCount:     entry.ReviewCount,
+			UpdatedAt:       updatedAt,
 		})
 	}
 	return entries, nil

@@ -54,6 +54,9 @@ func WriteQueryAnswer(opts QueryWritebackOptions) (QueryWritebackResult, error) 
 	if err := appendOverview(opts.ProjectPath, "Recent Syntheses", title, rel, "synthesis"); err != nil {
 		return QueryWritebackResult{}, err
 	}
+	if err := RefreshRelationsArtifact(opts.ProjectPath); err != nil {
+		return QueryWritebackResult{}, fmt.Errorf("refresh generated relations: %w", err)
+	}
 	return QueryWritebackResult{Path: rel, Title: title}, nil
 }
 

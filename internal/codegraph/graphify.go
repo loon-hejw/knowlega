@@ -29,6 +29,7 @@ func ImportGraphify(repoID, repoPath, graphPath, reportPath string) (Snapshot, e
 		RepoID:     repoID,
 		RepoPath:   repoPath,
 		Source:     "graphify",
+		Version:    1,
 		ImportedAt: time.Now(),
 	}
 	for _, n := range raw.Nodes {
@@ -51,13 +52,20 @@ func ImportGraphify(repoID, repoPath, graphPath, reportPath string) (Snapshot, e
 		if source == "" || target == "" {
 			continue
 		}
+		confidence := firstNonEmpty(stringField(e, "confidence"), "INFERRED")
+		score := numberField(e, "confidence_score")
+		if score == 0 {
+			score = defaultConfidenceScore(confidence)
+		}
 		snap.Edges = append(snap.Edges, Edge{
-			Source:     source,
-			Target:     target,
-			Relation:   graphifyRelation(e),
-			Confidence: firstNonEmpty(stringField(e, "confidence"), "INFERRED"),
-			Weight:     numberField(e, "weight"),
-			Props:      e,
+			Source:          source,
+			Target:          target,
+			Relation:        graphifyRelation(e),
+			Confidence:      confidence,
+			ConfidenceScore: score,
+			Weight:          numberField(e, "weight"),
+			Evidence:        graphifyEvidence(e),
+			Props:           e,
 		})
 	}
 	if reportPath != "" {
@@ -76,10 +84,18 @@ func graphifyNodeKind(n map[string]any) NodeKind {
 		return NodeFile
 	case "folder", "directory":
 		return NodeFolder
+	case "package", "module":
+		return NodePackage
 	case "function":
 		return NodeFunction
 	case "class":
 		return NodeClass
+	case "struct":
+		return NodeStruct
+	case "interface":
+		return NodeInterface
+	case "type":
+		return NodeType
 	case "method":
 		return NodeMethod
 	case "route":
@@ -108,10 +124,53 @@ func graphifyRelation(e map[string]any) Relation {
 		return RelExtends
 	case "implements":
 		return RelImplements
+	case "embeds":
+		return RelEmbeds
+	case "has_method", "hasmethod":
+		return RelHasMethod
+	case "handles_route":
+		return RelHandlesRoute
+	case "handles_tool":
+		return RelHandlesTool
+	case "step_in_process":
+		return RelStepInProcess
 	case "member_of", "memberof":
 		return RelMemberOf
 	default:
+		if raw != "" {
+			return Relation(strings.ToUpper(strings.NewReplacer("-", "_", " ", "_").Replace(raw)))
+		}
 		return RelRelated
+	}
+}
+
+func graphifyEvidence(edge map[string]any) []string {
+	var out []string
+	for _, key := range []string{"source_location", "evidence", "source_ref"} {
+		switch value := edge[key].(type) {
+		case string:
+			if strings.TrimSpace(value) != "" {
+				out = append(out, strings.TrimSpace(value))
+			}
+		case []any:
+			for _, item := range value {
+				if text := strings.TrimSpace(fmt.Sprint(item)); text != "" {
+					out = append(out, text)
+				}
+			}
+		}
+	}
+	return out
+}
+
+func defaultConfidenceScore(value string) float64 {
+	switch strings.ToUpper(strings.TrimSpace(value)) {
+	case "EXTRACTED":
+		return 1
+	case "AMBIGUOUS":
+		return 0.3
+	default:
+		return 0.75
 	}
 }
 

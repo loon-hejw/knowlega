@@ -237,16 +237,21 @@ func (s *Store) UpsertSourceManifestEntry(ctx context.Context, entry core.Source
 		entry.UpdatedAt = time.Now()
 	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO source_manifest (id, project_id, original_path, sha256, raw_path, title, files, review_count, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+INSERT INTO source_manifest (id, project_id, original_path, sha256, raw_path, archive_path, original_raw_path, content_path, original_sha256, content_sha256, title, files, review_count, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
 ON CONFLICT (project_id, original_path) DO UPDATE SET
   sha256 = EXCLUDED.sha256,
   raw_path = EXCLUDED.raw_path,
+  archive_path = EXCLUDED.archive_path,
+  original_raw_path = EXCLUDED.original_raw_path,
+  content_path = EXCLUDED.content_path,
+  original_sha256 = EXCLUDED.original_sha256,
+  content_sha256 = EXCLUDED.content_sha256,
   title = EXCLUDED.title,
   files = EXCLUDED.files,
   review_count = EXCLUDED.review_count,
   updated_at = EXCLUDED.updated_at
-`, entry.ID, entry.ProjectID, entry.OriginalPath, entry.SHA256, entry.RawPath, entry.Title, sqlArray(entry.Files), entry.ReviewCount, entry.UpdatedAt)
+`, entry.ID, entry.ProjectID, entry.OriginalPath, entry.SHA256, entry.RawPath, entry.ArchivePath, entry.OriginalRawPath, entry.ContentPath, entry.OriginalSHA256, entry.ContentSHA256, entry.Title, sqlArray(entry.Files), entry.ReviewCount, entry.UpdatedAt)
 	return err
 }
 
@@ -353,15 +358,17 @@ func (s *Store) AddGraphNode(ctx context.Context, node core.GraphNode) error {
 		return fmt.Errorf("marshal graph node props: %w", err)
 	}
 	_, err = s.db.ExecContext(ctx, `
-INSERT INTO graph_nodes (id, project_id, repo_id, kind, label, source_ref, props)
-VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+INSERT INTO graph_nodes (id, project_id, repo_id, domain, scope_id, kind, label, source_ref, props)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
 ON CONFLICT (id) DO UPDATE SET
   repo_id = EXCLUDED.repo_id,
+  domain = EXCLUDED.domain,
+  scope_id = EXCLUDED.scope_id,
   kind = EXCLUDED.kind,
   label = EXCLUDED.label,
   source_ref = EXCLUDED.source_ref,
   props = EXCLUDED.props
-`, node.ID, node.ProjectID, nullIfEmpty(node.RepoID), node.Kind, node.Label, node.SourceRef, string(props))
+`, node.ID, node.ProjectID, nullIfEmpty(node.RepoID), defaultString(node.Domain, "code"), node.ScopeID, node.Kind, node.Label, node.SourceRef, string(props))
 	return err
 }
 
@@ -371,15 +378,19 @@ func (s *Store) AddGraphEdge(ctx context.Context, edge core.GraphEdge) error {
 		return fmt.Errorf("marshal graph edge props: %w", err)
 	}
 	_, err = s.db.ExecContext(ctx, `
-INSERT INTO graph_edges (id, project_id, repo_id, src_id, dst_id, relation, confidence, weight, props)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb)
+INSERT INTO graph_edges (id, project_id, repo_id, domain, scope_id, src_id, dst_id, relation, confidence, confidence_score, weight, evidence, props)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb)
 ON CONFLICT (id) DO UPDATE SET
   repo_id = EXCLUDED.repo_id,
+  domain = EXCLUDED.domain,
+  scope_id = EXCLUDED.scope_id,
   relation = EXCLUDED.relation,
   confidence = EXCLUDED.confidence,
+  confidence_score = EXCLUDED.confidence_score,
   weight = EXCLUDED.weight,
+  evidence = EXCLUDED.evidence,
   props = EXCLUDED.props
-`, edge.ID, edge.ProjectID, nullIfEmpty(edge.RepoID), edge.SourceID, edge.TargetID, edge.Relation, edge.Confidence, edge.Weight, string(props))
+`, edge.ID, edge.ProjectID, nullIfEmpty(edge.RepoID), defaultString(edge.Domain, "code"), edge.ScopeID, edge.SourceID, edge.TargetID, edge.Relation, edge.Confidence, edge.ConfidenceScore, edge.Weight, sqlArray(edge.Evidence), string(props))
 	return err
 }
 
@@ -423,7 +434,7 @@ WITH graph_evidence AS (
   SELECT
     COALESCE(NULLIF(ge.props->>'source_ref', ''), 'pg/graph_edges/' || ge.id) AS path,
     COALESCE(src.label, ge.src_id) || ' -> ' || COALESCE(dst.label, ge.dst_id) || ' ' || ge.relation AS title,
-    lower(concat_ws(' ', ge.id, ge.src_id, ge.dst_id, ge.relation, ge.confidence, ge.props::text, src.label, dst.label, src.source_ref, dst.source_ref, cr.repo_path, cr.indexed_commit)) AS haystack,
+    lower(concat_ws(' ', ge.id, ge.domain, ge.scope_id, ge.src_id, ge.dst_id, ge.relation, ge.confidence, ge.confidence_score::text, array_to_string(ge.evidence, ' '), ge.props::text, src.label, dst.label, src.source_ref, dst.source_ref, cr.repo_path, cr.indexed_commit)) AS haystack,
     concat(
       'Graph edge evidence', chr(10), chr(10),
       'Repo ID: ', COALESCE(ge.repo_id, ''), chr(10),
@@ -433,7 +444,9 @@ WITH graph_evidence AS (
       'Target: ', ge.dst_id, ' (', COALESCE(dst.label, ''), ')', chr(10),
       'Relation: ', ge.relation, chr(10),
       'Confidence: ', ge.confidence, chr(10),
+      'Confidence score: ', ge.confidence_score, chr(10),
       'Weight: ', ge.weight, chr(10),
+      'Evidence: ', array_to_string(ge.evidence, ', '), chr(10),
       'Props: ', ge.props::text
     ) AS content,
     120 AS score
@@ -636,6 +649,13 @@ func sqlArray(values []string) []string {
 func nullIfEmpty(value string) any {
 	if value == "" {
 		return nil
+	}
+	return value
+}
+
+func defaultString(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
 	}
 	return value
 }

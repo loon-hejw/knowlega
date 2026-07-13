@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -117,6 +118,73 @@ ValidateToken calls AuthService. A legacy runbook says Gateway only.
 	if issues[0].Type != "contradiction" || issues[0].Path != "wiki/concepts/oauth.md" || !strings.Contains(issues[0].Detail, "AuthService") {
 		t.Fatalf("unexpected issue: %+v", issues[0])
 	}
+}
+
+func TestOpenAICompatibleWikiReviewAgentBudgetsLargeContext(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request chatCompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		if request.MaxTokens != 321 {
+			t.Fatalf("max_tokens=%d", request.MaxTokens)
+		}
+		if len(request.Messages) < 2 {
+			t.Fatalf("expected system and user messages, got %+v", request.Messages)
+		}
+		user := request.Messages[1].Content
+		if got := len([]rune(user)); got > 4500 {
+			t.Fatalf("review prompt was not bounded, got %d runes", got)
+		}
+		if !strings.Contains(user, "wiki/concepts/page-299.md") {
+			t.Fatalf("bounded review prompt should preserve later page metadata:\n%s", user)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{
+				"message": map[string]string{
+					"role":    "assistant",
+					"content": `{"issues":[]}`,
+				},
+			}},
+		})
+	}))
+	defer server.Close()
+
+	pages := make([]WikiReviewPage, 0, 300)
+	for i := 0; i < 300; i++ {
+		pages = append(pages, WikiReviewPage{
+			Path:    filepath.ToSlash(filepath.Join("wiki", "concepts", "page-"+fmtInt(i)+".md")),
+			Title:   "Page " + fmtInt(i),
+			Type:    "concept",
+			Excerpt: strings.Repeat("大段页面内容", 200),
+		})
+	}
+	agent := OpenAICompatibleWikiReviewAgent{
+		BaseURL:         server.URL,
+		APIKey:          "test-key",
+		Model:           "test-model",
+		Client:          server.Client(),
+		MaxInputChars:   5000,
+		MaxOutputTokens: 321,
+	}
+	issues, err := agent.ReviewWiki(WikiReviewInput{
+		Purpose:  strings.Repeat("purpose ", 200),
+		Schema:   strings.Repeat("schema ", 200),
+		Index:    strings.Repeat("index ", 2000),
+		Overview: strings.Repeat("overview ", 1000),
+		Pages:    pages,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(issues) != 0 {
+		t.Fatalf("issues=%+v", issues)
+	}
+}
+
+func fmtInt(v int) string {
+	return strconv.Itoa(v)
 }
 
 func writeFile(t *testing.T, path, content string) {

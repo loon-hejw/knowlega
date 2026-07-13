@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/hejw/knowledge-core/internal/core"
+	"github.com/hejw/knowledge-core/internal/sourcearchive"
 )
 
 type IngestTaskStatus string
@@ -83,9 +84,35 @@ type RunIngestQueueResult struct {
 }
 
 type ScanSourcesResult struct {
-	Queued  int          `json:"queued"`
-	Skipped int          `json:"skipped"`
-	Tasks   []IngestTask `json:"tasks"`
+	Queued      int                       `json:"queued"`
+	Skipped     int                       `json:"skipped"`
+	Tasks       []IngestTask              `json:"tasks"`
+	Events      []SourceWatchEvent        `json:"events,omitempty"`
+	Unsupported []UnsupportedSourceImport `json:"unsupported,omitempty"`
+}
+
+type UnsupportedSourceImport struct {
+	Path   string `json:"path"`
+	Reason string `json:"reason"`
+}
+
+type SourceWatchEvent struct {
+	Path      string `json:"path"`
+	Kind      string `json:"kind"`
+	OldSHA256 string `json:"old_sha256,omitempty"`
+	SHA256    string `json:"sha256,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+type sourceWatchFile struct {
+	Version int                         `json:"version"`
+	Sources map[string]sourceWatchEntry `json:"sources"`
+}
+
+type sourceWatchEntry struct {
+	SHA256     string `json:"sha256"`
+	UpdatedAt  string `json:"updated_at"`
+	LastStatus string `json:"last_status"`
 }
 
 func QueueIngestSource(opts QueueIngestOptions) (IngestTask, error) {
@@ -157,21 +184,104 @@ func ScanRawSources(opts QueueIngestOptions) (ScanSourcesResult, error) {
 		return ScanSourcesResult{}, nil
 	}
 	var paths []string
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
+	result := ScanSourcesResult{}
+	watch, err := loadSourceWatch(opts.ProjectPath)
+	if err != nil {
+		return ScanSourcesResult{}, err
+	}
+	current := map[string]string{}
+	currentStatus := map[string]string{}
+	archiveDirs := map[string]bool{}
+	archives, err := sourcearchive.Discover(opts.ProjectPath)
+	if err != nil {
+		return ScanSourcesResult{}, err
+	}
+	observe := func(abs, relSlash, hash string, supported bool, ext string, force bool, forceReason string) {
+		current[relSlash] = hash
+		currentStatus[relSlash] = "present"
+		previous, seen := watch.Sources[relSlash]
+		if seen && previous.LastStatus == "ignored" && previous.SHA256 == hash {
+			result.Skipped++
+			return
+		}
+		if !supported {
+			currentStatus[relSlash] = "unsupported"
+			reason := "unsupported extension " + ext
+			result.Unsupported = append(result.Unsupported, UnsupportedSourceImport{Path: relSlash, Reason: reason})
+			if !seen || previous.SHA256 != hash || previous.LastStatus != "unsupported" {
+				result.Events = append(result.Events, SourceWatchEvent{Path: relSlash, Kind: "unsupported", SHA256: hash, Reason: reason})
+			}
+			return
+		}
+		if force {
+			paths = append(paths, abs)
+			result.Events = append(result.Events, SourceWatchEvent{Path: relSlash, Kind: "changed", OldSHA256: previous.SHA256, SHA256: hash, Reason: forceReason})
+			return
+		}
+		if !seen {
+			paths = append(paths, abs)
+			result.Events = append(result.Events, SourceWatchEvent{Path: relSlash, Kind: "added", SHA256: hash})
+		} else if previous.SHA256 != hash || previous.LastStatus == "deleted" {
+			paths = append(paths, abs)
+			result.Events = append(result.Events, SourceWatchEvent{Path: relSlash, Kind: "changed", OldSHA256: previous.SHA256, SHA256: hash})
+		} else {
+			result.Skipped++
+		}
+	}
+	for _, archive := range archives {
+		archiveDirs[filepath.Clean(archive.AbsDir)] = true
+		originalAbs := filepath.Join(opts.ProjectPath, filepath.FromSlash(archive.Metadata.OriginalRawPath))
+		ext := strings.ToLower(filepath.Ext(archive.Metadata.OriginalName))
+		actualOriginalHash, hashErr := fileSHA256(originalAbs)
+		if hashErr != nil {
+			return ScanSourcesResult{}, hashErr
+		}
+		if actualOriginalHash != archive.Metadata.OriginalSHA256 {
+			reason := "immutable original SHA256 does not match metadata"
+			current[archive.Metadata.OriginalRawPath] = actualOriginalHash
+			currentStatus[archive.Metadata.OriginalRawPath] = "invalid"
+			result.Unsupported = append(result.Unsupported, UnsupportedSourceImport{Path: archive.Metadata.OriginalRawPath, Reason: reason})
+			result.Events = append(result.Events, SourceWatchEvent{Path: archive.Metadata.OriginalRawPath, Kind: "invalid", SHA256: actualOriginalHash, Reason: reason})
+			continue
+		}
+		force := false
+		forceReason := ""
+		if archive.Metadata.ContentPath != archive.Metadata.OriginalRawPath {
+			contentHash, contentErr := fileSHA256(filepath.Join(opts.ProjectPath, filepath.FromSlash(archive.Metadata.ContentPath)))
+			if contentErr != nil {
+				return ScanSourcesResult{}, contentErr
+			}
+			if contentHash != archive.Metadata.ContentSHA256 {
+				force = true
+				forceReason = "derived content SHA256 changed; re-extraction required"
+			}
+		}
+		observe(originalAbs, archive.Metadata.OriginalRawPath, actualOriginalHash, isSupportedIngestSourceExt(ext), ext, force, forceReason)
+	}
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
 			return err
 		}
-		ext := strings.ToLower(filepath.Ext(path))
-		if ext == ".txt" || ext == ".md" {
-			paths = append(paths, path)
+		if d.IsDir() {
+			if archiveDirs[filepath.Clean(path)] {
+				return filepath.SkipDir
+			}
+			return nil
 		}
+		ext := strings.ToLower(filepath.Ext(path))
+		rel, _ := filepath.Rel(opts.ProjectPath, path)
+		relSlash := filepath.ToSlash(rel)
+		hash, hashErr := fileSHA256(path)
+		if hashErr != nil {
+			return hashErr
+		}
+		observe(path, relSlash, hash, isSupportedIngestSourceExt(ext), ext, false, "")
 		return nil
 	})
 	if err != nil {
 		return ScanSourcesResult{}, err
 	}
 	sort.Strings(paths)
-	result := ScanSourcesResult{}
 	for _, path := range paths {
 		task, err := QueueIngestSource(QueueIngestOptions{
 			ProjectPath: opts.ProjectPath,
@@ -187,7 +297,69 @@ func ScanRawSources(opts QueueIngestOptions) (ScanSourcesResult, error) {
 			result.Skipped++
 		}
 	}
+	for rel, previous := range watch.Sources {
+		if _, ok := current[rel]; !ok && previous.LastStatus != "deleted" {
+			result.Events = append(result.Events, SourceWatchEvent{Path: rel, Kind: "deleted", OldSHA256: previous.SHA256})
+		}
+	}
+	next := sourceWatchFile{Version: 1, Sources: map[string]sourceWatchEntry{}}
+	now := time.Now().UTC().Format(time.RFC3339)
+	for rel, hash := range current {
+		status := currentStatus[rel]
+		if status == "" {
+			status = "present"
+		}
+		if previous, ok := watch.Sources[rel]; ok && previous.LastStatus == "ignored" && previous.SHA256 == hash {
+			status = "ignored"
+		}
+		next.Sources[rel] = sourceWatchEntry{SHA256: hash, UpdatedAt: now, LastStatus: status}
+	}
+	for rel, previous := range watch.Sources {
+		if _, ok := current[rel]; !ok {
+			previous.LastStatus = "deleted"
+			previous.UpdatedAt = now
+			next.Sources[rel] = previous
+		}
+	}
+	if err := saveSourceWatch(opts.ProjectPath, next); err != nil {
+		return ScanSourcesResult{}, err
+	}
 	return result, nil
+}
+
+func ignoreRawSource(projectPath, rawRel string) error {
+	rawRel = filepath.ToSlash(strings.TrimSpace(rawRel))
+	if rawRel == "" {
+		return nil
+	}
+	if archive, ok, err := sourcearchive.FindBySourcePath(projectPath, rawRel); err != nil {
+		return err
+	} else if ok {
+		rawRel = archive.Metadata.OriginalRawPath
+	}
+	abs := filepath.Join(projectPath, filepath.FromSlash(rawRel))
+	hash, err := fileSHA256(abs)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	watch, err := loadSourceWatch(projectPath)
+	if err != nil {
+		return err
+	}
+	watch.Sources[rawRel] = sourceWatchEntry{SHA256: hash, UpdatedAt: time.Now().UTC().Format(time.RFC3339), LastStatus: "ignored"}
+	return saveSourceWatch(projectPath, watch)
+}
+
+func isSupportedIngestSourceExt(ext string) bool {
+	switch strings.ToLower(ext) {
+	case ".txt", ".md", ".pdf", ".docx":
+		return true
+	default:
+		return false
+	}
 }
 
 func RunIngestQueue(opts RunIngestQueueOptions) (RunIngestQueueResult, error) {
@@ -294,6 +466,52 @@ func SaveIngestQueue(projectPath string, queue IngestQueue) error {
 
 func ingestQueuePath(projectPath string) string {
 	return filepath.Join(projectPath, ".kbcore", "ingest-queue.json")
+}
+
+func loadSourceWatch(projectPath string) (sourceWatchFile, error) {
+	watch := sourceWatchFile{Version: 1, Sources: map[string]sourceWatchEntry{}}
+	data, err := os.ReadFile(sourceWatchPath(projectPath))
+	if os.IsNotExist(err) {
+		return watch, nil
+	}
+	if err != nil {
+		return sourceWatchFile{}, err
+	}
+	if strings.TrimSpace(string(data)) == "" {
+		return watch, nil
+	}
+	if err := json.Unmarshal(data, &watch); err != nil {
+		return sourceWatchFile{}, fmt.Errorf("read source watch: %w", err)
+	}
+	if watch.Sources == nil {
+		watch.Sources = map[string]sourceWatchEntry{}
+	}
+	if watch.Version == 0 {
+		watch.Version = 1
+	}
+	return watch, nil
+}
+
+func saveSourceWatch(projectPath string, watch sourceWatchFile) error {
+	path := sourceWatchPath(projectPath)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	watch.Version = 1
+	data, err := json.MarshalIndent(watch, "", "  ")
+	if err != nil {
+		return err
+	}
+	data = append(data, '\n')
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func sourceWatchPath(projectPath string) string {
+	return filepath.Join(projectPath, ".kbcore", "source-watch.json")
 }
 
 func fileSHA256(path string) (string, error) {

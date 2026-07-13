@@ -21,8 +21,16 @@ func TestBootstrapSQLIncludesLLMWikiDerivedStateTables(t *testing.T) {
 		"frontmatter->>'aliases'",
 		"wiki_pages_search_idx",
 		"source_manifest_sha_idx",
+		"source_manifest_archive_idx",
+		"archive_path",
+		"original_raw_path",
+		"content_path",
 		"wiki_page_versions_page_idx",
 		"graph_edges_src_idx",
+		"graph_nodes_domain_scope_idx",
+		"graph_edges_domain_scope_idx",
+		"confidence_score",
+		"evidence text[]",
 	} {
 		if !strings.Contains(BootstrapSQL, want) {
 			t.Fatalf("BootstrapSQL missing %q", want)

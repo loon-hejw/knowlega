@@ -9,11 +9,15 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hejw/knowledge-core/internal/core"
+	"github.com/hejw/knowledge-core/internal/sourcearchive"
 	"github.com/hejw/knowledge-core/internal/wiki"
 )
+
+var wikiPersistMu sync.Mutex
 
 type ValidateOptions struct {
 	ProjectPath   string
@@ -21,6 +25,24 @@ type ValidateOptions struct {
 	Title         string
 	Provider      Provider
 	SkipUnchanged bool
+	OnProgress    func(ValidateProgress)
+	OnCommitted   func(ValidateResult) error
+	Concurrency   int
+	SourceIndex   int
+	SourceTotal   int
+	Manifest      *SourceManifest
+}
+
+type ValidateProgress struct {
+	Phase       string
+	SourcePath  string
+	SourceTitle string
+	Index       int
+	Total       int
+	Files       int
+	Reviews     int
+	Duration    time.Duration
+	Error       string
 }
 
 type ValidateResult struct {
@@ -40,44 +62,166 @@ type BatchValidateResult struct {
 	SkippedCount int
 }
 
+type analyzedSource struct {
+	opts        ValidateOptions
+	started     time.Time
+	title       string
+	rawRel      string
+	hash        string
+	manifestKey string
+	extracted   extractedSource
+	archive     *sourcearchive.Metadata
+	input       AnalysisInput
+	analysis    string
+}
+
+func progressEmitter(opts ValidateOptions, started time.Time) func(string, string, ValidateResult, error) {
+	return func(phase, title string, result ValidateResult, err error) {
+		if opts.OnProgress == nil {
+			return
+		}
+		progress := ValidateProgress{
+			Phase: phase, SourcePath: opts.SourcePath, SourceTitle: title,
+			Index: opts.SourceIndex, Total: opts.SourceTotal,
+			Files: len(result.Files), Reviews: result.ReviewCount, Duration: time.Since(started),
+		}
+		if err != nil {
+			progress.Error = err.Error()
+		}
+		opts.OnProgress(progress)
+	}
+}
+
 func ValidateLLMWiki(opts ValidateOptions) (ValidateResult, error) {
+	work, skipped, err := analyzeLLMWikiSource(opts)
+	if err != nil || skipped != nil {
+		if skipped != nil {
+			return *skipped, nil
+		}
+		return ValidateResult{}, err
+	}
+	return generateAndPersistLLMWikiSource(work)
+}
+
+func analyzeLLMWikiSource(opts ValidateOptions) (*analyzedSource, *ValidateResult, error) {
+	started := time.Now()
+	emit := progressEmitter(opts, started)
 	if opts.Provider == nil {
 		opts.Provider = MockProvider{}
 	}
 	if strings.TrimSpace(opts.ProjectPath) == "" {
-		return ValidateResult{}, fmt.Errorf("project path is required")
+		return nil, nil, fmt.Errorf("project path is required")
 	}
 	if strings.TrimSpace(opts.SourcePath) == "" {
-		return ValidateResult{}, fmt.Errorf("source path is required")
+		return nil, nil, fmt.Errorf("source path is required")
 	}
-	sourceBytes, err := os.ReadFile(opts.SourcePath)
+	if existing, ok, findErr := sourcearchive.FindBySourcePath(opts.ProjectPath, opts.SourcePath); findErr != nil {
+		return nil, nil, findErr
+	} else if ok {
+		opts.SourcePath = filepath.Join(opts.ProjectPath, filepath.FromSlash(existing.Metadata.OriginalRawPath))
+	}
+	originalBytes, err := os.ReadFile(opts.SourcePath)
 	if err != nil {
-		return ValidateResult{}, err
+		return nil, nil, err
 	}
-	hash := sourceHash(sourceBytes)
-	sourceTitle := opts.Title
-	if sourceTitle == "" {
-		sourceTitle = inferSourceTitle(opts.SourcePath, string(sourceBytes))
-	}
-	manifest, err := loadSourceManifest(opts.ProjectPath)
+	hash := sourceHash(originalBytes)
+	archive, legacyRaw, err := ensureSourceArchive(opts.ProjectPath, opts.SourcePath, originalBytes)
 	if err != nil {
-		return ValidateResult{}, err
+		return nil, nil, err
+	}
+	manifest := SourceManifest{}
+	if opts.Manifest != nil {
+		manifest = *opts.Manifest
+	} else {
+		manifest, err = loadSourceManifest(opts.ProjectPath)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 	manifestKey := sourceManifestKey(opts.SourcePath)
+	if archive != nil {
+		for key, entry := range manifest.Sources {
+			if filepath.ToSlash(entry.ArchivePath) == archive.ArchivePath {
+				manifestKey = key
+				break
+			}
+		}
+	}
+	archiveNeedsRepair := false
+	if archive != nil && archive.ContentPath != archive.OriginalRawPath {
+		content, readErr := os.ReadFile(filepath.Join(opts.ProjectPath, filepath.FromSlash(archive.ContentPath)))
+		if readErr != nil || sourceHash(content) != archive.ContentSHA256 {
+			archiveNeedsRepair = true
+		}
+	}
 	if opts.SkipUnchanged {
-		if entry, ok := manifest.Sources[manifestKey]; ok && entry.SHA256 == hash {
-			return ValidateResult{
+		if entry, ok := manifest.Sources[manifestKey]; ok && entry.SHA256 == hash && entry.PipelineVersion >= core.SourceManifestPipelineVersion {
+			if archiveNeedsRepair && archive != nil {
+				extracted, extractErr := extractSourceText(opts.SourcePath, originalBytes)
+				if extractErr != nil {
+					return nil, nil, extractErr
+				}
+				updated, updateErr := sourcearchive.SetExtracted(opts.ProjectPath, archive.OriginalRawPath, extracted.Text, extracted.Extractor)
+				if updateErr != nil {
+					return nil, nil, updateErr
+				}
+				archive = &updated.Metadata
+				entry.RawPath = archive.ContentPath
+				entry.ContentPath = archive.ContentPath
+				entry.ContentSHA256 = archive.ContentSHA256
+				wikiPersistMu.Lock()
+				latest, loadErr := loadSourceManifest(opts.ProjectPath)
+				if loadErr == nil {
+					latest.Sources[manifestKey] = entry
+					loadErr = saveSourceManifest(opts.ProjectPath, latest)
+					manifest = latest
+				}
+				wikiPersistMu.Unlock()
+				if loadErr != nil {
+					return nil, nil, loadErr
+				}
+				if opts.Manifest != nil {
+					*opts.Manifest = manifest
+				}
+			}
+			sourceTitle := firstNonEmpty(opts.Title, entry.Title, strings.TrimSuffix(filepath.Base(opts.SourcePath), filepath.Ext(opts.SourcePath)))
+			result := ValidateResult{
 				RawPath:     entry.RawPath,
 				Files:       entry.Files,
 				ReviewCount: entry.ReviewCount,
 				Skipped:     true,
 				SHA256:      hash,
-			}, nil
+			}
+			emit("skipped", sourceTitle, result, nil)
+			return nil, &result, nil
 		}
 	}
-	sourceRel, err := copyRawSource(opts.ProjectPath, opts.SourcePath, sourceBytes)
+	extracted, err := extractSourceText(opts.SourcePath, originalBytes)
 	if err != nil {
-		return ValidateResult{}, err
+		return nil, nil, err
+	}
+	sourceBytes := extracted.Text
+	sourceTitle := opts.Title
+	if sourceTitle == "" {
+		sourceTitle = inferSourceTitle(opts.SourcePath, string(sourceBytes))
+	}
+	var sourceRel string
+	if archive != nil {
+		if extracted.Extractor != "direct" {
+			updated, updateErr := sourcearchive.SetExtracted(opts.ProjectPath, archive.OriginalRawPath, sourceBytes, extracted.Extractor)
+			if updateErr != nil {
+				return nil, nil, updateErr
+			}
+			archive = &updated.Metadata
+		}
+		sourceRel = archive.ContentPath
+	} else if legacyRaw {
+		sourceRel, err = copyRawSourceWithName(opts.ProjectPath, opts.SourcePath, sourceBytes, extracted.RawName, hash)
+	} else {
+		return nil, nil, fmt.Errorf("source archive was not created for %s", opts.SourcePath)
+	}
+	if err != nil {
+		return nil, nil, err
 	}
 	input := AnalysisInput{
 		SourceTitle: sourceTitle,
@@ -88,47 +232,122 @@ func ValidateLLMWiki(opts ValidateOptions) (ValidateResult, error) {
 		Index:       readOptional(filepath.Join(opts.ProjectPath, "wiki", "index.md")),
 		Overview:    readOptional(filepath.Join(opts.ProjectPath, "wiki", "overview.md")),
 	}
+	emit("analysis", sourceTitle, ValidateResult{}, nil)
 	analysis, err := opts.Provider.Analyze(input)
 	if err != nil {
-		return ValidateResult{}, fmt.Errorf("analysis: %w", err)
+		wrapped := fmt.Errorf("analysis: %w", err)
+		emit("failed", sourceTitle, ValidateResult{}, wrapped)
+		return nil, nil, wrapped
 	}
-	generation, err := opts.Provider.Generate(analysis, input)
+	return &analyzedSource{
+		opts: opts, started: started, title: sourceTitle, rawRel: sourceRel,
+		hash: hash, manifestKey: manifestKey, extracted: extracted, archive: archive, input: input, analysis: analysis,
+	}, nil, nil
+}
+
+func generateAndPersistLLMWikiSource(work *analyzedSource) (ValidateResult, error) {
+	opts := work.opts
+	emit := progressEmitter(opts, work.started)
+	// Generation is serialized and refreshes shared navigation/existing pages,
+	// so every source merges against the latest committed wiki state.
+	wikiPersistMu.Lock()
+	defer wikiPersistMu.Unlock()
+	work.input.Purpose = readOptional(filepath.Join(opts.ProjectPath, "purpose.md"))
+	work.input.Schema = readOptional(filepath.Join(opts.ProjectPath, "schema.md"))
+	work.input.Index = readOptional(filepath.Join(opts.ProjectPath, "wiki", "index.md"))
+	work.input.Overview = readOptional(filepath.Join(opts.ProjectPath, "wiki", "overview.md"))
+	work.input.ExistingPages = existingPagesForAnalysis(opts.ProjectPath, work.analysis)
+	emit("generation", work.title, ValidateResult{}, nil)
+	generation, err := opts.Provider.Generate(work.analysis, work.input)
 	if err != nil {
-		return ValidateResult{}, fmt.Errorf("generation: %w", err)
+		wrapped := fmt.Errorf("generation: %w", err)
+		emit("failed", work.title, ValidateResult{}, wrapped)
+		return ValidateResult{}, wrapped
 	}
-	blocks, err := ParseBlocks(generation)
+	manifest, err := loadSourceManifest(opts.ProjectPath)
 	if err != nil {
 		return ValidateResult{}, err
 	}
+	if opts.Manifest != nil {
+		*opts.Manifest = manifest
+	}
+	emit("persisting", work.title, ValidateResult{}, nil)
+	blocks, err := ParseBlocks(generation)
+	if err == nil {
+		err = ValidateGeneratedBlocks(opts.ProjectPath, blocks, work.rawRel)
+	}
+	if err != nil {
+		// Models sometimes return an otherwise useful page update without
+		// repeating its YAML frontmatter. Give the provider one focused format
+		// repair attempt before failing the whole source and retrying the batch.
+		emit("generation_repair", work.title, ValidateResult{}, err)
+		repairAnalysis := work.analysis + "\n\nFORMAT REPAIR REQUIRED: " + err.Error() + " Regenerate the complete output from scratch. Every ---FILE block must contain valid YAML frontmatter and preserve all existing-page evidence and sources. Return only valid ---FILE and ---REVIEW blocks."
+		generation, repairErr := opts.Provider.Generate(repairAnalysis, work.input)
+		if repairErr != nil {
+			return ValidateResult{}, fmt.Errorf("%w; format repair: %v", err, repairErr)
+		}
+		blocks, err = ParseBlocks(generation)
+		if err == nil {
+			err = ValidateGeneratedBlocks(opts.ProjectPath, blocks, work.rawRel)
+		}
+		if err != nil {
+			return ValidateResult{}, fmt.Errorf("%w; format repair: %v", err, err)
+		}
+	}
 	var written []string
 	for _, file := range blocks.Files {
-		if err := wiki.WriteVersionedPage(opts.ProjectPath, file.Path, []byte(file.Content), "validate-llmwiki: "+sourceTitle); err != nil {
+		if err := wiki.WriteVersionedPage(opts.ProjectPath, file.Path, []byte(file.Content), "validate-llmwiki: "+work.title); err != nil {
 			return ValidateResult{}, err
 		}
 		written = append(written, file.Path)
 	}
-	if err := updateAggregates(opts.ProjectPath, sourceTitle, sourceRel, written, blocks.Reviews); err != nil {
+	if err := updateAggregates(opts.ProjectPath, work.title, work.rawRel, written, blocks.Reviews); err != nil {
 		return ValidateResult{}, err
 	}
-	manifest.Sources[manifestKey] = SourceManifestEntry{
-		OriginalPath: manifestKey,
-		SHA256:       hash,
-		RawPath:      sourceRel,
-		Title:        sourceTitle,
-		Files:        written,
-		ReviewCount:  len(blocks.Reviews),
-		UpdatedAt:    time.Now().Format(time.RFC3339),
+	entry := SourceManifestEntry{
+		OriginalPath:    sourceManifestKey(opts.SourcePath),
+		PipelineVersion: core.SourceManifestPipelineVersion,
+		SHA256:          work.hash,
+		RawPath:         work.rawRel,
+		Title:           work.title,
+		Files:           written,
+		ReviewCount:     len(blocks.Reviews),
+		UpdatedAt:       time.Now().Format(time.RFC3339),
+		Extraction: &SourceExtractionMetadata{
+			SourceExt:   work.extracted.SourceExt,
+			Extractor:   work.extracted.Extractor,
+			ExtractedAt: time.Now().UTC().Format(time.RFC3339),
+		},
 	}
+	if work.archive != nil {
+		entry.OriginalPath = sourceManifestKey(opts.SourcePath)
+		entry.ArchivePath = work.archive.ArchivePath
+		entry.OriginalRawPath = work.archive.OriginalRawPath
+		entry.ContentPath = work.archive.ContentPath
+		entry.OriginalSHA256 = work.archive.OriginalSHA256
+		entry.ContentSHA256 = work.archive.ContentSHA256
+	}
+	manifest.Sources[work.manifestKey] = entry
 	if err := saveSourceManifest(opts.ProjectPath, manifest); err != nil {
 		return ValidateResult{}, err
 	}
-	return ValidateResult{
-		RawPath:     sourceRel,
-		Analysis:    analysis,
+	if opts.Manifest != nil {
+		*opts.Manifest = manifest
+	}
+	result := ValidateResult{
+		RawPath:     work.rawRel,
+		Analysis:    work.analysis,
 		Files:       written,
 		ReviewCount: len(blocks.Reviews),
-		SHA256:      hash,
-	}, nil
+		SHA256:      work.hash,
+	}
+	if opts.OnCommitted != nil {
+		if err := opts.OnCommitted(result); err != nil {
+			return ValidateResult{}, fmt.Errorf("post-commit sync: %w", err)
+		}
+	}
+	emit("completed", work.title, result, nil)
+	return result, nil
 }
 
 func ValidateLLMWikiPath(opts ValidateOptions) (BatchValidateResult, error) {
@@ -137,6 +356,12 @@ func ValidateLLMWikiPath(opts ValidateOptions) (BatchValidateResult, error) {
 		return BatchValidateResult{}, err
 	}
 	if !info.IsDir() {
+		if opts.SourceIndex <= 0 {
+			opts.SourceIndex = 1
+		}
+		if opts.SourceTotal <= 0 {
+			opts.SourceTotal = 1
+		}
 		result, err := ValidateLLMWiki(opts)
 		if err != nil {
 			return BatchValidateResult{}, err
@@ -164,22 +389,101 @@ func ValidateLLMWikiPath(opts ValidateOptions) (BatchValidateResult, error) {
 		return BatchValidateResult{}, err
 	}
 	sort.Strings(sources)
+	manifest, err := loadSourceManifest(opts.ProjectPath)
+	if err != nil {
+		return BatchValidateResult{}, err
+	}
 	var batch BatchValidateResult
-	for _, source := range sources {
-		result, err := ValidateLLMWiki(ValidateOptions{
-			ProjectPath:   opts.ProjectPath,
-			SourcePath:    source,
-			Provider:      opts.Provider,
-			SkipUnchanged: opts.SkipUnchanged,
-		})
-		if err != nil {
-			return BatchValidateResult{}, fmt.Errorf("validate %s: %w", source, err)
+	concurrency := opts.Concurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	if concurrency == 1 {
+		for index, source := range sources {
+			result, err := ValidateLLMWiki(ValidateOptions{
+				ProjectPath:   opts.ProjectPath,
+				SourcePath:    source,
+				Provider:      opts.Provider,
+				SkipUnchanged: opts.SkipUnchanged,
+				OnProgress:    opts.OnProgress,
+				OnCommitted:   opts.OnCommitted,
+				SourceIndex:   index + 1,
+				SourceTotal:   len(sources),
+				Manifest:      &manifest,
+			})
+			if err != nil {
+				return BatchValidateResult{}, fmt.Errorf("validate %s: %w", source, err)
+			}
+			batch.Results = append(batch.Results, result)
+			batch.SourceCount++
+			batch.FileCount += filesWritten(result)
+			batch.ReviewCount += reviewsWritten(result)
+			batch.SkippedCount += skippedCount(result)
+		}
+		return batch, nil
+	}
+	type item struct {
+		index   int
+		work    *analyzedSource
+		skipped *ValidateResult
+		err     error
+	}
+	jobs := make(chan int)
+	results := make(chan item, len(sources))
+	var wg sync.WaitGroup
+	for w := 0; w < concurrency; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				source := sources[index]
+				work, skipped, err := analyzeLLMWikiSource(ValidateOptions{ProjectPath: opts.ProjectPath, SourcePath: source, Provider: opts.Provider, SkipUnchanged: opts.SkipUnchanged, OnProgress: opts.OnProgress, OnCommitted: opts.OnCommitted, SourceIndex: index + 1, SourceTotal: len(sources)})
+				results <- item{index: index, work: work, skipped: skipped, err: err}
+			}
+		}()
+	}
+	go func() {
+		for i := range sources {
+			jobs <- i
+		}
+		close(jobs)
+		wg.Wait()
+		close(results)
+	}()
+	prepared := make([]item, len(sources))
+	for r := range results {
+		prepared[r.index] = r
+	}
+	var firstErr error
+	for index, preparedItem := range prepared {
+		if preparedItem.err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("validate %s: %w", sources[index], preparedItem.err)
+			}
+			continue
+		}
+		var result ValidateResult
+		if preparedItem.skipped != nil {
+			result = *preparedItem.skipped
+		} else {
+			var err error
+			preparedItem.work.opts.Manifest = &manifest
+			result, err = generateAndPersistLLMWikiSource(preparedItem.work)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("validate %s: %w", sources[index], err)
+				}
+				continue
+			}
 		}
 		batch.Results = append(batch.Results, result)
 		batch.SourceCount++
 		batch.FileCount += filesWritten(result)
 		batch.ReviewCount += reviewsWritten(result)
 		batch.SkippedCount += skippedCount(result)
+	}
+	if firstErr != nil {
+		return batch, firstErr
 	}
 	return batch, nil
 }
@@ -223,6 +527,10 @@ func inferSourceTitle(path, content string) string {
 }
 
 func copyRawSource(projectPath, sourcePath string, data []byte) (string, error) {
+	return copyRawSourceWithName(projectPath, sourcePath, data, filepath.Base(sourcePath), sourceHash(data))
+}
+
+func copyRawSourceWithName(projectPath, sourcePath string, data []byte, rawName string, hash string) (string, error) {
 	projectRawRoot, err := filepath.Abs(filepath.Join(projectPath, "raw", "sources"))
 	if err != nil {
 		return "", err
@@ -231,19 +539,23 @@ func copyRawSource(projectPath, sourcePath string, data []byte) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	if rel, err := filepath.Rel(projectRawRoot, sourceAbs); err == nil && rel != "." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".." {
-		projectAbs, err := filepath.Abs(projectPath)
-		if err != nil {
-			return "", err
+	if filepath.Base(rawName) == filepath.Base(sourcePath) {
+		if rel, err := filepath.Rel(projectRawRoot, sourceAbs); err == nil && rel != "." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".." {
+			projectAbs, err := filepath.Abs(projectPath)
+			if err != nil {
+				return "", err
+			}
+			projectRel, err := filepath.Rel(projectAbs, sourceAbs)
+			if err != nil {
+				return "", err
+			}
+			return filepath.ToSlash(projectRel), nil
 		}
-		projectRel, err := filepath.Rel(projectAbs, sourceAbs)
-		if err != nil {
-			return "", err
-		}
-		return filepath.ToSlash(projectRel), nil
 	}
-	hash := sourceHash(data)
-	name := filepath.Base(sourcePath)
+	name := filepath.Base(rawName)
+	if name == "." || name == "/" || strings.TrimSpace(name) == "" {
+		name = filepath.Base(sourcePath)
+	}
 	rel := filepath.ToSlash(filepath.Join("raw", "sources", hash[:12]+"-"+name))
 	abs := filepath.Join(projectPath, filepath.FromSlash(rel))
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
@@ -268,13 +580,26 @@ type SourceManifest struct {
 }
 
 type SourceManifestEntry struct {
-	OriginalPath string   `json:"original_path"`
-	SHA256       string   `json:"sha256"`
-	RawPath      string   `json:"raw_path"`
-	Title        string   `json:"title"`
-	Files        []string `json:"files"`
-	ReviewCount  int      `json:"review_count"`
-	UpdatedAt    string   `json:"updated_at"`
+	OriginalPath    string                    `json:"original_path"`
+	PipelineVersion int                       `json:"pipeline_version,omitempty"`
+	SHA256          string                    `json:"sha256"`
+	RawPath         string                    `json:"raw_path"`
+	ArchivePath     string                    `json:"archive_path,omitempty"`
+	OriginalRawPath string                    `json:"original_raw_path,omitempty"`
+	ContentPath     string                    `json:"content_path,omitempty"`
+	OriginalSHA256  string                    `json:"original_sha256,omitempty"`
+	ContentSHA256   string                    `json:"content_sha256,omitempty"`
+	Title           string                    `json:"title"`
+	Files           []string                  `json:"files"`
+	ReviewCount     int                       `json:"review_count"`
+	UpdatedAt       string                    `json:"updated_at"`
+	Extraction      *SourceExtractionMetadata `json:"extraction,omitempty"`
+}
+
+type SourceExtractionMetadata struct {
+	SourceExt   string `json:"source_ext"`
+	Extractor   string `json:"extractor"`
+	ExtractedAt string `json:"extracted_at"`
 }
 
 func loadSourceManifest(projectPath string) (SourceManifest, error) {
@@ -330,15 +655,21 @@ func LoadSourceManifestEntries(projectPath, projectID string) ([]core.SourceMani
 			updatedAt = parsed
 		}
 		entries = append(entries, core.SourceManifestEntry{
-			ID:           core.StableID(projectID, "source-manifest", originalPath),
-			ProjectID:    projectID,
-			OriginalPath: originalPath,
-			SHA256:       entry.SHA256,
-			RawPath:      entry.RawPath,
-			Title:        entry.Title,
-			Files:        append([]string(nil), entry.Files...),
-			ReviewCount:  entry.ReviewCount,
-			UpdatedAt:    updatedAt,
+			ID:              core.StableID(projectID, "source-manifest", originalPath),
+			ProjectID:       projectID,
+			OriginalPath:    originalPath,
+			PipelineVersion: entry.PipelineVersion,
+			SHA256:          entry.SHA256,
+			RawPath:         entry.RawPath,
+			ArchivePath:     entry.ArchivePath,
+			OriginalRawPath: entry.OriginalRawPath,
+			ContentPath:     entry.ContentPath,
+			OriginalSHA256:  entry.OriginalSHA256,
+			ContentSHA256:   entry.ContentSHA256,
+			Title:           entry.Title,
+			Files:           append([]string(nil), entry.Files...),
+			ReviewCount:     entry.ReviewCount,
+			UpdatedAt:       updatedAt,
 		})
 	}
 	return entries, nil
@@ -373,12 +704,104 @@ func sourceManifestKey(path string) string {
 	return filepath.ToSlash(abs)
 }
 
+func ensureSourceArchive(projectPath, sourcePath string, originalBytes []byte) (*sourcearchive.Metadata, bool, error) {
+	if archive, ok, err := sourcearchive.FindBySourcePath(projectPath, sourcePath); err != nil {
+		return nil, false, err
+	} else if ok {
+		hash := sourceHash(originalBytes)
+		if archive.Metadata.OriginalSHA256 != hash {
+			return nil, false, fmt.Errorf("source archive original hash mismatch: %s", archive.Metadata.OriginalRawPath)
+		}
+		metadata := archive.Metadata
+		return &metadata, false, nil
+	}
+	rawRoot, err := filepath.Abs(filepath.Join(projectPath, "raw", "sources"))
+	if err != nil {
+		return nil, false, err
+	}
+	sourceAbs, err := filepath.Abs(sourcePath)
+	if err != nil {
+		return nil, false, err
+	}
+	if rel, relErr := filepath.Rel(rawRoot, sourceAbs); relErr == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		// Legacy flat/nested raw sources remain readable until the explicit
+		// source-layout migration moves them into archives.
+		return nil, true, nil
+	}
+	archive, err := sourcearchive.ImportBytes(sourcearchive.ImportOptions{
+		ProjectPath:      projectPath,
+		RelativePath:     filepath.Base(sourcePath),
+		OriginalLocation: sourceAbs,
+	}, originalBytes)
+	if err != nil {
+		return nil, false, err
+	}
+	metadata := archive.Metadata
+	return &metadata, false, nil
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 func readOptional(path string) string {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
 	return string(data)
+}
+
+func existingPagesForAnalysis(projectPath, analysis string) string {
+	paths := map[string]bool{}
+	for rest := analysis; ; {
+		start := strings.Index(rest, "wiki/")
+		if start < 0 {
+			break
+		}
+		rest = rest[start:]
+		end := strings.Index(rest, ".md")
+		if end < 0 {
+			break
+		}
+		candidate := strings.Trim(rest[:end+3], "`'\"()[]{}<>,;:")
+		if validateWikiFilePath(candidate) == nil {
+			paths[filepath.ToSlash(candidate)] = true
+		}
+		rest = rest[end+3:]
+	}
+	if pages, err := wiki.ScanWikiPages(wiki.ScanOptions{ProjectPath: projectPath}); err == nil {
+		for _, page := range pages {
+			if page.Title != "" && len([]rune(page.Title)) >= 2 && strings.Contains(analysis, page.Title) {
+				paths[page.Path] = true
+			}
+		}
+	}
+	ordered := make([]string, 0, len(paths))
+	for path := range paths {
+		ordered = append(ordered, path)
+	}
+	sort.Strings(ordered)
+	if len(ordered) > 12 {
+		ordered = ordered[:12]
+	}
+	var b strings.Builder
+	for _, path := range ordered {
+		content := readOptional(filepath.Join(projectPath, filepath.FromSlash(path)))
+		if strings.TrimSpace(content) == "" {
+			continue
+		}
+		fmt.Fprintf(&b, "\n---EXISTING PAGE: %s\n%s\n", path, content)
+		if b.Len() >= 48000 {
+			break
+		}
+	}
+	return b.String()
 }
 
 func updateAggregates(projectPath, title string, sourceRel string, files []string, reviews []ReviewBlock) error {

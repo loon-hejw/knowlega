@@ -5,6 +5,11 @@ import (
 	"time"
 )
 
+// SourceManifestPipelineVersion is bumped when unchanged sources must be
+// recompiled to pick up a materially different LLM Wiki generation contract.
+// It is stored per source so a partially migrated corpus remains resumable.
+const SourceManifestPipelineVersion = 2
+
 type Confidence string
 
 const (
@@ -75,15 +80,21 @@ type WikiPageVersion struct {
 }
 
 type SourceManifestEntry struct {
-	ID           string
-	ProjectID    string
-	OriginalPath string
-	SHA256       string
-	RawPath      string
-	Title        string
-	Files        []string
-	ReviewCount  int
-	UpdatedAt    time.Time
+	ID              string
+	ProjectID       string
+	OriginalPath    string
+	PipelineVersion int
+	SHA256          string
+	RawPath         string
+	ArchivePath     string
+	OriginalRawPath string
+	ContentPath     string
+	OriginalSHA256  string
+	ContentSHA256   string
+	Title           string
+	Files           []string
+	ReviewCount     int
+	UpdatedAt       time.Time
 }
 
 type CodeRepo struct {
@@ -108,6 +119,8 @@ type GraphNode struct {
 	ID        string
 	ProjectID string
 	RepoID    string
+	Domain    string
+	ScopeID   string
 	Kind      string
 	Label     string
 	SourceRef string
@@ -115,15 +128,19 @@ type GraphNode struct {
 }
 
 type GraphEdge struct {
-	ID         string
-	ProjectID  string
-	RepoID     string
-	SourceID   string
-	TargetID   string
-	Relation   string
-	Confidence Confidence
-	Weight     float64
-	Props      map[string]any
+	ID              string
+	ProjectID       string
+	RepoID          string
+	Domain          string
+	ScopeID         string
+	SourceID        string
+	TargetID        string
+	Relation        string
+	Confidence      Confidence
+	ConfidenceScore float64
+	Weight          float64
+	Evidence        []string
+	Props           map[string]any
 }
 
 type GraphEvidence struct {
@@ -134,16 +151,25 @@ type GraphEvidence struct {
 }
 
 type ReviewItem struct {
-	ID            string
-	ProjectID     string
-	Type          string
-	Title         string
-	Description   string
-	Severity      string
-	Status        string
-	AffectedPages []string
-	CreatedAt     time.Time
-	ResolvedAt    *time.Time
+	ID             string
+	ProjectID      string
+	Type           string
+	Title          string
+	Description    string
+	Severity       string
+	Status         string
+	SourcePath     string
+	AffectedPages  []string
+	SearchQueries  []string
+	Options        []ReviewOption
+	ResolvedAction string
+	CreatedAt      time.Time
+	ResolvedAt     *time.Time
+}
+
+type ReviewOption struct {
+	Label  string
+	Action string
 }
 
 type QueryResult struct {

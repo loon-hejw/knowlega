@@ -21,13 +21,20 @@ When generated wiki pages are overwritten, the previous page is archived under
 ## Current Scope
 
 - `kbcore init`: create a local wiki project layout.
-- `kbcore ingest`: copy an immutable source into `raw/sources/` and compile a
+- `kbcore ingest`: archive an immutable source under its own
+  `raw/sources/<collection>/<slug>-<hash12>/` directory and compile a
   source summary page into `wiki/sources/`. It also records the raw source and
   generated source page in `.kbcore/source-manifest.json`.
+- `kbcore source-layout migrate`: preview the conversion of legacy flat
+  `raw/sources/` files into per-source archives. Add `--apply` to execute the
+  journaled/resumable migration. It updates Markdown provenance, manifest,
+  queue, and watch state without invoking an LLM; `source-layout status` reads
+  `.kbcore/source-layout-migration.json`.
 - `kbcore validate-llmwiki`: run the LLM Wiki ingest flow for one file or a
   directory of `.txt`/`.md` files, generating source/concept/entity/synthesis
-  pages through strict `---FILE:`/`---REVIEW:` blocks. Pass `--agent llm` to use
-  an OpenAI-compatible provider, or `--agent mock` for offline validation.
+  pages through strict `---FILE:`/`---REVIEW:` blocks. The user-facing runtime
+  requires `--agent llm` with an OpenAI-compatible or Anthropic Messages
+  provider.
   Review blocks are persisted in `wiki/reviews.md`. Pass `--skip-unchanged` to
   avoid reprocessing sources whose SHA256 is unchanged in
   `.kbcore/source-manifest.json`.
@@ -38,10 +45,8 @@ When generated wiki pages are overwritten, the previous page is archived under
   manifest.
 - `kbcore query`: run the LLM Wiki query workflow: read the navigation files,
   produce a query plan, use local search only as candidate recall, then return
-  an answer/citation bundle. The current default agent is an offline fallback;
-  production should use the LLM action loop. Pass `--agent mock` for a
-  deterministic offline tool-loop validation scaffold, or `--save-title` to
-  write a useful LLM-backed answer back into `wiki/syntheses/`.
+  an answer/citation bundle. Query uses the LLM action loop; pass `--save-title`
+  to write a useful LLM-backed answer back into `wiki/syntheses/`.
 - `kbcore lint`: deterministic checks for broken links, orphan pages, missing
   outlinks, and known title/alias mentions that should be `[[wikilink]]`
   cross-references. Pass `--agent llm` to run the structural checks and then the
@@ -57,10 +62,21 @@ When generated wiki pages are overwritten, the previous page is archived under
   synced into PostgreSQL by the existing wiki sync path.
 - `kbcore code-import-graphify`: import a graphify `graph.json`/report snapshot
   and compile a code overview page.
+- `kbcore code-index-go`: build an exact Go-native semantic graph from a local
+  repository. It records packages, files, functions, methods, types,
+  interfaces, calls, imports, implementations, routes, tools, deterministic
+  communities, and bounded process flows under `.kbcore/graph-snapshots/`, then
+  creates versioned code overview/community/process Wiki pages. Every snapshot
+  records the Git commit, dirty-worktree state, and SHA256 of the indexed Go
+  sources so local changes cannot masquerade as the clean commit.
 - `kbcore serve`: run the same knowledge core as a local HTTP JSON service.
   The service exposes project init, ingest queue, LLM Wiki validate, query
   writeback, review tasks, wiki review, PG sync, lint, and code graph import
-  endpoints. Pass `--project` for a default wiki project and `--worker` to
+  endpoints. The graph API supports filtered, cursor-bounded subgraphs and
+  node expansion instead of returning the entire graph. With `graph.enabled`,
+  configured GitHub/GitLab/Gitea push webhooks enqueue allowlisted repository
+  indexing; `graph.worker` consumes the restart-safe graph queue. Pass
+  `--project` for a default wiki project and `--worker` to
   periodically scan `raw/sources/` and consume the ingest queue.
 - `kbcore migrate-sql`: print the PostgreSQL bootstrap schema.
 
@@ -128,8 +144,8 @@ search results. The CLI prints the action trace and supports `--save-title auto`
 to use the LLM-suggested title.
 The offline fallback keeps tests deterministic, but it is only a scaffold. Use
 `--agent llm` for a real LLM-driven planner/action/synthesis workflow. CLI/API
-database configuration is available through `--db-dsn` or `KB_CORE_DB_DSN`, with
-`--project-id` or `KB_CORE_PROJECT_ID` selecting the PG project scope. Query
+database configuration is read from `database.dsn` and `database.project_id` in
+`config.yaml`, with explicit `--db-dsn`/`--project-id` CLI overrides. Query
 writeback is enforced in the service layer: only non-offline answers with
 `can_write_back=true` and at least one non-navigation citation can be saved to
 `wiki/syntheses/`. When PostgreSQL is configured, completed queries are also
@@ -145,11 +161,13 @@ semantic naming metadata, matching the file-search scorer's alias boost.
 Page embedding text includes title, type, aliases, sources, and body, so changes
 to semantic naming or provenance refresh embeddings through the stored source
 hash.
-Use `sync-wiki-pg --embed` with `KB_CORE_EMBEDDING_MODEL` plus
-`KB_CORE_EMBEDDING_API_KEY` or `OPENAI_API_KEY` to populate page embeddings.
+Use `sync-wiki-pg --embed` with the `embedding` section in `config.yaml` to
+populate page embeddings. The runtime retries `/v1/embeddings` if a root
+`/embeddings` request returns 404, and `embedding.max_input_chars` bounds long
+page text before embedding so smaller models do not reject large wiki pages.
 When `ingest`, `validate-llmwiki`, `query --save-title`, or
 `code-import-graphify` run with `--db-dsn`/`--project-id`, the pages they write
-are incrementally synced into PG; if embedding env vars are configured, those
+are incrementally synced into PG; if an embedding model is configured, those
 page embeddings are refreshed only when the embedding text hash or embedding
 model changes. PostgreSQL stores `embedding_model`,
 `embedding_source_sha256`, and `embedding_updated_at` beside the pgvector value.
@@ -168,6 +186,12 @@ project/
   schema.md
   raw/
     sources/
+      <collection>/
+        <slug>-<sha256-prefix>/
+          metadata.json
+          original/
+            <original-file>
+          extracted.md        # PDF/DOCX only
     code-graphs/
   wiki/
     index.md
@@ -177,6 +201,10 @@ project/
     sources/
     code/
     syntheses/
+  .kbcore/
+    graph-snapshots/
+    graph-jobs.json
+    relations.json            # generated; never a hand-edited truth source
 ```
 
 ## Build And Test
@@ -184,23 +212,63 @@ project/
 ```bash
 go test ./...
 bash scripts/verify-xiyouji.sh
-go run ./cmd/kbcore init --path /tmp/demo-kb --name demo
-go run ./cmd/kbcore ingest --project /tmp/demo-kb --source ./README.md
-go run ./cmd/kbcore validate-llmwiki --project /tmp/demo-kb --source ./tst/xiyouji-chapters --agent mock --skip-unchanged
-go run ./cmd/kbcore queue-ingest --project /tmp/demo-kb --source ./tst/xiyouji-chapters/chapter-054.txt
-go run ./cmd/kbcore run-queue --project /tmp/demo-kb --agent mock
-go run ./cmd/kbcore query --project /tmp/demo-kb --q graph
-go run ./cmd/kbcore lint --project /tmp/demo-kb
+go run ./cmd/kbcore --config config.yaml init --path /tmp/demo-kb --name demo
+go run ./cmd/kbcore --config config.yaml ingest --project /tmp/demo-kb --source ./README.md
+go run ./cmd/kbcore --config config.yaml validate-llmwiki --project /tmp/demo-kb --source ./tst/xiyouji-chapters --agent llm --skip-unchanged
+go run ./cmd/kbcore --config config.yaml queue-ingest --project /tmp/demo-kb --source ./tst/xiyouji-chapters/chapter-054.txt
+go run ./cmd/kbcore --config config.yaml run-queue --project /tmp/demo-kb --agent llm
+go run ./cmd/kbcore --config config.yaml source-layout migrate --project /tmp/demo-kb
+go run ./cmd/kbcore --config config.yaml source-layout migrate --project /tmp/demo-kb --apply --migrate-db
+go run ./cmd/kbcore --config config.yaml code-index-go --project /tmp/demo-kb --repo-path . --repo-id knowledge-core --migrate-db
+go run ./cmd/kbcore --config config.yaml query --project /tmp/demo-kb --q graph
+go run ./cmd/kbcore --config config.yaml lint --project /tmp/demo-kb
 bash scripts/verify-llmwiki-llm.sh
 ```
+
+## Local Docker Test Config
+
+Start a local PostgreSQL database with pgvector:
+
+```bash
+docker compose -f docker-compose.local.yml up -d
+cp config.example.yaml config.yaml
+$EDITOR config.yaml
+env GOCACHE=/private/tmp/kbcore-gocache go run ./cmd/kbcore migrate-sql | \
+  docker exec -i kbcore-postgres-local psql -U kbcore -d kbcore
+```
+
+Then run the local stack with LLM credentials configured in `config.yaml`:
+
+```bash
+env GOCACHE=/private/tmp/kbcore-gocache go run ./cmd/kbcore --config config.yaml serve --migrate-db
+```
+
+For managed remote indexing, configure the `graph` section in
+`config.example.yaml`. Repository entries are the complete allowlist. Webhook
+endpoints are `POST /webhooks/code/<registry-id>` and verify provider-specific
+signatures/tokens before queueing only the configured branch. Clone credentials
+are supplied to Git through an ephemeral HTTP header; they are not placed in
+the remote URL, logs, snapshots, or API responses. Optional
+`graph.semantic_enrichment` adds bounded LLM-inferred document relations after
+the exact Go index completes; failures never replace or invalidate extracted
+symbol/call facts.
 
 ## Service Mode
 
 Start a local API server:
 
 ```bash
-go run ./cmd/kbcore serve --addr 127.0.0.1:19829 --project /tmp/demo-kb --agent llm
+go run ./cmd/kbcore --config config.yaml serve
 ```
+
+`serve` listens before the configured bootstrap corpus finishes. Follow progress
+in the terminal or through `GET /workspace/status`; project APIs return HTTP 503
+until Markdown validation and configured PostgreSQL/embedding sync are ready.
+Each completed source is checkpointed in `.kbcore/source-manifest.json`, so a
+restart skips unchanged sources and resumes at the first incomplete source.
+Transient failures retry with exponential backoff configured by
+`project.bootstrap.retry_initial_delay` and `retry_max_delay`. Use
+`kbcore wait-ready` only when a script must wait for the complete project.
 
 Add `--worker --scan-interval 30s` only when the service should continuously
 scan `raw/sources/` and process queued files. Without `--worker`, writes happen
@@ -224,11 +292,23 @@ curl -sS -X POST http://127.0.0.1:19829/query \
   -d '{"q":"女儿国 唐僧 八戒","agent":"llm","save_title":"女儿国 synthesis"}'
 
 curl -sS 'http://127.0.0.1:19829/reviews?status=open'
+
+curl -sS 'http://127.0.0.1:19829/projects/files?project=/tmp/demo-kb'
+
+curl -sS -X POST http://127.0.0.1:19829/projects/sources/delete \
+  -H 'Content-Type: application/json' \
+  -d '{"project_path":"/tmp/demo-kb","source_path":"raw/sources/example.md","dry_run":true}'
 ```
 
-The service is local-first and has no built-in authentication. Keep the default
-loopback binding or put it behind an authenticated reverse proxy before exposing
-it on a network.
+The service is local-first. Set `server.api_token` to require
+`Authorization: Bearer ...` for non-loopback requests; set
+`server.api_require_token: true` to require the token for loopback requests too.
+
+Agent clients can also use the stdio MCP server:
+
+```bash
+go run ./cmd/kbcore --config config.yaml mcp
+```
 
 ## Web UI
 
@@ -236,14 +316,15 @@ The `web/` app is a Vite + React + TypeScript frontend using Ant Design. It
 talks to `kbcore serve` through the Vite `/api` proxy during development.
 
 ```bash
-go run ./cmd/kbcore serve --addr 127.0.0.1:19829 --project /tmp/demo-kb --agent llm
+go run ./cmd/kbcore --config config.yaml serve
 
 cd web
 npm install
 npm run dev
 ```
 
-Open the Vite URL and set the project path, project id, and agent in Settings.
+Open the Vite URL; the UI reads the active project path, project id, and agent
+from the backend and enters the configured project automatically.
 The UI supports health checks, queueing sources, scanning `raw/sources/`, running
 the ingest queue, querying with optional synthesis writeback, resolving review
 items, linting, LLM wiki review, validate flow, and PostgreSQL sync.
@@ -259,60 +340,62 @@ npm run build
 split `tst/xiyouji-chapters` corpus. It creates a temporary project, runs mock
 LLM Wiki ingest over all 100 chapter files, checks the expected `sources=100`,
 `files=300`, and `reviews=100` shape, runs lint, then asks chapter-level
-queries through `query --agent mock` and verifies the action trace plus the
-first result. It also imports a tiny graphify snapshot and asks a code
-relationship question that must use the `graph` tool. The mock query agent
-exercises `list_pages`/`read`/`search`/`graph`/`final` tool-loop plumbing without
+queries through internal deterministic query scaffolds and verifies the action
+trace plus the first result. It also imports a tiny graphify snapshot and asks a
+code relationship question that must use the `graph` tool. These scaffolds
+exercise `list_pages`/`read`/`search`/`graph`/`final` tool-loop plumbing without
 claiming real semantic LLM planning. The script checks navigation-first reads,
 search fallback with auto-read evidence, and graphify evidence lookup.
 
-To sync graphify/GitNexus-style graph facts into PostgreSQL and let query use
-PG graph evidence:
+To sync graphify/GitNexus-style graph facts into PostgreSQL, configure the
+`database` section and run the commands with `--config config.yaml`; explicit
+`--db-dsn` and `--project-id` remain available as one-off CLI overrides.
+
+To run ingest/query with a real OpenAI-compatible or Anthropic Messages LLM
+planner/synthesizer:
 
 ```bash
-export KB_CORE_DB_DSN='postgres://user:pass@localhost:5432/kb?sslmode=disable'
-export KB_CORE_PROJECT_ID=demo
-go run ./cmd/kbcore code-import-graphify --project /tmp/demo-kb --repo-id repo --repo-path /path/to/repo --graph graph.json --db-dsn "$KB_CORE_DB_DSN" --project-id "$KB_CORE_PROJECT_ID"
-go run ./cmd/kbcore sync-wiki-pg --project /tmp/demo-kb --db-dsn "$KB_CORE_DB_DSN" --project-id "$KB_CORE_PROJECT_ID" --migrate-db --embed
-go run ./cmd/kbcore query --project /tmp/demo-kb --project-id "$KB_CORE_PROJECT_ID" --db-dsn "$KB_CORE_DB_DSN" --q "ValidateToken AuthService" --agent llm
+cp config.example.yaml config.yaml
+$EDITOR config.yaml
+go run ./cmd/kbcore --config config.yaml validate-llmwiki --project /tmp/demo-kb --source ./tst/xiyouji-chapters/chapter-054.txt --agent llm
+go run ./cmd/kbcore --config config.yaml query --project /tmp/demo-kb --q "女儿国 唐僧 八戒" --agent llm
+go run ./cmd/kbcore --config config.yaml lint --project /tmp/demo-kb --agent llm
+go run ./cmd/kbcore --config config.yaml review-wiki --project /tmp/demo-kb --agent llm
 ```
 
-To run ingest/query with a real OpenAI-compatible LLM planner/synthesizer:
+Set `llm.protocol: openai` for `POST /chat/completions`, or set
+`llm.protocol: anthropic` for `POST /messages`. Anthropic mode sends
+`x-api-key`, `Authorization: Bearer`, and `anthropic-version` (default
+`2023-06-01`), which supports both Anthropic-native authentication and gateways
+that retain Bearer authentication. `base_url` may be the provider root, a
+`/v1` base, or the full operation URL; Anthropic root URLs are normalized to
+`/v1/messages`. OpenAI-compatible root URLs retain the existing direct
+`/chat/completions` behavior, while `/v1` bases use `/v1/chat/completions`.
+The protocol setting is shared by ingest, overview synthesis, query
+planning/tool use, and semantic wiki review.
+Embeddings remain independently OpenAI-compatible through the `embedding`
+section.
 
-```bash
-cp .env.local.example .env.local
-$EDITOR .env.local
-go run ./cmd/kbcore validate-llmwiki --project /tmp/demo-kb --source ./tst/xiyouji-chapters/chapter-054.txt --agent llm
-go run ./cmd/kbcore query --project /tmp/demo-kb --q "女儿国 唐僧 八戒" --agent llm
-go run ./cmd/kbcore query --project /tmp/demo-kb --q "女儿国 唐僧 八戒" --agent llm --save-title "女儿国 synthesis"
-go run ./cmd/kbcore lint --project /tmp/demo-kb --agent llm
-go run ./cmd/kbcore review-wiki --project /tmp/demo-kb --agent llm
-```
+`llm.user_agent` is optional and defaults to `knowledge-core/0.1`. Gateways
+that route or filter by client identity can override it; the configured value
+is sent unchanged on both OpenAI-compatible and Anthropic requests.
 
-LLM, embedding, and PostgreSQL settings can live in `.env.local`, `kbcore.env`,
-or `.kbcore/config.env` in the current working directory. Set `KB_CORE_CONFIG`
-to point at a different config file. Shell environment variables still take
-precedence over file values.
-
-For the internal modelgate setup, `.env.local` can contain:
-
-```dotenv
-KB_CORE_LLM_BASE_URL=https://modelgate.bhidi.com/v1
-KB_CORE_LLM_API_KEY=replace-with-your-key
-KB_CORE_LLM_MODEL=Qwen3.6-27B-FP8
-KB_CORE_EMBEDDING_MODEL=
-```
+`config.yaml` is the only runtime configuration source. Relative project and
+bootstrap paths are resolved from the YAML file's directory. Explicit CLI flags
+override YAML values; YAML values override program defaults. Legacy environment
+variables and `.env.local`/`kbcore.env` files are intentionally ignored.
 
 VS Code users can run the checked-in `Full Stack: LLM + Web` compound launch.
-It starts `kbcore serve --agent llm` on `127.0.0.1:19829` and the Vite frontend
-on `127.0.0.1:5177`, using `.env.local` for local secrets.
+It starts `kbcore --config config.yaml serve` and the Vite frontend on
+`127.0.0.1:5177`. While the backend performs the first LLM bootstrap, the web UI
+shows per-source Analysis/Generation/persistence/sync progress and automatic
+retry timing; it opens the configured project as soon as the API becomes ready.
 
-Without those variables, `--agent auto` uses the offline mock/fallback agents.
-Those are useful for tests, but they are not the final LLM Wiki behavior and
-their query answers are not eligible for `--save-title` writeback.
+Without valid YAML credentials, user-facing LLM commands fail fast with a clear
+field-specific configuration error instead of silently falling back to offline scaffolds.
 
-`scripts/verify-llmwiki-llm.sh` is the small real-LLM acceptance path. It skips
-when LLM credentials are absent. When configured, it creates three fixed source
+`scripts/verify-llmwiki-llm.sh` is the small real-LLM acceptance path. With a
+valid YAML config, it creates three fixed source
 files, runs `validate-llmwiki --agent llm`, checks that generated wiki pages
 preserve source provenance and wikilinks, checks `overview.md` and
 `reviews.md`, requires one `wiki/sources/` source-summary page per fixed source,
@@ -323,5 +406,5 @@ LLM review commands must report at least one semantic issue type such as
 `contradiction`, `stale-claim`, `source-gap`, or `review-needed`.
 On success, it writes `VERIFY_REPORT.md` inside the temporary wiki project with
 the fixed sources, generated pages, link count, and command outputs.
-Set `KB_CORE_REQUIRE_LLM=1` when this should be a hard gate instead of a skip on
-missing LLM credentials.
+Pass the intended YAML path as the script's first argument; missing credentials
+are a hard failure rather than an automatic mock fallback.

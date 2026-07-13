@@ -18,20 +18,22 @@ import (
 )
 
 type QueryPlanningInput struct {
-	Question string
-	Purpose  string
-	Schema   string
-	Index    string
-	Overview string
-	LogTail  string
+	Question            string
+	ConversationContext string
+	Purpose             string
+	Schema              string
+	Index               string
+	Overview            string
+	LogTail             string
 }
 
 type QuerySynthesisInput struct {
-	Question string
-	Plan     core.QueryPlan
-	Results  []core.QueryResult
-	Docs     []QueryReadDocument
-	Trace    []core.QueryTraceStep
+	Question            string
+	ConversationContext string
+	Plan                core.QueryPlan
+	Results             []core.QueryResult
+	Docs                []QueryReadDocument
+	Trace               []core.QueryTraceStep
 }
 
 type QueryReadDocument struct {
@@ -61,18 +63,28 @@ type QueryAgent interface {
 	SynthesizeQuery(QuerySynthesisInput) (string, error)
 }
 
+type ContextQueryAgent interface {
+	PlanQueryContext(context.Context, QueryPlanningInput) (core.QueryPlan, error)
+	SynthesizeQueryContext(context.Context, QuerySynthesisInput) (string, error)
+}
+
 type QueryActionInput struct {
-	Question   string
-	Plan       core.QueryPlan
-	Results    []core.QueryResult
-	Docs       []QueryReadDocument
-	Navigation []QueryNavigationObservation
-	Trace      []core.QueryTraceStep
-	Step       int
+	Question            string
+	ConversationContext string
+	Plan                core.QueryPlan
+	Results             []core.QueryResult
+	Docs                []QueryReadDocument
+	Navigation          []QueryNavigationObservation
+	Trace               []core.QueryTraceStep
+	Step                int
 }
 
 type QueryActionAgent interface {
 	NextQueryAction(QueryActionInput) (core.QueryAction, error)
+}
+
+type ContextQueryActionAgent interface {
+	NextQueryActionContext(context.Context, QueryActionInput) (core.QueryAction, error)
 }
 
 type GraphEvidenceStore interface {
@@ -96,19 +108,33 @@ type EmbeddingProvider interface {
 }
 
 type QueryOptions struct {
-	ProjectPath       string
-	ProjectID         string
-	Question          string
-	Limit             int
-	Agent             QueryAgent
-	SearchStore       SearchEvidenceStore
-	GraphStore        GraphEvidenceStore
-	QueryLogStore     QueryLogStore
-	EmbeddingProvider EmbeddingProvider
-	Context           context.Context
+	ProjectPath         string
+	ProjectID           string
+	Question            string
+	ConversationContext string
+	Limit               int
+	Agent               QueryAgent
+	SearchStore         SearchEvidenceStore
+	GraphStore          GraphEvidenceStore
+	QueryLogStore       QueryLogStore
+	EmbeddingProvider   EmbeddingProvider
+	Context             context.Context
+	Progress            QueryProgressFunc
 }
 
 type FallbackQueryAgent struct{}
+
+type QueryProgressEvent struct {
+	Type        string            `json:"type"`
+	Step        int               `json:"step,omitempty"`
+	Action      *core.QueryAction `json:"action,omitempty"`
+	Message     string            `json:"message"`
+	Observation string            `json:"observation,omitempty"`
+}
+
+type QueryProgressFunc func(QueryProgressEvent)
+
+type queryProgressContextKey struct{}
 
 func QueryLLMWiki(projectPath, q string, limit int) (*core.QueryAnswer, error) {
 	return QueryLLMWikiWithAgent(projectPath, q, limit, FallbackQueryAgent{})
@@ -128,6 +154,9 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if opts.Progress != nil {
+		ctx = context.WithValue(ctx, queryProgressContextKey{}, opts.Progress)
+	}
 	projectPath := opts.ProjectPath
 	q := opts.Question
 	limit := opts.Limit
@@ -136,21 +165,111 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 		agent = FallbackQueryAgent{}
 	}
 	fallbackAgent := isFallbackQueryAgent(agent)
+	emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "routing_started", Message: "正在判断问题意图"})
+	if decision, ok := deterministicQueryRoute(q); ok {
+		if normalizeRouteIntent(decision.Intent) != QueryIntentWikiQuery {
+			answerResult, handled, err := answerRoutedQuery(ctx, opts, agent, decision, nil)
+			if err != nil {
+				return nil, err
+			}
+			if handled {
+				return answerResult, nil
+			}
+		}
+	}
 	input, err := queryPlanningInput(projectPath, q)
 	if err != nil {
 		return nil, err
 	}
-	plan, err := agent.PlanQuery(input)
+	input.ConversationContext = opts.ConversationContext
+	decision, err := routeQueryWithContext(ctx, agent, QueryRoutingInput{
+		Question:            input.Question,
+		ConversationContext: input.ConversationContext,
+		Purpose:             input.Purpose,
+		Schema:              input.Schema,
+		Index:               input.Index,
+		Overview:            input.Overview,
+	})
+	if err != nil {
+		decision = QueryRouteDecision{
+			Intent:     QueryIntentWikiQuery,
+			Confidence: 0.5,
+			Reason:     "query router failed after retries; defaulting to persistent wiki query: " + err.Error(),
+		}
+	}
+	routedAnswer, handled, err := answerRoutedQuery(ctx, opts, agent, decision, &input)
+	if err != nil {
+		return nil, err
+	}
+	if handled {
+		return routedAnswer, nil
+	}
+	emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "planning_started", Message: "正在读取导航页并规划查询"})
+	plan, err := planQueryWithContext(ctx, agent, input)
 	if err != nil {
 		return nil, err
 	}
 	if plan.Question == "" {
 		plan.Question = q
 	}
+	plan.Intent = normalizeQueryIntent(plan.Intent)
+	if plan.Intent == QueryIntentSystemFAQ || plan.Intent == QueryIntentGeneralAssistant || plan.Intent == QueryIntentUnsupported {
+		answerResult, handled, err := answerRoutedQuery(ctx, opts, agent, QueryRouteDecision{
+			Intent:     plan.Intent,
+			Confidence: 0.6,
+			Reason:     "planner returned a non-wiki intent",
+		}, &input)
+		if err != nil {
+			return nil, err
+		}
+		if handled {
+			return answerResult, nil
+		}
+	}
 	if limit > 0 {
 		plan.CandidateLimit = limit
 	} else if plan.CandidateLimit <= 0 {
 		plan.CandidateLimit = 10
+	}
+	if plan.Intent == "direct_chat" {
+		plan.ReadFirst = nil
+		plan.Searches = nil
+		plan.CanWriteBack = false
+		if strings.TrimSpace(plan.AnswerMode) == "" {
+			plan.AnswerMode = "direct_chat"
+		}
+		answerResult := &core.QueryAnswer{
+			Question: q,
+			Plan:     plan,
+			Answer:   directChatAnswer(q),
+			Notes: []string{
+				"Direct chat intent was answered without wiki evidence.",
+			},
+		}
+		if err := insertQueryLogIfConfigured(ctx, opts.QueryLogStore, opts.ProjectID, q, plan.AnswerMode, 0); err != nil {
+			return nil, err
+		}
+		return answerResult, nil
+	}
+	if plan.Intent == "missing_evidence" {
+		plan.ReadFirst = nil
+		plan.Searches = nil
+		plan.CanWriteBack = false
+		if strings.TrimSpace(plan.AnswerMode) == "" {
+			plan.AnswerMode = "missing_evidence"
+		}
+		answerResult := &core.QueryAnswer{
+			Question: q,
+			Plan:     plan,
+			Answer:   degradedNoEvidenceAnswer(q),
+			Notes: []string{
+				"Planner reported missing evidence before wiki tool execution.",
+			},
+		}
+		if err := insertQueryLogIfConfigured(ctx, opts.QueryLogStore, opts.ProjectID, q, plan.AnswerMode, 0); err != nil {
+			return nil, err
+		}
+		return answerResult, nil
 	}
 	if strings.TrimSpace(plan.AnswerMode) == "" {
 		if fallbackAgent {
@@ -158,6 +277,10 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 		} else {
 			plan.AnswerMode = "llm_synthesis"
 		}
+	}
+	emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "planning_done", Message: "查询计划已生成", Observation: fmt.Sprintf("read_first=%d searches=%d limit=%d", len(plan.ReadFirst), len(plan.Searches), plan.CandidateLimit)})
+	if len(plan.ReadFirst) > 0 {
+		emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "read_started", Message: "正在读取计划指定页面", Observation: strings.Join(plan.ReadFirst, ", ")})
 	}
 	docs, err := readPlanDocuments(projectPath, plan, 5000)
 	if err != nil {
@@ -168,15 +291,17 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 	var finalAnswer string
 	var suggestedWritebackTitle string
 	if actionAgent, ok := agent.(QueryActionAgent); ok {
-		results, docs, trace, finalAnswer, suggestedWritebackTitle, err = runQueryActionLoop(ctx, projectPath, opts.ProjectID, q, plan, results, docs, actionAgent, opts.SearchStore, opts.GraphStore, opts.EmbeddingProvider)
+		results, docs, trace, finalAnswer, suggestedWritebackTitle, err = runQueryActionLoop(ctx, projectPath, opts.ProjectID, q, opts.ConversationContext, plan, results, docs, actionAgent, opts.SearchStore, opts.GraphStore, opts.EmbeddingProvider, opts.Progress)
 		if err != nil {
 			return nil, err
 		}
 	} else if len(plan.Searches) > 0 {
+		emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "search_started", Message: "正在召回候选页面"})
 		results, err = SearchWikiCandidatesWithStore(ctx, projectPath, opts.ProjectID, opts.SearchStore, opts.EmbeddingProvider, plan, plan.CandidateLimit)
 		if err != nil {
 			return nil, err
 		}
+		emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "search_done", Message: "候选召回完成", Observation: fmt.Sprintf("results=%d", len(results))})
 		candidateDocs, readErr := readQueryDocuments(projectPath, results, 8, 5000)
 		if readErr != nil {
 			return nil, readErr
@@ -185,12 +310,14 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 	}
 	answer := finalAnswer
 	if strings.TrimSpace(answer) == "" {
-		answer, err = agent.SynthesizeQuery(QuerySynthesisInput{
-			Question: q,
-			Plan:     plan,
-			Results:  results,
-			Docs:     docs,
-			Trace:    trace,
+		emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "synthesis_started", Message: "正在综合最终答案", Observation: fmt.Sprintf("docs=%d results=%d", len(docs), len(results))})
+		answer, err = synthesizeQueryWithContext(ctx, agent, QuerySynthesisInput{
+			Question:            q,
+			ConversationContext: opts.ConversationContext,
+			Plan:                plan,
+			Results:             results,
+			Docs:                docs,
+			Trace:               trace,
 		})
 		if err != nil {
 			return nil, err
@@ -202,7 +329,7 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 	if fallbackAgent {
 		notes = append([]string{
 			"FallbackQueryAgent is an offline scaffold. It reads recalled pages but does not perform semantic LLM planning, synthesis, or writeback.",
-			"Use an OpenAI-compatible QueryAgent for the real LLM Wiki workflow.",
+			"Use a configured OpenAI-compatible or Anthropic QueryAgent for the real LLM Wiki workflow.",
 		}, notes...)
 	}
 	answerResult := &core.QueryAnswer{
@@ -215,12 +342,162 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 		Trace:                   trace,
 		Notes:                   notes,
 	}
-	if opts.QueryLogStore != nil && strings.TrimSpace(opts.ProjectID) != "" {
-		if err := opts.QueryLogStore.InsertQueryLog(ctx, queryLogID(opts.ProjectID, q, plan.AnswerMode), opts.ProjectID, q, plan.AnswerMode, len(results)); err != nil {
-			return nil, err
-		}
+	if !hasAnswerEvidence(docs) && (actionRetryExhausted(trace) || hasNoEvidenceFinalRejection(trace)) {
+		answerResult.Plan.CanWriteBack = false
+	}
+	if err := insertQueryLogIfConfigured(ctx, opts.QueryLogStore, opts.ProjectID, q, plan.AnswerMode, len(results)); err != nil {
+		return nil, err
 	}
 	return answerResult, nil
+}
+
+func insertQueryLogIfConfigured(ctx context.Context, store QueryLogStore, projectID, q, mode string, resultCount int) error {
+	if store == nil || strings.TrimSpace(projectID) == "" {
+		return nil
+	}
+	return store.InsertQueryLog(ctx, queryLogID(projectID, q, mode), projectID, q, mode, resultCount)
+}
+
+func answerRoutedQuery(ctx context.Context, opts QueryOptions, agent QueryAgent, decision QueryRouteDecision, input *QueryPlanningInput) (*core.QueryAnswer, bool, error) {
+	decision.Intent = normalizeRouteIntent(decision.Intent)
+	emitQueryProgress(opts.Progress, QueryProgressEvent{
+		Type:        "routing_done",
+		Message:     routeDecisionMessage(decision.Intent),
+		Observation: routeDecisionObservation(decision),
+	})
+	q := opts.Question
+	switch decision.Intent {
+	case QueryIntentWikiQuery:
+		return nil, false, nil
+	case QueryIntentDirectChat:
+		plan := directChatPlan(q)
+		answerResult := &core.QueryAnswer{
+			Question: q,
+			Plan:     plan,
+			Answer:   directChatAnswer(q),
+			Notes: []string{
+				"Direct chat intent was answered without wiki evidence.",
+				"Route: " + routeDecisionObservation(decision),
+			},
+		}
+		if err := insertQueryLogIfConfigured(ctx, opts.QueryLogStore, opts.ProjectID, q, plan.AnswerMode, 0); err != nil {
+			return nil, true, err
+		}
+		return answerResult, true, nil
+	case QueryIntentSystemFAQ:
+		plan := routeQueryPlan(q, QueryIntentSystemFAQ, QueryIntentSystemFAQ)
+		answerResult := &core.QueryAnswer{
+			Question: q,
+			Plan:     plan,
+			Answer:   systemFAQAnswer(),
+			Notes: []string{
+				"System FAQ intent was answered without wiki evidence.",
+				"Route: " + routeDecisionObservation(decision),
+			},
+		}
+		if err := insertQueryLogIfConfigured(ctx, opts.QueryLogStore, opts.ProjectID, q, plan.AnswerMode, 0); err != nil {
+			return nil, true, err
+		}
+		return answerResult, true, nil
+	case QueryIntentGeneralAssistant:
+		plan := routeQueryPlan(q, QueryIntentGeneralAssistant, QueryIntentGeneralAssistant)
+		emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "general_answer_started", Message: "正在生成普通问答回答"})
+		conversation := opts.ConversationContext
+		if input != nil && strings.TrimSpace(conversation) == "" {
+			conversation = input.ConversationContext
+		}
+		answer, err := answerGeneralQueryWithContext(ctx, agent, QueryGeneralAnswerInput{
+			Question:            q,
+			ConversationContext: conversation,
+		})
+		notes := []string{
+			"General assistant intent was answered without wiki evidence.",
+			"This answer is not eligible for wiki writeback.",
+			"Route: " + routeDecisionObservation(decision),
+		}
+		if err != nil {
+			answer = generalAssistantUnavailableAnswer(q)
+			notes = append(notes, "General assistant LLM call failed or is unavailable: "+err.Error())
+		}
+		emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "general_answer_done", Message: "普通问答回答已生成"})
+		answerResult := &core.QueryAnswer{
+			Question: q,
+			Plan:     plan,
+			Answer:   answer,
+			Notes:    notes,
+		}
+		if err := insertQueryLogIfConfigured(ctx, opts.QueryLogStore, opts.ProjectID, q, plan.AnswerMode, 0); err != nil {
+			return nil, true, err
+		}
+		return answerResult, true, nil
+	case QueryIntentMissingEvidence:
+		plan := routeQueryPlan(q, QueryIntentMissingEvidence, QueryIntentMissingEvidence)
+		answerResult := &core.QueryAnswer{
+			Question: q,
+			Plan:     plan,
+			Answer:   missingEvidenceAnswer(q),
+			Notes: []string{
+				"Router reported missing evidence before wiki tool execution.",
+				"Route: " + routeDecisionObservation(decision),
+			},
+		}
+		if err := insertQueryLogIfConfigured(ctx, opts.QueryLogStore, opts.ProjectID, q, plan.AnswerMode, 0); err != nil {
+			return nil, true, err
+		}
+		return answerResult, true, nil
+	case QueryIntentUnsupported:
+		plan := routeQueryPlan(q, QueryIntentUnsupported, QueryIntentUnsupported)
+		answerResult := &core.QueryAnswer{
+			Question: q,
+			Plan:     plan,
+			Answer:   unsupportedQuestionAnswer(q),
+			Notes: []string{
+				"Unsupported intent was not sent to the wiki tool loop.",
+				"Route: " + routeDecisionObservation(decision),
+			},
+		}
+		if err := insertQueryLogIfConfigured(ctx, opts.QueryLogStore, opts.ProjectID, q, plan.AnswerMode, 0); err != nil {
+			return nil, true, err
+		}
+		return answerResult, true, nil
+	default:
+		return nil, false, nil
+	}
+}
+
+func routeDecisionMessage(intent string) string {
+	switch normalizeRouteIntent(intent) {
+	case QueryIntentDirectChat:
+		return "识别为简单对话，直接回答"
+	case QueryIntentSystemFAQ:
+		return "识别为系统问题，直接回答"
+	case QueryIntentGeneralAssistant:
+		return "识别为普通问答，不进入知识库"
+	case QueryIntentMissingEvidence:
+		return "识别为缺少知识库证据"
+	case QueryIntentUnsupported:
+		return "识别为当前系统不支持的请求"
+	default:
+		return "识别为知识库查询，进入证据流程"
+	}
+}
+
+func routeDecisionObservation(decision QueryRouteDecision) string {
+	reason := strings.TrimSpace(decision.Reason)
+	if reason == "" {
+		reason = "no route reason provided"
+	}
+	return fmt.Sprintf("intent=%s confidence=%.2f reason=%s", normalizeRouteIntent(decision.Intent), decision.Confidence, reason)
+}
+
+func answerGeneralQueryWithContext(ctx context.Context, agent QueryAgent, input QueryGeneralAnswerInput) (string, error) {
+	if contextAgent, ok := agent.(ContextQueryGeneralAnswerAgent); ok {
+		return contextAgent.AnswerGeneralQueryContext(ctx, input)
+	}
+	if generalAgent, ok := agent.(QueryGeneralAnswerAgent); ok {
+		return generalAgent.AnswerGeneralQuery(input)
+	}
+	return "", fmt.Errorf("general assistant agent is not configured")
 }
 
 func isFallbackQueryAgent(agent QueryAgent) bool {
@@ -232,6 +509,24 @@ func queryLogID(projectID, q, mode string) string {
 	now := time.Now().UTC()
 	sum := sha256.Sum256([]byte(projectID + "\x00" + q + "\x00" + mode + "\x00" + now.Format(time.RFC3339Nano)))
 	return fmt.Sprintf("query-%d-%s", now.UnixNano(), hex.EncodeToString(sum[:])[:12])
+}
+
+func actionRetryExhausted(trace []core.QueryTraceStep) bool {
+	for _, step := range trace {
+		if strings.Contains(step.Observation, "action_retry_exhausted") {
+			return true
+		}
+	}
+	return false
+}
+
+func hasNoEvidenceFinalRejection(trace []core.QueryTraceStep) bool {
+	for _, step := range trace {
+		if isNoEvidenceFinalRejection(step.Observation) {
+			return true
+		}
+	}
+	return false
 }
 
 func QueryWiki(projectPath, q string, limit int) ([]core.QueryResult, error) {
@@ -436,27 +731,61 @@ func queryCitations(docs []QueryReadDocument) []core.QueryCitation {
 	return citations
 }
 
-func runQueryActionLoop(ctx context.Context, projectPath, projectID, q string, plan core.QueryPlan, results []core.QueryResult, docs []QueryReadDocument, agent QueryActionAgent, searchStore SearchEvidenceStore, graphStore GraphEvidenceStore, embeddingProvider EmbeddingProvider) ([]core.QueryResult, []QueryReadDocument, []core.QueryTraceStep, string, string, error) {
-	const maxSteps = 6
+func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversation string, plan core.QueryPlan, results []core.QueryResult, docs []QueryReadDocument, agent QueryActionAgent, searchStore SearchEvidenceStore, graphStore GraphEvidenceStore, embeddingProvider EmbeddingProvider, progress QueryProgressFunc) ([]core.QueryResult, []QueryReadDocument, []core.QueryTraceStep, string, string, error) {
+	const maxSteps = 254
 	var trace []core.QueryTraceStep
 	var navigation []QueryNavigationObservation
+	noEvidenceFinalRejections := 0
 	for step := 1; step <= maxSteps; step++ {
-		action, err := agent.NextQueryAction(QueryActionInput{
-			Question:   q,
-			Plan:       plan,
-			Results:    results,
-			Docs:       docs,
-			Navigation: navigation,
-			Trace:      trace,
-			Step:       step,
+		if err := ctx.Err(); err != nil {
+			return nil, nil, nil, "", "", err
+		}
+		emitQueryProgress(progress, QueryProgressEvent{Type: "action_planning_started", Step: step, Message: "正在决定下一步工具动作"})
+		action, err := nextQueryActionWithContext(ctx, agent, QueryActionInput{
+			Question:            q,
+			ConversationContext: conversation,
+			Plan:                plan,
+			Results:             results,
+			Docs:                docs,
+			Navigation:          navigation,
+			Trace:               trace,
+			Step:                step,
 		})
 		if err != nil {
-			return nil, nil, nil, "", "", err
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return nil, nil, nil, "", "", ctxErr
+			}
+			action := core.QueryAction{
+				Action:    "synthesize",
+				Rationale: "llm query action failed after retries",
+			}
+			traceStep := core.QueryTraceStep{
+				Step:        step,
+				Action:      action,
+				Observation: "action_retry_exhausted: " + err.Error(),
+			}
+			trace = append(trace, traceStep)
+			emitQueryProgress(progress, QueryProgressEvent{
+				Type:        "action_retry_exhausted",
+				Step:        step,
+				Action:      &action,
+				Message:     "动作解析失败，保留已读证据并进入综合",
+				Observation: traceStep.Observation,
+			})
+			results, docs, err = ensureEvidenceAfterActionFailure(ctx, projectPath, projectID, q, plan, results, docs, searchStore, embeddingProvider)
+			if err != nil {
+				return nil, nil, nil, "", "", err
+			}
+			if !hasAnswerEvidence(docs) {
+				return results, docs, trace, degradedNoEvidenceAnswer(q), "", nil
+			}
+			return results, docs, trace, "", "", nil
 		}
 		action.Action = strings.ToLower(strings.TrimSpace(action.Action))
 		if action.Action == "" && strings.TrimSpace(action.Answer) != "" {
 			action.Action = "final"
 		}
+		emitQueryProgress(progress, QueryProgressEvent{Type: "action_started", Step: step, Action: &action, Message: "开始执行 " + action.Action, Observation: action.Rationale})
 		switch action.Action {
 		case "read":
 			doc, err := readToolDocument(projectPath, action.Path, 6000)
@@ -464,11 +793,13 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q string, p
 				return nil, nil, nil, "", "", err
 			}
 			docs = appendQueryDocs(docs, []QueryReadDocument{doc})
-			trace = append(trace, core.QueryTraceStep{
+			traceStep := core.QueryTraceStep{
 				Step:        step,
 				Action:      action,
 				Observation: fmt.Sprintf("read %s (%d chars)", doc.Path, len(doc.Content)),
-			})
+			}
+			trace = append(trace, traceStep)
+			emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: step, Action: &action, Message: "读取完成", Observation: traceStep.Observation})
 		case "list", "list_pages":
 			listLimit := action.Limit
 			if listLimit <= 0 {
@@ -483,11 +814,13 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q string, p
 				Query:  action.Query,
 				Pages:  pages,
 			})
-			trace = append(trace, core.QueryTraceStep{
+			traceStep := core.QueryTraceStep{
 				Step:        step,
 				Action:      action,
 				Observation: formatWikiPageListObservation(pages),
-			})
+			}
+			trace = append(trace, traceStep)
+			emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: step, Action: &action, Message: "页面列表完成", Observation: traceStep.Observation})
 		case "follow_links":
 			linkLimit := action.Limit
 			if linkLimit <= 0 {
@@ -504,11 +837,13 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q string, p
 				Pages:   wikiPageSummariesFromDocs(linkDocs),
 				Skipped: skipped,
 			})
-			trace = append(trace, core.QueryTraceStep{
+			traceStep := core.QueryTraceStep{
 				Step:        step,
 				Action:      action,
 				Observation: formatFollowLinksObservation(linkDocs, skipped),
-			})
+			}
+			trace = append(trace, traceStep)
+			emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: step, Action: &action, Message: "链接展开完成", Observation: traceStep.Observation})
 		case "search":
 			searchText := strings.TrimSpace(action.Query)
 			if searchText == "" {
@@ -553,11 +888,13 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q string, p
 				}
 				docs = appendQueryDocs(docs, graphDocs)
 			}
-			trace = append(trace, core.QueryTraceStep{
+			traceStep := core.QueryTraceStep{
 				Step:        step,
 				Action:      action,
 				Observation: formatSearchObservation(searchResults) + formatSearchReadObservation(searchDocs, skipped),
-			})
+			}
+			trace = append(trace, traceStep)
+			emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: step, Action: &action, Message: "搜索完成", Observation: traceStep.Observation})
 		case "graph", "expand":
 			graphText := strings.TrimSpace(action.Query)
 			if graphText == "" {
@@ -577,16 +914,33 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q string, p
 			}
 			docs = appendQueryDocs(docs, graphDocs)
 			docs = appendQueryDocs(docs, wikiGraphDocs)
-			trace = append(trace, core.QueryTraceStep{
+			traceStep := core.QueryTraceStep{
 				Step:        step,
 				Action:      action,
 				Observation: formatGraphObservation(graphDocs) + "; " + formatWikiGraphObservation(wikiGraphDocs),
-			})
+			}
+			trace = append(trace, traceStep)
+			emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: step, Action: &action, Message: "图谱检索完成", Observation: traceStep.Observation})
 		case "final", "save", "writeback":
-			finalAnswer, suggestedTitle, accepted := acceptFinalQueryAction(step, action, results, docs, &trace)
+			finalAnswer, suggestedTitle, accepted := acceptFinalQueryAction(step, q, plan, action, results, docs, &trace)
 			if !accepted {
+				emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: step, Action: &action, Message: "最终答案被拒绝，需要继续读取证据", Observation: trace[len(trace)-1].Observation})
+				if isNoEvidenceFinalRejection(trace[len(trace)-1].Observation) {
+					noEvidenceFinalRejections++
+				}
+				if noEvidenceFinalRejections >= 2 {
+					results, docs, err = ensureEvidenceAfterActionFailure(ctx, projectPath, projectID, q, plan, results, docs, searchStore, embeddingProvider)
+					if err != nil {
+						return nil, nil, nil, "", "", err
+					}
+					if !hasAnswerEvidence(docs) {
+						return results, docs, trace, degradedNoEvidenceAnswer(q), "", nil
+					}
+					return results, docs, trace, "", "", nil
+				}
 				continue
 			}
+			emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: step, Action: &action, Message: "最终答案已生成"})
 			return results, docs, trace, finalAnswer, suggestedTitle, nil
 		default:
 			return nil, nil, nil, "", "", fmt.Errorf("unknown query action %q", action.Action)
@@ -600,10 +954,88 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q string, p
 		},
 		Observation: "synthesizing with collected evidence",
 	})
+	emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: maxSteps + 1, Message: "达到工具步数上限，转入综合", Observation: "synthesizing with collected evidence"})
 	return results, docs, trace, "", "", nil
 }
 
-func acceptFinalQueryAction(step int, action core.QueryAction, results []core.QueryResult, docs []QueryReadDocument, trace *[]core.QueryTraceStep) (string, string, bool) {
+func ensureEvidenceAfterActionFailure(ctx context.Context, projectPath, projectID, q string, plan core.QueryPlan, results []core.QueryResult, docs []QueryReadDocument, searchStore SearchEvidenceStore, embeddingProvider EmbeddingProvider) ([]core.QueryResult, []QueryReadDocument, error) {
+	if hasAnswerEvidence(docs) {
+		return results, docs, nil
+	}
+	limit := plan.CandidateLimit
+	if limit <= 0 {
+		limit = 5
+	}
+	searchText := strings.TrimSpace(q)
+	if searchText == "" {
+		return results, docs, nil
+	}
+	searchPlan := core.QueryPlan{
+		Question: q,
+		Searches: []core.QuerySearch{{
+			Text:      searchText,
+			Weight:    6,
+			Rationale: "fallback recall after LLM action failure",
+		}},
+		CandidateLimit: limit,
+	}
+	searchResults, err := SearchWikiCandidatesWithStore(ctx, projectPath, projectID, searchStore, embeddingProvider, searchPlan, limit)
+	if err != nil {
+		return nil, nil, err
+	}
+	results = appendQueryResults(results, searchResults)
+	searchDocs, _, err := readSearchResultDocuments(projectPath, searchResults, minInt(limit, 5), 6000)
+	if err != nil {
+		return nil, nil, err
+	}
+	docs = appendQueryDocs(docs, searchDocs)
+	return results, docs, nil
+}
+
+func degradedNoEvidenceAnswer(q string) string {
+	question := strings.TrimSpace(q)
+	if question == "" {
+		question = "当前问题"
+	}
+	return fmt.Sprintf("这次查询没有生成可靠答案：LLM 工具动作连续返回无法解析的 JSON，系统已重试并保留当前查询结果，但没有读取到可用于回答 `%s` 的非导航证据。请重试，或先导入/同步相关知识库内容后再查询。", question)
+}
+
+func missingEvidenceAnswer(q string) string {
+	question := strings.TrimSpace(q)
+	if question == "" {
+		question = "当前问题"
+	}
+	return fmt.Sprintf("当前知识库里没有足够证据可靠回答 `%s`。请先导入相关 raw/source 材料并运行知识库维护流程，或把问题改成已有资料能覆盖的范围。", question)
+}
+
+func emitQueryProgress(progress QueryProgressFunc, event QueryProgressEvent) {
+	if progress != nil {
+		progress(event)
+	}
+}
+
+func planQueryWithContext(ctx context.Context, agent QueryAgent, input QueryPlanningInput) (core.QueryPlan, error) {
+	if contextAgent, ok := agent.(ContextQueryAgent); ok {
+		return contextAgent.PlanQueryContext(ctx, input)
+	}
+	return agent.PlanQuery(input)
+}
+
+func synthesizeQueryWithContext(ctx context.Context, agent QueryAgent, input QuerySynthesisInput) (string, error) {
+	if contextAgent, ok := agent.(ContextQueryAgent); ok {
+		return contextAgent.SynthesizeQueryContext(ctx, input)
+	}
+	return agent.SynthesizeQuery(input)
+}
+
+func nextQueryActionWithContext(ctx context.Context, agent QueryActionAgent, input QueryActionInput) (core.QueryAction, error) {
+	if contextAgent, ok := agent.(ContextQueryActionAgent); ok {
+		return contextAgent.NextQueryActionContext(ctx, input)
+	}
+	return agent.NextQueryAction(input)
+}
+
+func acceptFinalQueryAction(step int, q string, plan core.QueryPlan, action core.QueryAction, results []core.QueryResult, docs []QueryReadDocument, trace *[]core.QueryTraceStep) (string, string, bool) {
 	if unsupported := unsupportedSearchOnlyCitations(action.Answer, results, docs); len(unsupported) > 0 {
 		*trace = append(*trace, core.QueryTraceStep{
 			Step:        step,
@@ -613,6 +1045,14 @@ func acceptFinalQueryAction(step int, action core.QueryAction, results []core.Qu
 		return "", "", false
 	}
 	if !hasAnswerEvidence(docs) {
+		if isDirectChatIntent(plan.Intent) && !answerReferencesEvidence(action.Answer) && (isDirectChatQuestion(q) || strings.TrimSpace(plan.Intent) == "direct_chat") {
+			*trace = append(*trace, core.QueryTraceStep{
+				Step:        step,
+				Action:      action,
+				Observation: "direct chat final accepted without wiki evidence",
+			})
+			return strings.TrimSpace(action.Answer), "", true
+		}
 		*trace = append(*trace, core.QueryTraceStep{
 			Step:   step,
 			Action: action,
@@ -631,6 +1071,88 @@ func acceptFinalQueryAction(step int, action core.QueryAction, results []core.Qu
 		Observation: observation,
 	})
 	return strings.TrimSpace(action.Answer), strings.TrimSpace(action.Title), true
+}
+
+func isNoEvidenceFinalRejection(observation string) bool {
+	return strings.Contains(observation, "LLM Wiki answers require a read wiki/raw page or graph evidence")
+}
+
+func normalizeQueryIntent(intent string) string {
+	intent = strings.ToLower(strings.TrimSpace(intent))
+	intent = strings.ReplaceAll(intent, "-", "_")
+	intent = strings.ReplaceAll(intent, " ", "_")
+	switch intent {
+	case "direct_chat", "chitchat", "smalltalk", "small_talk", "chat", "greeting":
+		return "direct_chat"
+	case "system_faq", "faq", "system_help", "help", "capability", "capabilities":
+		return "system_faq"
+	case "general_assistant", "general", "general_chat", "general_question", "ordinary_qa":
+		return "general_assistant"
+	case "missing_evidence", "no_evidence", "insufficient_evidence", "unknown":
+		return "missing_evidence"
+	case "unsupported", "unsupported_request", "out_of_scope", "unsafe_or_unsupported":
+		return "unsupported"
+	case "offline_fallback_query":
+		return "offline_fallback_query"
+	case "answer_from_persistent_wiki", "wiki_query", "query", "rag", "":
+		return "answer_from_persistent_wiki"
+	default:
+		return "answer_from_persistent_wiki"
+	}
+}
+
+func isDirectChatIntent(intent string) bool {
+	return normalizeQueryIntent(intent) == "direct_chat"
+}
+
+func directChatPlan(q string) core.QueryPlan {
+	return core.QueryPlan{
+		Question:       q,
+		Intent:         "direct_chat",
+		CandidateLimit: 0,
+		AnswerMode:     "direct_chat",
+		CanWriteBack:   false,
+	}
+}
+
+func isDirectChatQuestion(q string) bool {
+	text := normalizeDirectChatText(q)
+	if text == "" {
+		return false
+	}
+	switch text {
+	case "你好", "您好", "嗨", "哈喽", "在吗", "在么", "谢谢", "多谢", "感谢",
+		"hello", "hi", "hey", "yo", "thanks", "thankyou", "thank you":
+		return true
+	}
+	if len([]rune(text)) <= 8 {
+		return strings.HasPrefix(text, "你好") || strings.HasPrefix(text, "您好")
+	}
+	return false
+}
+
+func normalizeDirectChatText(q string) string {
+	text := strings.ToLower(strings.TrimSpace(q))
+	text = strings.Trim(text, " \t\r\n,.!?！？。~～，、；;：:")
+	return strings.Join(strings.Fields(text), " ")
+}
+
+func directChatAnswer(q string) string {
+	text := normalizeDirectChatText(q)
+	switch text {
+	case "谢谢", "多谢", "感谢", "thanks", "thankyou", "thank you":
+		return "不客气。我在这里，可以继续问我知识库里的内容，或者让我帮你整理、查询和维护知识库。"
+	default:
+		return "你好，我在。你可以直接问我知识库里的内容，或者让我帮你整理、查询和维护知识库。"
+	}
+}
+
+func answerReferencesEvidence(answer string) bool {
+	answer = strings.ToLower(answer)
+	return strings.Contains(answer, "wiki/") ||
+		strings.Contains(answer, "raw/sources/") ||
+		strings.Contains(answer, "raw/code-graphs/") ||
+		strings.Contains(answer, "[[")
 }
 
 func readSearchResultDocuments(projectPath string, results []core.QueryResult, maxDocs int, maxRunes int) ([]QueryReadDocument, []string, error) {
@@ -1071,7 +1593,20 @@ func resolveReadToolPath(projectPath, target string) (string, error) {
 		return "", fmt.Errorf("query read action requires path")
 	}
 	if strings.HasPrefix(target, "wiki/") || strings.HasPrefix(target, "raw/sources/") {
-		return normalizeToolPath(target)
+		rel, err := normalizeToolPath(target)
+		if err != nil {
+			return "", err
+		}
+		if _, err := os.Stat(filepath.Join(projectPath, filepath.FromSlash(rel))); err == nil {
+			return rel, nil
+		}
+		if strings.HasPrefix(rel, "wiki/") && strings.HasSuffix(rel, ".md") {
+			resolved, resolveErr := resolveWikiPathByBasename(projectPath, rel)
+			if resolveErr == nil {
+				return resolved, nil
+			}
+		}
+		return rel, nil
 	}
 	if strings.HasSuffix(target, ".md") || strings.Contains(target, "/") {
 		resolved, err := resolveWikiLink(projectPath, "wiki/index.md", target)
@@ -1080,6 +1615,37 @@ func resolveReadToolPath(projectPath, target string) (string, error) {
 		}
 	}
 	return resolveWikiNameLink(projectPath, target)
+}
+
+func resolveWikiPathByBasename(projectPath, rel string) (string, error) {
+	name := filepath.Base(filepath.FromSlash(rel))
+	if name == "." || name == string(filepath.Separator) {
+		return "", fmt.Errorf("query read path has no file name: %s", rel)
+	}
+	var matches []string
+	root := filepath.Join(projectPath, "wiki")
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || filepath.Base(path) != name {
+			return err
+		}
+		match, relErr := filepath.Rel(projectPath, path)
+		if relErr != nil {
+			return relErr
+		}
+		matches = append(matches, filepath.ToSlash(match))
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
+	switch len(matches) {
+	case 0:
+		return "", fmt.Errorf("query read path not found: %s", rel)
+	case 1:
+		return matches[0], nil
+	default:
+		return "", fmt.Errorf("query read path %s is ambiguous by file name: %s", rel, strings.Join(matches, ", "))
+	}
 }
 
 func normalizeToolPath(rel string) (string, error) {
@@ -1116,13 +1682,20 @@ func searchCodeGraphDocuments(ctx context.Context, projectPath, projectID string
 			return graphEvidenceDocuments(evidence), nil
 		}
 	}
-	root := filepath.Join(projectPath, "raw", "code-graphs")
-	if _, err := os.Stat(root); os.IsNotExist(err) {
-		return nil, nil
-	}
 	terms := queryTerms(q)
 	var matches []graphDocMatch
-	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	nativeSnapshots, nativePaths, err := loadLatestCodeSnapshots(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	for index, snapshot := range nativeSnapshots {
+		matches = append(matches, graphMatchesForSnapshot(nativePaths[index], snapshot, terms)...)
+	}
+	root := filepath.Join(projectPath, "raw", "code-graphs")
+	if _, err := os.Stat(root); os.IsNotExist(err) {
+		return graphMatchesToDocuments(matches, limit), nil
+	}
+	err = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() || filepath.Base(path) != "graph.json" {
 			return err
 		}
@@ -1143,6 +1716,10 @@ func searchCodeGraphDocuments(ctx context.Context, projectPath, projectID string
 	if err != nil {
 		return nil, err
 	}
+	return graphMatchesToDocuments(matches, limit), nil
+}
+
+func graphMatchesToDocuments(matches []graphDocMatch, limit int) []QueryReadDocument {
 	sort.Slice(matches, func(i, j int) bool {
 		if matches[i].Score == matches[j].Score {
 			return matches[i].Path < matches[j].Path
@@ -1161,7 +1738,7 @@ func searchCodeGraphDocuments(ctx context.Context, projectPath, projectID string
 			Content: match.Content,
 		})
 	}
-	return docs, nil
+	return docs
 }
 
 func graphEvidenceDocuments(evidence []core.GraphEvidence) []QueryReadDocument {

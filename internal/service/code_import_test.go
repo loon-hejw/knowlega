@@ -162,6 +162,25 @@ func TestSyncCodeGraphSnapshotUsesTransactionalStore(t *testing.T) {
 	}
 }
 
+func TestIndexedCodeRevisionDistinguishesDirtySource(t *testing.T) {
+	tests := []struct {
+		name string
+		snap codegraph.Snapshot
+		want string
+	}{
+		{name: "clean", snap: codegraph.Snapshot{Commit: "abc123", SourceSHA256: strings.Repeat("a", 64)}, want: "abc123"},
+		{name: "dirty commit", snap: codegraph.Snapshot{Commit: "abc123", Dirty: true, SourceSHA256: strings.Repeat("b", 64)}, want: "abc123+dirty.bbbbbbbbbbbb"},
+		{name: "dirty worktree", snap: codegraph.Snapshot{Dirty: true, SourceSHA256: strings.Repeat("c", 64)}, want: "dirty.cccccccccccc"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := indexedCodeRevision(test.snap); got != test.want {
+				t.Fatalf("indexed revision=%q want=%q", got, test.want)
+			}
+		})
+	}
+}
+
 type recordingCodeGraphStore struct {
 	repos    []core.CodeRepo
 	deleted  []string

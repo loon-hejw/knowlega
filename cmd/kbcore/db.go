@@ -8,7 +8,6 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 
-	"github.com/hejw/knowledge-core/internal/config"
 	"github.com/hejw/knowledge-core/internal/core"
 	"github.com/hejw/knowledge-core/internal/postgres"
 )
@@ -40,17 +39,10 @@ func (h *dbStoreHandle) Close() {
 	}
 }
 
-func envOrValue(value, envKey string) string {
-	if strings.TrimSpace(value) != "" {
-		return value
-	}
-	return config.Value(envKey)
-}
-
 func requireProjectID(projectID string) (string, error) {
 	projectID = strings.TrimSpace(projectID)
 	if projectID == "" {
-		return "", fmt.Errorf("project id is required when using PostgreSQL; pass --project-id or set KB_CORE_PROJECT_ID")
+		return "", fmt.Errorf("project id is required when using PostgreSQL; pass --project-id or configure database.project_id")
 	}
 	return projectID, nil
 }

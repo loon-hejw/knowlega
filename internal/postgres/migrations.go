@@ -74,6 +74,11 @@ CREATE TABLE IF NOT EXISTS source_manifest (
   original_path text NOT NULL,
   sha256 text NOT NULL,
   raw_path text NOT NULL,
+  archive_path text NOT NULL DEFAULT '',
+  original_raw_path text NOT NULL DEFAULT '',
+  content_path text NOT NULL DEFAULT '',
+  original_sha256 text NOT NULL DEFAULT '',
+  content_sha256 text NOT NULL DEFAULT '',
   title text NOT NULL,
   files text[] NOT NULL DEFAULT '{}',
   review_count integer NOT NULL DEFAULT 0,
@@ -81,7 +86,14 @@ CREATE TABLE IF NOT EXISTS source_manifest (
   UNIQUE(project_id, original_path)
 );
 
+ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS archive_path text NOT NULL DEFAULT '';
+ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS original_raw_path text NOT NULL DEFAULT '';
+ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS content_path text NOT NULL DEFAULT '';
+ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS original_sha256 text NOT NULL DEFAULT '';
+ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS content_sha256 text NOT NULL DEFAULT '';
+
 CREATE INDEX IF NOT EXISTS source_manifest_sha_idx ON source_manifest(project_id, sha256);
+CREATE INDEX IF NOT EXISTS source_manifest_archive_idx ON source_manifest(project_id, archive_path);
 
 CREATE TABLE IF NOT EXISTS code_repos (
   id text PRIMARY KEY,
@@ -99,6 +111,8 @@ CREATE TABLE IF NOT EXISTS graph_nodes (
   id text PRIMARY KEY,
   project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   repo_id text REFERENCES code_repos(id) ON DELETE CASCADE,
+  domain text NOT NULL DEFAULT 'code',
+  scope_id text NOT NULL DEFAULT '',
   kind text NOT NULL,
   label text NOT NULL,
   source_ref text NOT NULL DEFAULT '',
@@ -109,17 +123,31 @@ CREATE TABLE IF NOT EXISTS graph_edges (
   id text PRIMARY KEY,
   project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   repo_id text REFERENCES code_repos(id) ON DELETE CASCADE,
+  domain text NOT NULL DEFAULT 'code',
+  scope_id text NOT NULL DEFAULT '',
   src_id text NOT NULL,
   dst_id text NOT NULL,
   relation text NOT NULL,
   confidence text NOT NULL DEFAULT 'INFERRED',
+  confidence_score double precision NOT NULL DEFAULT 0.75,
   weight double precision NOT NULL DEFAULT 1,
+  evidence text[] NOT NULL DEFAULT '{}',
   props jsonb NOT NULL DEFAULT '{}'::jsonb
 );
+
+ALTER TABLE graph_nodes ADD COLUMN IF NOT EXISTS domain text NOT NULL DEFAULT 'code';
+ALTER TABLE graph_nodes ADD COLUMN IF NOT EXISTS scope_id text NOT NULL DEFAULT '';
+ALTER TABLE graph_edges ADD COLUMN IF NOT EXISTS domain text NOT NULL DEFAULT 'code';
+ALTER TABLE graph_edges ADD COLUMN IF NOT EXISTS scope_id text NOT NULL DEFAULT '';
+ALTER TABLE graph_edges ADD COLUMN IF NOT EXISTS confidence_score double precision NOT NULL DEFAULT 0.75;
+ALTER TABLE graph_edges ADD COLUMN IF NOT EXISTS evidence text[] NOT NULL DEFAULT '{}';
 
 CREATE INDEX IF NOT EXISTS graph_edges_src_idx ON graph_edges(project_id, src_id, relation);
 CREATE INDEX IF NOT EXISTS graph_edges_dst_idx ON graph_edges(project_id, dst_id, relation);
 CREATE INDEX IF NOT EXISTS graph_nodes_kind_idx ON graph_nodes(project_id, kind);
+CREATE INDEX IF NOT EXISTS graph_nodes_domain_scope_idx ON graph_nodes(project_id, domain, scope_id, kind);
+CREATE INDEX IF NOT EXISTS graph_edges_domain_scope_idx ON graph_edges(project_id, domain, scope_id, relation);
+CREATE INDEX IF NOT EXISTS graph_edges_confidence_score_idx ON graph_edges(project_id, confidence_score DESC);
 
 CREATE TABLE IF NOT EXISTS ingest_jobs (
   id text PRIMARY KEY,

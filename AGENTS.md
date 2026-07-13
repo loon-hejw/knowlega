@@ -67,19 +67,18 @@ ingest should use an LLM provider whenever credentials are available:
 3. Validation: frontmatter, paths, source provenance, wikilinks.
 4. Merge: update existing pages without destroying prior evidence.
 
-Local runtime settings are read from environment variables first, then from
-`.env.local`, `kbcore.env`, or `.kbcore/config.env` in the current working
-directory. `KB_CORE_CONFIG=/path/to/file.env` can point at a different file.
-Do not commit real API keys.
+Local runtime settings are read only from the repository-root `config.yaml`, or
+from the path passed with global `--config`. CLI flags override YAML values,
+which override program defaults. Do not read runtime settings from environment
+variables or legacy env files, and do not commit `config.yaml` or real API keys.
 
 For small end-to-end LLM acceptance, use `scripts/verify-llmwiki-llm.sh`. It
 creates three fixed source files, runs `validate-llmwiki --agent llm`, checks
 generated pages, links, `wiki/overview.md`, `wiki/reviews.md`, deterministic
 `lint` returning `ok`, `review-wiki --agent llm`, and `lint --agent llm`. It
 must also require one `wiki/sources/` source-summary page per fixed source. It
-should skip cleanly when LLM credentials are not configured. Set
-`KB_CORE_REQUIRE_LLM=1` when the acceptance run must fail instead of skipping
-without real LLM credentials.
+must receive a YAML config with real LLM credentials and fail clearly when that
+configuration is missing.
 Because the fixture contains a deliberately stale compost-blend claim, both LLM
 review commands must report at least one semantic issue type. Successful runs
 write `VERIFY_REPORT.md` inside the temporary wiki project with source,
@@ -142,18 +141,16 @@ Borrow these behaviors:
 - Query workflows configured with PostgreSQL should append to `query_logs`.
   Treat questions as useful maintenance signals for missing pages, recurring
   synthesis needs, and review follow-up.
-- CLI/API database configuration is available through `--db-dsn` or
-  `KB_CORE_DB_DSN`, with `--project-id` or `KB_CORE_PROJECT_ID` selecting the PG
-  project scope for graph evidence.
+- CLI/API database configuration is available through `database.dsn` and
+  `database.project_id`, with explicit `--db-dsn`/`--project-id` CLI overrides.
 - Embedding generation must be injected through a real provider. Tests may use
   fake vectors to verify plumbing, but do not hard-code deterministic fake
   embeddings as production semantics.
 - Wiki page embedding text must include semantic frontmatter that affects
   recall: title, type, aliases, sources, and body. Alias/source changes should
   change `embedding_source_sha256` and refresh the embedding.
-- OpenAI-compatible embedding configuration uses `KB_CORE_EMBEDDING_BASE_URL`,
-  `KB_CORE_EMBEDDING_API_KEY`, and `KB_CORE_EMBEDDING_MODEL`, with
-  `OPENAI_API_KEY`/`OPENAI_BASE_URL` fallback where appropriate.
+- OpenAI-compatible embedding configuration uses the `embedding` YAML section;
+  an enabled embedding model may inherit the configured LLM base URL/API key.
 - Use `sync-wiki-pg --embed` to populate `wiki_pages.embedding` from current
   Markdown pages. Query can then use pgvector before PG FTS and file fallback.
 - Full `sync-wiki-pg` treats PostgreSQL wiki rows as a rebuildable index:
@@ -193,6 +190,11 @@ Borrow these behaviors:
 - `serve --worker` may scan `raw/sources/` and consume the ingest queue, but it
   must stay opt-in so starting the service does not unexpectedly spend LLM
   tokens.
+- Configured service bootstrap should listen before a large corpus finishes,
+  expose progress through workspace status, and resume from the source manifest
+  after restart. Keep bootstrap compilation serial unless aggregate Markdown
+  and manifest writes are made concurrency-safe; PostgreSQL and embedding sync
+  must be idempotently completed before the project is marked ready.
 - The `web/` frontend is a Vite + React + TypeScript + Ant Design application.
   Keep it as an API client over `kbcore serve`; do not duplicate LLM Wiki
   compile, query, review, or persistence logic in the browser.
@@ -306,10 +308,10 @@ tst/xiyouji-chapters/chapter-100.txt
 Use this corpus to test multi-source wiki accumulation:
 
 ```bash
-env GOCACHE=/private/tmp/kbcore-gocache go run ./cmd/kbcore init \
+env GOCACHE=/private/tmp/kbcore-gocache go run ./cmd/kbcore --config config.yaml init \
   --path /private/tmp/kbcore-xiyouji-wiki --name xiyouji
 
-env GOCACHE=/private/tmp/kbcore-gocache go run ./cmd/kbcore validate-llmwiki \
+env GOCACHE=/private/tmp/kbcore-gocache go run ./cmd/kbcore --config config.yaml validate-llmwiki \
   --project /private/tmp/kbcore-xiyouji-wiki \
   --source tst/xiyouji-chapters \
   --agent mock

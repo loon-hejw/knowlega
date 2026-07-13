@@ -123,7 +123,8 @@ func syncCodeGraphSnapshot(ctx context.Context, store CodeGraphStore, projectID 
 		ID:                 repoID,
 		ProjectID:          projectID,
 		RepoPath:           snap.RepoPath,
-		IndexedCommit:      snap.Commit,
+		HeadCommit:         snap.Commit,
+		IndexedCommit:      indexedCodeRevision(snap),
 		PrimaryGraphSource: graphSource,
 		Stale:              false,
 		SyncedAt:           &now,
@@ -141,10 +142,15 @@ func syncCodeGraphSnapshot(ctx context.Context, store CodeGraphStore, projectID 
 		props["raw_id"] = node.ID
 		props["community"] = node.Community
 		props["graph_source"] = graphSource
+		props["commit"] = snap.Commit
+		props["working_tree_dirty"] = snap.Dirty
+		props["source_sha256"] = snap.SourceSHA256
 		if err := store.AddGraphNode(ctx, core.GraphNode{
 			ID:        nodeID,
 			ProjectID: projectID,
 			RepoID:    repoID,
+			Domain:    "code",
+			ScopeID:   snap.RepoID,
 			Kind:      string(node.Kind),
 			Label:     node.Label,
 			SourceRef: graphSourceRef(sourceRef, "node", node.ID),
@@ -166,17 +172,24 @@ func syncCodeGraphSnapshot(ctx context.Context, store CodeGraphStore, projectID 
 		props["raw_source"] = edge.Source
 		props["raw_target"] = edge.Target
 		props["graph_source"] = graphSource
+		props["commit"] = snap.Commit
+		props["working_tree_dirty"] = snap.Dirty
+		props["source_sha256"] = snap.SourceSHA256
 		props["source_ref"] = graphSourceRef(sourceRef, "edge", edge.Source+"/"+edge.Target)
 		if err := store.AddGraphEdge(ctx, core.GraphEdge{
-			ID:         graphEdgeID(projectID, snap.RepoID, edge.Source, edge.Target, string(edge.Relation)),
-			ProjectID:  projectID,
-			RepoID:     repoID,
-			SourceID:   srcID,
-			TargetID:   dstID,
-			Relation:   string(edge.Relation),
-			Confidence: graphConfidence(edge.Confidence),
-			Weight:     edge.Weight,
-			Props:      props,
+			ID:              graphEdgeID(projectID, snap.RepoID, edge.Source, edge.Target, string(edge.Relation)),
+			ProjectID:       projectID,
+			RepoID:          repoID,
+			Domain:          "code",
+			ScopeID:         snap.RepoID,
+			SourceID:        srcID,
+			TargetID:        dstID,
+			Relation:        string(edge.Relation),
+			Confidence:      graphConfidence(edge.Confidence),
+			ConfidenceScore: graphEdgeConfidenceScore(edge),
+			Weight:          edge.Weight,
+			Evidence:        append([]string(nil), edge.Evidence...),
+			Props:           props,
 		}); err != nil {
 			return CodeGraphSyncResult{}, err
 		}
@@ -186,6 +199,41 @@ func syncCodeGraphSnapshot(ctx context.Context, store CodeGraphStore, projectID 
 		Nodes:  len(snap.Nodes),
 		Edges:  len(snap.Edges),
 	}, nil
+}
+
+func indexedCodeRevision(snapshot codegraph.Snapshot) string {
+	commit := strings.TrimSpace(snapshot.Commit)
+	if !snapshot.Dirty {
+		return commit
+	}
+	hash := snapshot.SourceSHA256
+	if len(hash) > 12 {
+		hash = hash[:12]
+	}
+	if commit == "" {
+		if hash == "" {
+			return "dirty"
+		}
+		return "dirty." + hash
+	}
+	if hash == "" {
+		return commit + "+dirty"
+	}
+	return commit + "+dirty." + hash
+}
+
+func graphEdgeConfidenceScore(edge codegraph.Edge) float64 {
+	if edge.ConfidenceScore > 0 {
+		return edge.ConfidenceScore
+	}
+	switch graphConfidence(edge.Confidence) {
+	case core.ConfidenceExtracted:
+		return 1
+	case core.ConfidenceAmbiguous:
+		return 0.3
+	default:
+		return 0.75
+	}
 }
 
 func renderCodeOverview(snap codegraph.Snapshot) string {

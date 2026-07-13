@@ -1,30 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-missing_llm_config() {
-  local message="$1"
-  if [[ "${KB_CORE_REQUIRE_LLM:-0}" == "1" ]]; then
-    echo "error: $message" >&2
-    exit 1
-  fi
-  echo "skip: $message"
-  exit 0
-}
-
-if [[ -z "${KB_CORE_LLM_API_KEY:-${OPENAI_API_KEY:-}}" ]]; then
-  missing_llm_config "KB_CORE_LLM_API_KEY or OPENAI_API_KEY is required for real LLM verification"
+CONFIG="${1:-config.yaml}"
+if [[ ! -f "$CONFIG" ]]; then
+  echo "error: YAML config not found: $CONFIG" >&2
+  exit 1
 fi
-
-if [[ -z "${KB_CORE_LLM_MODEL:-${OPENAI_MODEL:-}}" ]]; then
-  missing_llm_config "KB_CORE_LLM_MODEL or OPENAI_MODEL is required for real LLM verification"
-fi
-
-ROOT="${KB_CORE_LLM_VERIFY_PROJECT:-$(mktemp -d /private/tmp/kbcore-llmwiki-verify.XXXXXX)}"
+ROOT="$(mktemp -d /private/tmp/kbcore-llmwiki-verify.XXXXXX)"
 SOURCES="$ROOT/input-sources"
 CACHE="${GOCACHE:-/private/tmp/kbcore-gocache}"
 
 run() {
-  env GOCACHE="$CACHE" go run ./cmd/kbcore "$@"
+  env GOCACHE="$CACHE" go run ./cmd/kbcore --config "$CONFIG" "$@"
 }
 
 require_grep() {
