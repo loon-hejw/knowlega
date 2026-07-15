@@ -214,6 +214,151 @@ Token validation calls AuthService.
 	}
 }
 
+func TestUnifiedQueryTurnSkipsRouterAndPlanner(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	canWriteBack := false
+	agent := &unifiedTurnTestAgent{decisions: []core.QueryTurnDecision{{
+		Intent:           QueryIntentDirectChat,
+		ResolvedQuestion: "你好",
+		ReasoningMode:    "synthesis",
+		CanWriteBack:     &canWriteBack,
+		Action:           core.QueryAction{Action: "final", Answer: "你好，我在。"},
+	}}}
+	var events []QueryProgressEvent
+	answer, err := QueryLLMWikiWithOptions(QueryOptions{
+		ProjectPath: root,
+		Question:    "你好",
+		Agent:       agent,
+		Progress: func(event QueryProgressEvent) {
+			events = append(events, event)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer.Answer != "你好，我在。" || answer.Plan.Intent != QueryIntentDirectChat {
+		t.Fatalf("answer=%+v", answer)
+	}
+	if agent.turnCalls != 1 || agent.planCalls != 0 || agent.routeCalls != 0 || agent.actionCalls != 0 {
+		t.Fatalf("unexpected calls: turn=%d plan=%d route=%d legacy_action=%d", agent.turnCalls, agent.planCalls, agent.routeCalls, agent.actionCalls)
+	}
+	if !queryProgressContains(events, "context_started") || !queryProgressContains(events, "strategy_ready") {
+		t.Fatalf("unified progress events missing: %+v", events)
+	}
+	if queryProgressContains(events, "routing_started") || queryProgressContains(events, "planning_started") {
+		t.Fatalf("legacy router/planner events must not be emitted: %+v", events)
+	}
+	if len(agent.inputs) != 1 || agent.inputs[0].Index == "" || agent.inputs[0].Purpose == "" {
+		t.Fatalf("first turn did not receive project guidance: %+v", agent.inputs)
+	}
+}
+
+func TestUnifiedQueryTurnKeepsNumberedRequirementsAndReadsEvidence(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(root, "wiki", "entities", "zhenyuanzi.md"), `---
+type: entity
+title: 镇元子
+---
+# 镇元子
+镇元子与孙悟空相见，后来结为兄弟。
+`)
+	canWriteBack := false
+	question := "1. 有结义的情节\n2. 见过孙悟空\n3. 跟孙悟空不算敌对关系"
+	agent := &unifiedTurnTestAgent{decisions: []core.QueryTurnDecision{
+		{
+			Intent:           QueryIntentWikiQuery,
+			ResolvedQuestion: "谁同时满足三个条件？",
+			ReasoningMode:    "constraint_satisfaction",
+			Requirements: []core.QueryRequirement{
+				{ID: "1", Text: "有结义的情节", Kind: "positive"},
+				{ID: "2", Text: "见过孙悟空", Kind: "positive"},
+				{ID: "3", Text: "跟孙悟空不算敌对关系", Kind: "positive"},
+			},
+			RequireAll:   true,
+			CanWriteBack: &canWriteBack,
+			Action:       core.QueryAction{Action: "read", Path: "wiki/entities/zhenyuanzi.md"},
+		},
+		{Action: core.QueryAction{
+			Action:    "final",
+			Candidate: "镇元子",
+			Answer:    "镇元子满足这三个条件 [wiki/entities/zhenyuanzi.md]。",
+			Checks: []core.QueryEvidenceCheck{
+				{RequirementID: "1", Status: "supported", EvidencePaths: []string{"wiki/entities/zhenyuanzi.md"}},
+				{RequirementID: "2", Status: "supported", EvidencePaths: []string{"wiki/entities/zhenyuanzi.md"}},
+				{RequirementID: "3", Status: "supported", EvidencePaths: []string{"wiki/entities/zhenyuanzi.md"}},
+			},
+		}},
+	}}
+	answer, err := QueryLLMWikiWithOptions(QueryOptions{
+		ProjectPath: root,
+		Question:    question,
+		Agent:       agent,
+		Runtime: QueryRuntimeOptions{
+			InitialActionBudget: 4,
+			MaxActionBudget:     8,
+			VerificationPasses:  -1,
+			StagnationRounds:    2,
+			TotalTimeout:        time.Minute,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer.Status != "complete" || answer.Candidate != "镇元子" || len(answer.Plan.Requirements) != 3 {
+		t.Fatalf("answer=%+v", answer)
+	}
+	if agent.planCalls != 0 || agent.routeCalls != 0 || agent.turnCalls != 2 {
+		t.Fatalf("unexpected calls: %+v", agent)
+	}
+	if len(answer.Citations) != 1 || answer.Citations[0].Path != "wiki/entities/zhenyuanzi.md" {
+		t.Fatalf("citations=%+v", answer.Citations)
+	}
+}
+
+func TestUnifiedMissingEvidenceMustAttemptEvidenceTool(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	canWriteBack := false
+	agent := &unifiedTurnTestAgent{decisions: []core.QueryTurnDecision{
+		{
+			Intent:       QueryIntentMissingEvidence,
+			CanWriteBack: &canWriteBack,
+			Action:       core.QueryAction{Action: "final", Answer: "知识库没有相关证据。"},
+		},
+		{Action: core.QueryAction{Action: "search", Query: "不存在的主题"}},
+		{Action: core.QueryAction{Action: "final", Answer: "检索后仍未找到相关证据。"}},
+	}}
+	answer, err := QueryLLMWikiWithOptions(QueryOptions{
+		ProjectPath: root,
+		Question:    "知识库里有不存在的主题吗？",
+		Agent:       agent,
+		Runtime: QueryRuntimeOptions{
+			InitialActionBudget: 4,
+			MaxActionBudget:     8,
+			VerificationPasses:  -1,
+			StagnationRounds:    2,
+			TotalTimeout:        time.Minute,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer.Answer != "检索后仍未找到相关证据。" || agent.turnCalls != 3 {
+		t.Fatalf("answer=%+v turns=%d", answer, agent.turnCalls)
+	}
+	if !hasNoEvidenceFinalRejection(answer.Trace) {
+		t.Fatalf("first unsupported final should have been rejected: %+v", answer.Trace)
+	}
+}
+
 func TestLLMWikiQueryCanReadPlannedPagesWithoutSearch(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "kb")
 	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
@@ -2163,6 +2308,15 @@ type routedQueryAgent struct {
 	synthCalled   int
 }
 
+type unifiedTurnTestAgent struct {
+	decisions   []core.QueryTurnDecision
+	inputs      []QueryActionInput
+	turnCalls   int
+	planCalls   int
+	routeCalls  int
+	actionCalls int
+}
+
 type fakeGraphEvidenceStore struct {
 	evidence  []core.GraphEvidence
 	called    int
@@ -2340,6 +2494,34 @@ func (f *routedQueryAgent) NextQueryAction(QueryActionInput) (core.QueryAction, 
 func (f *routedQueryAgent) SynthesizeQuery(QuerySynthesisInput) (string, error) {
 	f.synthCalled++
 	return "direct synthesized", nil
+}
+
+func (f *unifiedTurnTestAgent) RouteQuery(QueryRoutingInput) (QueryRouteDecision, error) {
+	f.routeCalls++
+	return QueryRouteDecision{Intent: QueryIntentWikiQuery}, nil
+}
+
+func (f *unifiedTurnTestAgent) PlanQuery(QueryPlanningInput) (core.QueryPlan, error) {
+	f.planCalls++
+	return core.QueryPlan{Intent: QueryIntentWikiQuery}, nil
+}
+
+func (f *unifiedTurnTestAgent) NextQueryTurn(input QueryActionInput) (core.QueryTurnDecision, error) {
+	f.turnCalls++
+	f.inputs = append(f.inputs, input)
+	if f.turnCalls > len(f.decisions) {
+		return core.QueryTurnDecision{}, errors.New("no more unified decisions")
+	}
+	return f.decisions[f.turnCalls-1], nil
+}
+
+func (f *unifiedTurnTestAgent) NextQueryAction(QueryActionInput) (core.QueryAction, error) {
+	f.actionCalls++
+	return core.QueryAction{}, errors.New("legacy action method must not be called")
+}
+
+func (f *unifiedTurnTestAgent) SynthesizeQuery(QuerySynthesisInput) (string, error) {
+	return "unexpected synthesis", nil
 }
 
 func queryProgressContains(events []QueryProgressEvent, eventType string) bool {

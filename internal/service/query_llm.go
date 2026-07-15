@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -271,6 +272,15 @@ func (a OpenAICompatibleQueryAgent) NextQueryAction(input QueryActionInput) (cor
 }
 
 func (a OpenAICompatibleQueryAgent) NextQueryActionContext(ctx context.Context, input QueryActionInput) (core.QueryAction, error) {
+	decision, err := a.NextQueryTurnContext(ctx, input)
+	return decision.Action, err
+}
+
+func (a OpenAICompatibleQueryAgent) NextQueryTurn(input QueryActionInput) (core.QueryTurnDecision, error) {
+	return a.NextQueryTurnContext(context.Background(), input)
+}
+
+func (a OpenAICompatibleQueryAgent) NextQueryTurnContext(ctx context.Context, input QueryActionInput) (core.QueryTurnDecision, error) {
 	allReadPaths := queryReadPathInventory(input.Docs)
 	input = budgetQueryActionInput(input, 52000)
 	var docs strings.Builder
@@ -291,8 +301,11 @@ func (a OpenAICompatibleQueryAgent) NextQueryActionContext(ctx context.Context, 
 			fmt.Fprintf(&navigation, "  skipped=%s\n", strings.Join(obs.Skipped, ", "))
 		}
 	}
-	system := `You are operating a persistent LLM Wiki through tools.
-Choose exactly one next action and return only JSON.
+	system := `You are the single continuing agent operating a persistent LLM Wiki through tools.
+On the first turn, classify the request, decompose material conditions, and choose the first real action in the same response. On later turns, continue from the persisted plan, evidence, candidate ledger, and tool trace.
+Return only JSON in this envelope:
+{"intent":"wiki_query|direct_chat|system_faq|general_assistant|missing_evidence|unsupported","resolved_question":"standalone question","reasoning_mode":"constraint_satisfaction|fact_lookup|comparison|causal|temporal|negative|synthesis|code_graph","requirements":[{"id":"1","text":"...","kind":"positive|negative"}],"require_all_requirements":true,"can_write_back":false,"action":{...one action below...}}
+Intent and planning fields are required on step 1 and may be omitted later. action is always required.
 
 Actions:
 - {"action":"read","path":"wiki/... or raw/sources/... or exact wiki title/link/alias","rationale":"why this evidence is needed"}
@@ -305,6 +318,8 @@ Actions:
 - {"action":"writeback","title":"short synthesis page title","answer":"final cited answer","rationale":"why this synthesis should be saved"}
 
 Rules:
+- Every request receives at least this one model turn. direct_chat, system_faq, general_assistant, and unsupported should return final immediately without pretending to use wiki evidence.
+- wiki_query must use read/search/follow_links/graph evidence before final. missing_evidence must perform a search or read attempt before concluding that evidence is absent.
 - Prefer wiki navigation before broad search: read wiki/index.md, list_pages, follow_links from relevant pages, then search only when navigation is insufficient.
 - list_pages is navigation only, not factual evidence for final answers.
 - follow_links reads linked wiki pages and can provide final-answer evidence.
@@ -332,6 +347,22 @@ Conversation context:
 Query plan:
 %s
 
+First-turn project context (navigation and guidance, not final-answer evidence):
+Purpose:
+%s
+
+Schema:
+%s
+
+Index:
+%s
+
+Overview:
+%s
+
+Recent log:
+%s
+
 Canonical candidate assessments from prior tool actions:
 %s
 
@@ -350,21 +381,21 @@ All read document paths (aggregate paths are navigation only):
 %s
 
 	Read documents:
-%s`, input.Question, input.ConversationContext, mustJSON(input.Plan), mustJSON(input.CandidateAssessments), input.Step, mustJSON(input.Trace), results.String(), navigation.String(), allReadPaths, docs.String())
+%s`, input.Question, input.ConversationContext, mustJSON(input.Plan), input.Purpose, input.Schema, input.Index, input.Overview, input.LogTail, mustJSON(input.CandidateAssessments), input.Step, mustJSON(input.Trace), results.String(), navigation.String(), allReadPaths, docs.String())
 	retryOpts := a.retryOptions()
-	return llmretry.DoValue[core.QueryAction](ctx, retryOpts, queryLLMRetryCallback(ctx), func(attempt int) (core.QueryAction, bool, error) {
+	return llmretry.DoValue[core.QueryTurnDecision](ctx, retryOpts, queryLLMRetryCallback(ctx), func(attempt int) (core.QueryTurnDecision, bool, error) {
 		content, retryable, err := a.chatOnce(ctx, system, user)
 		if err != nil {
-			return core.QueryAction{}, retryable, err
+			return core.QueryTurnDecision{}, retryable, err
 		}
-		action, err := decodeLLMJSONObject[core.QueryAction](content, "llm query action")
+		decision, err := decodeQueryTurnDecision(content)
 		if err != nil {
-			return core.QueryAction{}, true, err
+			return core.QueryTurnDecision{}, true, err
 		}
-		if strings.TrimSpace(action.Action) == "" {
-			return core.QueryAction{}, true, fmt.Errorf("llm query action missing action: %s", content)
+		if strings.TrimSpace(decision.Action.Action) == "" {
+			return core.QueryTurnDecision{}, true, fmt.Errorf("llm query turn missing action: %s", content)
 		}
-		return action, false, nil
+		return decision, false, nil
 	})
 }
 
@@ -548,6 +579,30 @@ func decodeLLMJSONObject[T any](content string, label string) (T, error) {
 	return value, nil
 }
 
+func decodeQueryTurnDecision(content string) (core.QueryTurnDecision, error) {
+	data := []byte(extractJSONObject(content))
+	// Keep the action endpoint backward compatible with providers and tests that
+	// still return the former flat QueryAction shape. Production first turns use
+	// the decision envelope, but a flat action remains a valid later-turn reply.
+	var shape map[string]json.RawMessage
+	if err := json.Unmarshal(data, &shape); err != nil {
+		return core.QueryTurnDecision{}, fmt.Errorf("parse llm query action: %w: %s", err, content)
+	}
+	actionJSON := bytes.TrimSpace(shape["action"])
+	if len(actionJSON) > 0 && actionJSON[0] == '{' {
+		var decision core.QueryTurnDecision
+		if err := json.Unmarshal(data, &decision); err != nil {
+			return core.QueryTurnDecision{}, fmt.Errorf("parse llm query turn: %w: %s", err, content)
+		}
+		return decision, nil
+	}
+	var action core.QueryAction
+	if err := json.Unmarshal(data, &action); err != nil {
+		return core.QueryTurnDecision{}, fmt.Errorf("parse llm query action: %w: %s", err, content)
+	}
+	return core.QueryTurnDecision{Action: action}, nil
+}
+
 func mustJSON(value any) string {
 	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
@@ -566,6 +621,11 @@ func budgetQueryPlanningInput(input QueryPlanningInput) QueryPlanningInput {
 }
 
 func budgetQueryActionInput(input QueryActionInput, docsBudget int) QueryActionInput {
+	input.Purpose = promptbudget.TrimEnd(input.Purpose, 6000)
+	input.Schema = promptbudget.TrimEnd(input.Schema, 6000)
+	input.Index = promptbudget.TrimMiddle(input.Index, 30000)
+	input.Overview = promptbudget.TrimMiddle(input.Overview, 16000)
+	input.LogTail = tailRunes(input.LogTail, 4000)
 	input.Results = budgetQueryResults(input.Results, 12)
 	input.Docs = budgetRecentReadDocuments(prioritizeQueryActionDocuments(input.Docs, input.Results, input.Trace), docsBudget)
 	input.Navigation = budgetNavigationObservations(input.Navigation, 6, 12)

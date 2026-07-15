@@ -102,7 +102,6 @@ import type {
 
 
 import {
-  JsonBlock,
   OperationOutput,
   SeverityTag,
   buildFileTree,
@@ -277,11 +276,6 @@ export function ChatBubble({
                 label: "结果",
                 children: <ResultsTable results={answer.results ?? []} onOpenFile={onOpenFile} />,
               },
-              {
-                key: "plan",
-                label: "计划",
-                children: <JsonBlock value={answer.plan} />,
-              },
             ]}
           />
         </>
@@ -356,6 +350,9 @@ export function activeRunStage(status: ActiveChatRunState["status"], latestType?
   if (status === "failed") return "done";
   if (status === "canceled") return "done";
   if (!latestType || latestType === "started") return "intake";
+  if (latestType === "context_started" || latestType === "context_ready") return "context";
+  if (latestType === "strategy_ready") return "evidence";
+  // Historical runs may still contain the former router/planner events.
   if (latestType === "routing_started" || latestType === "routing_done") return "routing";
   if (latestType === "general_answer_started" || latestType === "general_answer_done") return "direct_answer";
   if (latestType === "planning_started" || latestType === "planning_done") return "planning";
@@ -365,21 +362,13 @@ export function activeRunStage(status: ActiveChatRunState["status"], latestType?
 }
 
 export function buildRunStages(activeKey: string, status: ActiveChatRunState["status"], intent?: string): RunStageSummary[] {
-  const order = isNonWikiRunIntent(intent)
-    ? [
-        { key: "intake", label: "接收问题" },
-        { key: "routing", label: "判断意图" },
-        { key: "direct_answer", label: "直接回答" },
-        { key: "done", label: "完成" },
-      ]
-    : [
-        { key: "intake", label: "接收问题" },
-        { key: "routing", label: "判断意图" },
-        { key: "planning", label: "规划查询" },
-        { key: "evidence", label: "读取证据" },
-        { key: "synthesis", label: "综合答案" },
-        { key: "done", label: "完成" },
-      ];
+  const order = [
+    { key: "intake", label: "接收问题" },
+    { key: "context", label: "准备上下文" },
+    { key: "evidence", label: isNonWikiRunIntent(intent) ? "执行回答动作" : "执行证据动作" },
+    { key: "synthesis", label: "综合答案" },
+    { key: "done", label: "完成" },
+  ];
   const activeIndex = order.findIndex((stage) => stage.key === activeKey);
   return order.map((stage, index) => {
     let stageStatus: RunStageStatus = index < activeIndex ? "done" : index === activeIndex ? "active" : "waiting";
@@ -393,6 +382,7 @@ export function runTitle(status: ActiveChatRunState["status"], stage: string, la
   if (status === "succeeded") return "答案已生成";
   if (status === "failed") return latest?.message || "查询失败";
   if (status === "canceled") return "查询已取消";
+  if (stage === "context") return "正在准备知识库上下文";
   if (stage === "routing") return "正在判断问题意图";
   if (stage === "direct_answer") return "正在直接生成回答";
   if (stage === "planning") return "正在等待模型制定查询计划";
@@ -414,6 +404,7 @@ export function runSubtitle(status: ActiveChatRunState["status"], elapsedMs: num
 export function stagePercent(stage: string): number {
   const values: Record<string, number> = {
     intake: 12,
+    context: 28,
     routing: 26,
     planning: 42,
     evidence: 68,
@@ -433,7 +424,7 @@ export function routeIntentFromEvents(events: ChatRunEvent[]): string {
 }
 
 export function isNonWikiRunIntent(intent?: string): boolean {
-  return ["direct_chat", "system_faq", "general_assistant", "missing_evidence", "unsupported"].includes(intent ?? "");
+  return ["direct_chat", "system_faq", "general_assistant", "unsupported"].includes(intent ?? "");
 }
 
 export function countRunActions(events: ChatRunEvent[], actions: string[]): number {
@@ -449,6 +440,8 @@ export function actionLabel(action: string): string {
     search: "搜索页面",
     graph: "查询图谱",
     expand: "查询图谱",
+    assess: "核验候选",
+    assess_candidate: "核验候选",
     final: "生成答案",
     writeback: "准备写回",
   };
@@ -473,6 +466,9 @@ export function terminalChatRunStatus(type: string): ActiveChatRunState["status"
 export function eventTypeLabel(type: string): string {
   const labels: Record<string, string> = {
     started: "启动",
+    context_started: "上下文",
+    context_ready: "上下文就绪",
+    strategy_ready: "策略",
     routing_started: "意图",
     routing_done: "路由",
     planning_started: "规划",

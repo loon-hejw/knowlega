@@ -340,6 +340,28 @@ func TestOpenAICompatibleQueryAgentParsesNextAction(t *testing.T) {
 	}
 }
 
+func TestDecodeQueryTurnDecisionEnvelope(t *testing.T) {
+	canWriteBack := false
+	decision, err := decodeQueryTurnDecision(`{
+  "intent":"wiki_query",
+  "resolved_question":"谁满足全部条件？",
+  "reasoning_mode":"constraint_satisfaction",
+  "requirements":[{"id":"1","text":"见过孙悟空","kind":"positive"}],
+  "require_all_requirements":true,
+  "can_write_back":false,
+  "action":{"action":"search","query":"见过孙悟空","limit":10}
+}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision.Intent != QueryIntentWikiQuery || decision.Action.Action != "search" || len(decision.Requirements) != 1 || !decision.RequireAll {
+		t.Fatalf("decision=%+v", decision)
+	}
+	if decision.CanWriteBack == nil || *decision.CanWriteBack != canWriteBack {
+		t.Fatalf("can_write_back=%v", decision.CanWriteBack)
+	}
+}
+
 func TestOpenAICompatibleQueryAgentRetriesActionInvalidJSON(t *testing.T) {
 	call := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

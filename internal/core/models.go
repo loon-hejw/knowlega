@@ -262,6 +262,16 @@ type QueryAction struct {
 	Checks    []QueryEvidenceCheck `json:"evidence_checks,omitempty"`
 }
 
+type QueryTurnDecision struct {
+	Intent           string             `json:"intent,omitempty"`
+	ResolvedQuestion string             `json:"resolved_question,omitempty"`
+	ReasoningMode    string             `json:"reasoning_mode,omitempty"`
+	Requirements     []QueryRequirement `json:"requirements,omitempty"`
+	RequireAll       bool               `json:"require_all_requirements,omitempty"`
+	CanWriteBack     *bool              `json:"can_write_back,omitempty"`
+	Action           QueryAction        `json:"action"`
+}
+
 type QueryTraceStep struct {
 	Step        int         `json:"step"`
 	Action      QueryAction `json:"action"`

@@ -78,7 +78,20 @@ type QueryActionInput struct {
 	Navigation           []QueryNavigationObservation
 	Trace                []core.QueryTraceStep
 	CandidateAssessments []core.QueryCandidateAssessment
+	Purpose              string
+	Schema               string
+	Index                string
+	Overview             string
+	LogTail              string
 	Step                 int
+}
+
+type QueryTurnAgent interface {
+	NextQueryTurn(QueryActionInput) (core.QueryTurnDecision, error)
+}
+
+type ContextQueryTurnAgent interface {
+	NextQueryTurnContext(context.Context, QueryActionInput) (core.QueryTurnDecision, error)
 }
 
 type QueryActionAgent interface {
@@ -235,6 +248,9 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 		agent = FallbackQueryAgent{}
 	}
 	fallbackAgent := isFallbackQueryAgent(agent)
+	if actionAgent, ok := agent.(QueryActionAgent); ok && supportsUnifiedQueryTurn(agent) {
+		return queryLLMWikiUnified(ctx, opts, actionAgent, runtime, fallbackAgent)
+	}
 	emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "routing_started", Message: "正在判断问题意图"})
 	if decision, ok := deterministicQueryRoute(q); ok {
 		if normalizeRouteIntent(decision.Intent) != QueryIntentWikiQuery {
@@ -373,7 +389,7 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 	var finalAction core.QueryAction
 	status := "complete"
 	if actionAgent, ok := agent.(QueryActionAgent); ok {
-		loopResult, loopErr := runQueryActionLoop(ctx, projectPath, opts.ProjectID, q, opts.ConversationContext, plan, results, docs, actionAgent, opts.SearchStore, opts.GraphStore, opts.EmbeddingProvider, runtime, opts.Progress)
+		loopResult, loopErr := runQueryActionLoop(ctx, projectPath, opts.ProjectID, q, opts.ConversationContext, plan, results, docs, QueryPlanningInput{}, actionAgent, opts.SearchStore, opts.GraphStore, opts.EmbeddingProvider, runtime, opts.Progress)
 		err = loopErr
 		if err != nil {
 			return nil, err
@@ -466,6 +482,147 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 		Notes:                    notes,
 	}
 	if plan.RequireVerification && !queryVerificationsAccepted(verification, runtime.VerificationPasses) {
+		answerResult.Plan.CanWriteBack = false
+	}
+	if !hasAnswerEvidence(docs) && (actionRetryExhausted(trace) || hasNoEvidenceFinalRejection(trace)) {
+		answerResult.Plan.CanWriteBack = false
+	}
+	if err := insertQueryLogIfConfigured(ctx, opts.QueryLogStore, opts.ProjectID, q, plan.AnswerMode, len(results)); err != nil {
+		return nil, err
+	}
+	return answerResult, nil
+}
+
+func supportsUnifiedQueryTurn(agent QueryAgent) bool {
+	if _, ok := agent.(ContextQueryTurnAgent); ok {
+		return true
+	}
+	_, ok := agent.(QueryTurnAgent)
+	return ok
+}
+
+func queryLLMWikiUnified(ctx context.Context, opts QueryOptions, actionAgent QueryActionAgent, runtime QueryRuntimeOptions, fallbackAgent bool) (*core.QueryAnswer, error) {
+	q := opts.Question
+	emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "context_started", Message: "正在准备知识库上下文"})
+	initial, err := queryPlanningInput(opts.ProjectPath, q)
+	if err != nil {
+		return nil, err
+	}
+	initial.ConversationContext = opts.ConversationContext
+	limit := opts.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	plan := core.QueryPlan{
+		Question:       q,
+		CandidateLimit: limit,
+		AnswerMode:     "single_agent_tool_loop",
+		CanWriteBack:   false,
+	}
+	// Numbered conditions are deterministic input structure, not semantic
+	// routing. Capturing them here prevents any later model turn from silently
+	// dropping the user's explicit checklist.
+	plan = enrichQueryPlan(q, plan)
+	emitQueryProgress(opts.Progress, QueryProgressEvent{
+		Type:        "context_ready",
+		Message:     "知识库上下文已就绪，等待首轮决策",
+		Observation: fmt.Sprintf("guidance=purpose,schema,index,overview requirements=%d", len(plan.Requirements)),
+	})
+	loopResult, err := runQueryActionLoop(
+		ctx,
+		opts.ProjectPath,
+		opts.ProjectID,
+		q,
+		opts.ConversationContext,
+		plan,
+		nil,
+		nil,
+		initial,
+		actionAgent,
+		opts.SearchStore,
+		opts.GraphStore,
+		opts.EmbeddingProvider,
+		runtime,
+		opts.Progress,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(loopResult.Plan.Question) != "" {
+		plan = loopResult.Plan
+	}
+	results := loopResult.Results
+	docs := loopResult.Docs
+	trace := loopResult.Trace
+	answer := loopResult.Answer
+	status := loopResult.Status
+	finalAction := loopResult.FinalAction
+	incompleteReason := ""
+	if strings.TrimSpace(answer) == "" && plan.RequireAll {
+		best := bestCandidateAssessment(loopResult.Assessments)
+		if best != nil {
+			finalAction.Candidate = best.Candidate
+			finalAction.Checks = best.Checks
+			answer = formatIncompleteCandidateAnswer(plan, *best)
+		}
+		incompleteReason = unresolvedQueryRequirements(plan, finalAction.Checks)
+		if incompleteReason == "" {
+			incompleteReason = " 查询预算内未形成可验证的完整候选。"
+		}
+		if strings.TrimSpace(answer) == "" {
+			answer = "当前已读证据尚不能同时满足问题的全部要求。" + incompleteReason
+		}
+		status = "incomplete"
+		plan.CanWriteBack = false
+	}
+	if strings.TrimSpace(answer) == "" {
+		emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "synthesis_started", Message: "正在综合最终答案", Observation: fmt.Sprintf("docs=%d results=%d", len(docs), len(results))})
+		answer, err = synthesizeQueryWithContext(ctx, opts.Agent, QuerySynthesisInput{
+			Question:            q,
+			ConversationContext: opts.ConversationContext,
+			Plan:                plan,
+			Results:             results,
+			Docs:                docs,
+			Trace:               trace,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if !plan.RequireAll {
+			status = "complete"
+		}
+	}
+	if status == "" {
+		status = "complete"
+	}
+	if status != "complete" {
+		plan.CanWriteBack = false
+	}
+	notes := []string{
+		"The first model turn classified intent, decomposed requirements, and selected the first real tool action.",
+		"Search results are candidate recall only; citations come from read or graph evidence.",
+	}
+	if fallbackAgent {
+		notes = append(notes, "FallbackQueryAgent is an offline scaffold and cannot write back.")
+	}
+	answerResult := &core.QueryAnswer{
+		Question:                 q,
+		Plan:                     plan,
+		Results:                  results,
+		Answer:                   answer,
+		Status:                   status,
+		Candidate:                finalAction.Candidate,
+		EvidenceChecks:           finalAction.Checks,
+		CandidateAssessments:     loopResult.Assessments,
+		UnresolvedRequirementIDs: unresolvedRequirementIDs(plan, finalAction.Checks),
+		SuggestedWritebackTitle:  loopResult.SuggestedTitle,
+		Citations:                queryCitationsForAnswer(docs, finalAction.Checks),
+		Trace:                    trace,
+		Verification:             loopResult.Verification,
+		IncompleteReason:         incompleteReason,
+		Notes:                    notes,
+	}
+	if plan.RequireVerification && !queryVerificationsAccepted(loopResult.Verification, runtime.VerificationPasses) {
 		answerResult.Plan.CanWriteBack = false
 	}
 	if !hasAnswerEvidence(docs) && (actionRetryExhausted(trace) || hasNoEvidenceFinalRejection(trace)) {
@@ -1272,6 +1429,7 @@ func queryCitationsForAnswer(docs []QueryReadDocument, checks []core.QueryEviden
 }
 
 type queryLoopResult struct {
+	Plan           core.QueryPlan
 	Results        []core.QueryResult
 	Docs           []QueryReadDocument
 	Trace          []core.QueryTraceStep
@@ -1283,16 +1441,22 @@ type queryLoopResult struct {
 	Status         string
 }
 
-func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversation string, plan core.QueryPlan, results []core.QueryResult, docs []QueryReadDocument, agent QueryActionAgent, searchStore SearchEvidenceStore, graphStore GraphEvidenceStore, embeddingProvider EmbeddingProvider, runtime QueryRuntimeOptions, progress QueryProgressFunc) (queryLoopResult, error) {
+func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversation string, plan core.QueryPlan, results []core.QueryResult, docs []QueryReadDocument, initial QueryPlanningInput, agent QueryActionAgent, searchStore SearchEvidenceStore, graphStore GraphEvidenceStore, embeddingProvider EmbeddingProvider, runtime QueryRuntimeOptions, progress QueryProgressFunc) (queryLoopResult, error) {
 	var trace []core.QueryTraceStep
 	var navigation []QueryNavigationObservation
 	var assessments []core.QueryCandidateAssessment
 	var verification []core.QueryVerification
+	unifiedTurnAgent := false
+	if _, ok := agent.(ContextQueryTurnAgent); ok {
+		unifiedTurnAgent = true
+	} else if _, ok := agent.(QueryTurnAgent); ok {
+		unifiedTurnAgent = true
+	}
 	noEvidenceFinalRejections := 0
 	enrichedCandidates := map[string]bool{}
 	pendingReviewPass := 0
 	reviewPasses := 0
-	if plan.RequireVerification {
+	if !unifiedTurnAgent && plan.RequireVerification {
 		reviewPasses = runtime.VerificationPasses
 	}
 	actionBudget := runtime.InitialActionBudget
@@ -1318,7 +1482,9 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 		})
 		return fmt.Sprintf("; candidate-specific searches covered every requirement and auto-read %d new document(s)", len(docs)-before), nil
 	}
-	hardBudget := runtime.MaxActionBudget + reviewPasses
+	// Reserve room for stop-review turns. Whether those turns are required is
+	// decided by the same first model response that classifies the question.
+	hardBudget := runtime.MaxActionBudget + runtime.VerificationPasses
 	for step := 1; step <= hardBudget; step++ {
 		if step > actionBudget {
 			if pendingReviewPass == 0 && (!plan.RequireAll || stagnantWindows >= runtime.StagnationRounds) {
@@ -1340,7 +1506,7 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 			return queryLoopResult{}, err
 		}
 		emitQueryProgress(progress, QueryProgressEvent{Type: "action_planning_started", Step: step, Message: "正在决定下一步工具动作"})
-		action, err := nextQueryActionWithContext(ctx, agent, QueryActionInput{
+		actionInput := QueryActionInput{
 			Question:             q,
 			ConversationContext:  conversation,
 			Plan:                 plan,
@@ -1350,7 +1516,15 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 			Trace:                trace,
 			CandidateAssessments: assessments,
 			Step:                 step,
-		})
+		}
+		if step == 1 {
+			actionInput.Purpose = initial.Purpose
+			actionInput.Schema = initial.Schema
+			actionInput.Index = initial.Index
+			actionInput.Overview = initial.Overview
+			actionInput.LogTail = initial.LogTail
+		}
+		decision, err := nextQueryTurnWithContext(ctx, agent, actionInput)
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return queryLoopResult{}, ctxErr
@@ -1377,10 +1551,24 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 				return queryLoopResult{}, err
 			}
 			if !hasAnswerEvidence(docs) {
-				return queryLoopResult{Results: results, Docs: docs, Trace: trace, Answer: degradedNoEvidenceAnswer(q), Status: "degraded"}, nil
+				return queryLoopResult{Plan: plan, Results: results, Docs: docs, Trace: trace, Answer: degradedNoEvidenceAnswer(q), Status: "degraded"}, nil
 			}
-			return queryLoopResult{Results: results, Docs: docs, Trace: trace, Assessments: assessments, Verification: verification, Status: "incomplete"}, nil
+			return queryLoopResult{Plan: plan, Results: results, Docs: docs, Trace: trace, Assessments: assessments, Verification: verification, Status: "incomplete"}, nil
 		}
+		if step == 1 && unifiedTurnAgent {
+			plan = mergeQueryTurnDecision(q, plan, decision, runtime)
+			reviewPasses = 0
+			if plan.RequireVerification {
+				reviewPasses = runtime.VerificationPasses
+			}
+			emitQueryProgress(progress, QueryProgressEvent{
+				Type:        "strategy_ready",
+				Step:        step,
+				Message:     "首轮决策已生成，开始执行工具",
+				Observation: fmt.Sprintf("intent=%s mode=%s requirements=%d action=%s", plan.Intent, plan.ReasoningMode, len(plan.Requirements), decision.Action.Action),
+			})
+		}
+		action := decision.Action
 		action.Action = strings.ToLower(strings.TrimSpace(action.Action))
 		if action.Action == "" && strings.TrimSpace(action.Answer) != "" {
 			action.Action = "final"
@@ -1574,9 +1762,9 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 						return queryLoopResult{}, err
 					}
 					if !hasAnswerEvidence(docs) {
-						return queryLoopResult{Results: results, Docs: docs, Trace: trace, Answer: degradedNoEvidenceAnswer(q), Assessments: assessments, Status: "degraded"}, nil
+						return queryLoopResult{Plan: plan, Results: results, Docs: docs, Trace: trace, Answer: degradedNoEvidenceAnswer(q), Assessments: assessments, Status: "degraded"}, nil
 					}
-					return queryLoopResult{Results: results, Docs: docs, Trace: trace, Assessments: assessments, Status: "incomplete"}, nil
+					return queryLoopResult{Plan: plan, Results: results, Docs: docs, Trace: trace, Assessments: assessments, Status: "incomplete"}, nil
 				}
 				continue
 			}
@@ -1602,7 +1790,7 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 				continue
 			}
 			emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: step, Action: &action, Message: "最终答案已生成"})
-			return queryLoopResult{Results: results, Docs: docs, Trace: trace, Answer: finalAnswer, SuggestedTitle: suggestedTitle, Assessments: assessments, FinalAction: action, Verification: verification, Status: "complete"}, nil
+			return queryLoopResult{Plan: plan, Results: results, Docs: docs, Trace: trace, Answer: finalAnswer, SuggestedTitle: suggestedTitle, Assessments: assessments, FinalAction: action, Verification: verification, Status: "complete"}, nil
 		default:
 			return queryLoopResult{}, fmt.Errorf("unknown query action %q", action.Action)
 		}
@@ -1616,7 +1804,7 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 		Observation: "synthesizing with collected evidence",
 	})
 	emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: hardBudget + 1, Message: "达到深度查询预算，停止继续检索", Observation: "requirements remain unresolved"})
-	return queryLoopResult{Results: results, Docs: docs, Trace: trace, Assessments: assessments, Verification: verification, Status: "incomplete"}, nil
+	return queryLoopResult{Plan: plan, Results: results, Docs: docs, Trace: trace, Assessments: assessments, Verification: verification, Status: "incomplete"}, nil
 }
 
 func expandVerificationNextQueries(ctx context.Context, projectPath, projectID string, queries []string, searchStore SearchEvidenceStore, embeddingProvider EmbeddingProvider) ([]core.QueryResult, []QueryReadDocument, error) {
@@ -2188,6 +2376,90 @@ func nextQueryActionWithContext(ctx context.Context, agent QueryActionAgent, inp
 	return agent.NextQueryAction(input)
 }
 
+func nextQueryTurnWithContext(ctx context.Context, agent QueryActionAgent, input QueryActionInput) (core.QueryTurnDecision, error) {
+	if contextAgent, ok := agent.(ContextQueryTurnAgent); ok {
+		return contextAgent.NextQueryTurnContext(ctx, input)
+	}
+	if turnAgent, ok := agent.(QueryTurnAgent); ok {
+		return turnAgent.NextQueryTurn(input)
+	}
+	action, err := nextQueryActionWithContext(ctx, agent, input)
+	return core.QueryTurnDecision{Action: action}, err
+}
+
+func mergeQueryTurnDecision(question string, plan core.QueryPlan, decision core.QueryTurnDecision, runtime QueryRuntimeOptions) core.QueryPlan {
+	if intent := strings.TrimSpace(decision.Intent); intent != "" {
+		plan.Intent = normalizeQueryIntent(intent)
+	}
+	if resolved := strings.TrimSpace(decision.ResolvedQuestion); resolved != "" {
+		plan.ResolvedQuestion = resolved
+	}
+	if mode := strings.TrimSpace(decision.ReasoningMode); mode != "" {
+		plan.ReasoningMode = mode
+	}
+	if len(decision.Requirements) > 0 {
+		plan.Requirements = normalizeQueryRequirements(decision.Requirements)
+	}
+	if decision.RequireAll {
+		plan.RequireAll = true
+	}
+	if decision.CanWriteBack != nil {
+		plan.CanWriteBack = *decision.CanWriteBack
+	}
+	plan = enrichQueryPlan(question, plan)
+	if strings.TrimSpace(plan.Intent) == "" {
+		plan.Intent = QueryIntentWikiQuery
+	}
+	plan.Intent = normalizeQueryIntent(plan.Intent)
+	if isQueryIntentWithoutWikiEvidence(plan.Intent) {
+		plan.CanWriteBack = false
+		plan.RequireAll = false
+		plan.RequireVerification = false
+		plan.VerificationPasses = 0
+		plan.AnswerMode = plan.Intent
+		return plan
+	}
+	plan.AnswerMode = "single_agent_tool_loop"
+	plan.RequireVerification = plan.RequireAll && runtime.VerificationPasses > 0
+	if plan.RequireVerification {
+		plan.VerificationPasses = runtime.VerificationPasses
+	}
+	return plan
+}
+
+func normalizeQueryRequirements(requirements []core.QueryRequirement) []core.QueryRequirement {
+	out := make([]core.QueryRequirement, 0, len(requirements))
+	seen := map[string]bool{}
+	for index, requirement := range requirements {
+		id := strings.TrimSpace(requirement.ID)
+		if id == "" {
+			id = fmt.Sprintf("%d", index+1)
+		}
+		if seen[id] || strings.TrimSpace(requirement.Text) == "" {
+			continue
+		}
+		kind := strings.ToLower(strings.TrimSpace(requirement.Kind))
+		if kind != "negative" {
+			kind = "positive"
+		}
+		requirement.ID = id
+		requirement.Text = strings.TrimSpace(requirement.Text)
+		requirement.Kind = kind
+		out = append(out, requirement)
+		seen[id] = true
+	}
+	return out
+}
+
+func isQueryIntentWithoutWikiEvidence(intent string) bool {
+	switch normalizeQueryIntent(intent) {
+	case QueryIntentDirectChat, QueryIntentSystemFAQ, QueryIntentGeneralAssistant, QueryIntentUnsupported:
+		return true
+	default:
+		return false
+	}
+}
+
 func acceptFinalQueryAction(step int, q string, plan core.QueryPlan, action core.QueryAction, results []core.QueryResult, docs []QueryReadDocument, trace *[]core.QueryTraceStep) (string, string, bool) {
 	action.Answer = normalizeQueryAnswerEvidencePaths(action.Answer, docs)
 	if unresolved := validateQueryRequirementChecks(plan, action, docs, *trace); len(unresolved) > 0 {
@@ -2207,11 +2479,19 @@ func acceptFinalQueryAction(step int, q string, plan core.QueryPlan, action core
 		return "", "", false
 	}
 	if !hasAnswerEvidence(docs) {
-		if isDirectChatIntent(plan.Intent) && !answerReferencesEvidence(action.Answer) && (isDirectChatQuestion(q) || strings.TrimSpace(plan.Intent) == "direct_chat") {
+		if isQueryIntentWithoutWikiEvidence(plan.Intent) && !answerReferencesEvidence(action.Answer) {
 			*trace = append(*trace, core.QueryTraceStep{
 				Step:        step,
 				Action:      action,
-				Observation: "direct chat final accepted without wiki evidence",
+				Observation: normalizeQueryIntent(plan.Intent) + " final accepted without wiki evidence",
+			})
+			return strings.TrimSpace(action.Answer), "", true
+		}
+		if normalizeQueryIntent(plan.Intent) == QueryIntentMissingEvidence && queryTraceHasEvidenceAttempt(*trace) && !answerReferencesEvidence(action.Answer) {
+			*trace = append(*trace, core.QueryTraceStep{
+				Step:        step,
+				Action:      action,
+				Observation: "missing-evidence conclusion accepted after wiki evidence attempt",
 			})
 			return strings.TrimSpace(action.Answer), "", true
 		}
@@ -2233,6 +2513,16 @@ func acceptFinalQueryAction(step int, q string, plan core.QueryPlan, action core
 		Observation: observation,
 	})
 	return strings.TrimSpace(action.Answer), strings.TrimSpace(action.Title), true
+}
+
+func queryTraceHasEvidenceAttempt(trace []core.QueryTraceStep) bool {
+	for _, step := range trace {
+		switch strings.ToLower(strings.TrimSpace(step.Action.Action)) {
+		case "read", "search", "follow_links", "graph", "expand":
+			return true
+		}
+	}
+	return false
 }
 
 func validateQueryRequirementChecks(plan core.QueryPlan, action core.QueryAction, docs []QueryReadDocument, trace []core.QueryTraceStep) []string {
