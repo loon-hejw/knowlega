@@ -85,13 +85,17 @@ use:
 - `follow_links` for wiki traversal;
 - `search` for candidate recall;
 - `graph` for exact code facts and related wiki evidence;
+- `assess_candidate` to persist one candidate's requirement ledger;
 - `final` to answer from evidence; and
 - `writeback` to suggest a durable synthesis.
 
+Planning seeds navigation, then one agent owns the complete tool transcript,
+candidate state, correction feedback, stop reviews, and final answer. Candidate
+generation, candidate audit, and verification are not separate LLM personas.
 The runtime reads `wiki/index.md`, `wiki/overview.md`, and `wiki/log.md` first.
 Search snippets and page lists are navigation only. A final answer requires a
-read wiki/raw document or graph evidence, and citations are built only from
-that evidence.
+read wiki/raw document or graph evidence, and citations come from the canonical
+answer-level evidence ledger rather than the last trace action.
 
 Recall order is:
 

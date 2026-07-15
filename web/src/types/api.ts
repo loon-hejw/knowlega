@@ -463,6 +463,16 @@ export interface QueryEvidenceCheck {
   explanation?: string;
 }
 
+export interface QueryCandidateAssessment {
+  candidate: string;
+  disposition: "active" | "partial" | "rejected" | "accepted" | string;
+  evidence_checks?: QueryEvidenceCheck[];
+  unresolved_requirement_ids?: string[];
+  contradicted_requirement_ids?: string[];
+  reason?: string;
+  step?: number;
+}
+
 export interface QueryVerification {
   pass: number;
   kind: string;
@@ -527,6 +537,11 @@ export interface QueryAnswer {
   plan: QueryPlan;
   results: QueryResult[] | null;
   answer: string;
+  status?: "complete" | "incomplete" | "degraded" | string;
+  candidate?: string;
+  evidence_checks?: QueryEvidenceCheck[];
+  candidate_assessments?: QueryCandidateAssessment[];
+  unresolved_requirement_ids?: string[];
   suggested_writeback_title?: string;
   citations: QueryCitation[] | null;
   trace?: QueryTraceStep[];

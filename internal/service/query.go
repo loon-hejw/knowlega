@@ -70,14 +70,15 @@ type ContextQueryAgent interface {
 }
 
 type QueryActionInput struct {
-	Question            string
-	ConversationContext string
-	Plan                core.QueryPlan
-	Results             []core.QueryResult
-	Docs                []QueryReadDocument
-	Navigation          []QueryNavigationObservation
-	Trace               []core.QueryTraceStep
-	Step                int
+	Question             string
+	ConversationContext  string
+	Plan                 core.QueryPlan
+	Results              []core.QueryResult
+	Docs                 []QueryReadDocument
+	Navigation           []QueryNavigationObservation
+	Trace                []core.QueryTraceStep
+	CandidateAssessments []core.QueryCandidateAssessment
+	Step                 int
 }
 
 type QueryActionAgent interface {
@@ -282,8 +283,8 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 		plan.Question = q
 	}
 	plan = enrichQueryPlan(q, plan)
-	_, plan.RequireVerification = agent.(QueryVerificationAgent)
-	plan.RequireVerification = plan.RequireVerification && runtime.VerificationPasses > 0
+	_, hasActionLoop := agent.(QueryActionAgent)
+	plan.RequireVerification = hasActionLoop && plan.RequireAll && runtime.VerificationPasses > 0
 	if plan.RequireVerification {
 		plan.VerificationPasses = runtime.VerificationPasses
 	}
@@ -317,6 +318,7 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 			Question: q,
 			Plan:     plan,
 			Answer:   directChatAnswer(q),
+			Status:   "complete",
 			Notes: []string{
 				"Direct chat intent was answered without wiki evidence.",
 			},
@@ -337,6 +339,7 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 			Question: q,
 			Plan:     plan,
 			Answer:   degradedNoEvidenceAnswer(q),
+			Status:   "degraded",
 			Notes: []string{
 				"Planner reported missing evidence before wiki tool execution.",
 			},
@@ -362,82 +365,28 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 		return nil, err
 	}
 	var results []core.QueryResult
-	if plan.RequireAll && len(plan.Requirements) > 0 {
-		emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "requirement_recall_started", Message: "正在逐条件召回并计算证据交集"})
-		requirementResults, recallErr := recallRequirementCandidates(ctx, projectPath, opts.ProjectID, plan, opts.SearchStore, opts.EmbeddingProvider)
-		if recallErr != nil {
-			return nil, recallErr
-		}
-		results = appendQueryResults(results, requirementResults)
-		requirementDocs, readErr := readQueryDocuments(projectPath, requirementResults, minInt(len(requirementResults), 16), 6000)
-		if readErr != nil {
-			return nil, readErr
-		}
-		for left, right := 0, len(requirementDocs)-1; left < right; left, right = left+1, right-1 {
-			requirementDocs[left], requirementDocs[right] = requirementDocs[right], requirementDocs[left]
-		}
-		docs = appendQueryDocs(docs, requirementDocs)
-		emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "requirement_recall_done", Message: "逐条件证据召回完成", Observation: fmt.Sprintf("candidates=%d documents=%d", len(requirementResults), len(requirementDocs))})
-	}
-	if plan.ReasoningMode == "constraint_satisfaction" {
-		if hypothesisAgent, ok := agent.(QueryHypothesisAgent); ok {
-			hypotheses, hypothesisErr := hypothesisAgent.GenerateQueryHypothesesContext(ctx, QueryHypothesisInput{
-				Question: q, Requirements: plan.Requirements, Index: input.Index, Overview: input.Overview,
-				Results: results, Docs: docs,
-			})
-			if hypothesisErr == nil {
-				plan.Hypotheses = hypotheses
-			}
-		}
-		if len(plan.Hypotheses) > 0 {
-			hypothesisDocs, hypothesisErr := readHypothesisDocuments(projectPath, plan.Hypotheses, 18, 6000)
-			if hypothesisErr != nil {
-				return nil, hypothesisErr
-			}
-			docs = appendQueryDocs(docs, hypothesisDocs)
-			emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "hypothesis_read_done", Message: "独立候选证据读取完成", Observation: fmt.Sprintf("documents=%d", len(hypothesisDocs))})
-			if auditAgent, ok := agent.(QueryCandidateAuditAgent); ok {
-				auditHypotheses := plan.Hypotheses
-				if len(auditHypotheses) > 4 {
-					auditHypotheses = auditHypotheses[:4]
-				}
-				packs, packErr := buildCandidateEvidencePacks(projectPath, auditHypotheses, plan.Requirements, 6, 12000)
-				if packErr != nil {
-					return nil, packErr
-				}
-				audited, auditErr := auditAgent.AuditQueryCandidatesContext(ctx, QueryCandidateAuditInput{
-					Question: q, Requirements: plan.Requirements, Hypotheses: auditHypotheses, Packs: packs,
-				})
-				if auditErr == nil {
-					audited = normalizeCandidateAudits(audited, packs, plan.Requirements)
-					if len(audited) > 0 {
-						plan.Hypotheses = audited
-					}
-				}
-				for _, pack := range packs {
-					docs = appendQueryDocs(docs, pack.Docs)
-				}
-				if len(plan.Hypotheses) > 0 {
-					for _, pack := range packs {
-						if strings.EqualFold(strings.TrimSpace(pack.Candidate), strings.TrimSpace(plan.Hypotheses[0].Candidate)) {
-							docs = refreshQueryDocs(docs, pack.Docs)
-							break
-						}
-					}
-				}
-				emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "candidate_audit_done", Message: "候选逐条件证据审计完成", Observation: fmt.Sprintf("candidates=%d", len(plan.Hypotheses))})
-			}
-		}
-	}
 	var trace []core.QueryTraceStep
 	var verification []core.QueryVerification
 	var finalAnswer string
 	var suggestedWritebackTitle string
+	var candidateAssessments []core.QueryCandidateAssessment
+	var finalAction core.QueryAction
+	status := "complete"
 	if actionAgent, ok := agent.(QueryActionAgent); ok {
-		results, docs, trace, finalAnswer, suggestedWritebackTitle, err = runQueryActionLoop(ctx, projectPath, opts.ProjectID, q, opts.ConversationContext, plan, results, docs, actionAgent, opts.SearchStore, opts.GraphStore, opts.EmbeddingProvider, runtime, &verification, opts.Progress)
+		loopResult, loopErr := runQueryActionLoop(ctx, projectPath, opts.ProjectID, q, opts.ConversationContext, plan, results, docs, actionAgent, opts.SearchStore, opts.GraphStore, opts.EmbeddingProvider, runtime, opts.Progress)
+		err = loopErr
 		if err != nil {
 			return nil, err
 		}
+		results = loopResult.Results
+		docs = loopResult.Docs
+		trace = loopResult.Trace
+		finalAnswer = loopResult.Answer
+		suggestedWritebackTitle = loopResult.SuggestedTitle
+		candidateAssessments = loopResult.Assessments
+		finalAction = loopResult.FinalAction
+		verification = loopResult.Verification
+		status = loopResult.Status
 	} else if len(plan.Searches) > 0 {
 		emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "search_started", Message: "正在召回候选页面"})
 		results, err = SearchWikiCandidatesWithStore(ctx, projectPath, opts.ProjectID, opts.SearchStore, opts.EmbeddingProvider, plan, plan.CandidateLimit)
@@ -453,13 +402,21 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 	}
 	answer := finalAnswer
 	incompleteReason := ""
-	_, deepVerificationAgent := agent.(QueryVerificationAgent)
-	if strings.TrimSpace(answer) == "" && (plan.RequireAll || deepVerificationAgent) {
-		incompleteReason = unresolvedQueryRequirements(plan, trace)
-		if incompleteReason == "" {
-			incompleteReason = " 深度代理未能在查询预算内通过最终验证。"
+	if strings.TrimSpace(answer) == "" && plan.RequireAll {
+		best := bestCandidateAssessment(candidateAssessments)
+		if best != nil {
+			finalAction.Candidate = best.Candidate
+			finalAction.Checks = best.Checks
+			answer = formatIncompleteCandidateAnswer(plan, *best)
 		}
-		answer = "当前已读证据尚不能同时满足问题的全部要求。" + incompleteReason
+		incompleteReason = unresolvedQueryRequirements(plan, finalAction.Checks)
+		if incompleteReason == "" {
+			incompleteReason = " 查询预算内未形成可验证的完整候选。"
+		}
+		if strings.TrimSpace(answer) == "" {
+			answer = "当前已读证据尚不能同时满足问题的全部要求。" + incompleteReason
+		}
+		status = "incomplete"
 		plan.CanWriteBack = false
 	}
 	if strings.TrimSpace(answer) == "" {
@@ -475,6 +432,12 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 		if err != nil {
 			return nil, err
 		}
+		if !plan.RequireAll {
+			status = "complete"
+		}
+	}
+	if status != "complete" {
+		plan.CanWriteBack = false
 	}
 	notes := []string{
 		"SearchWikiCandidates is only the recall tool; it is not the LLM Wiki query workflow by itself.",
@@ -486,16 +449,21 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 		}, notes...)
 	}
 	answerResult := &core.QueryAnswer{
-		Question:                q,
-		Plan:                    plan,
-		Results:                 results,
-		Answer:                  answer,
-		SuggestedWritebackTitle: suggestedWritebackTitle,
-		Citations:               queryCitations(docs),
-		Trace:                   trace,
-		Verification:            verification,
-		IncompleteReason:        incompleteReason,
-		Notes:                   notes,
+		Question:                 q,
+		Plan:                     plan,
+		Results:                  results,
+		Answer:                   answer,
+		Status:                   status,
+		Candidate:                finalAction.Candidate,
+		EvidenceChecks:           finalAction.Checks,
+		CandidateAssessments:     candidateAssessments,
+		UnresolvedRequirementIDs: unresolvedRequirementIDs(plan, finalAction.Checks),
+		SuggestedWritebackTitle:  suggestedWritebackTitle,
+		Citations:                queryCitationsForAnswer(docs, finalAction.Checks),
+		Trace:                    trace,
+		Verification:             verification,
+		IncompleteReason:         incompleteReason,
+		Notes:                    notes,
 	}
 	if plan.RequireVerification && !queryVerificationsAccepted(verification, runtime.VerificationPasses) {
 		answerResult.Plan.CanWriteBack = false
@@ -782,6 +750,7 @@ func answerRoutedQuery(ctx context.Context, opts QueryOptions, agent QueryAgent,
 			Question: q,
 			Plan:     plan,
 			Answer:   systemFAQAnswer(),
+			Status:   "complete",
 			Notes: []string{
 				"System FAQ intent was answered without wiki evidence.",
 				"Route: " + routeDecisionObservation(decision),
@@ -816,6 +785,7 @@ func answerRoutedQuery(ctx context.Context, opts QueryOptions, agent QueryAgent,
 			Question: q,
 			Plan:     plan,
 			Answer:   answer,
+			Status:   "complete",
 			Notes:    notes,
 		}
 		if err := insertQueryLogIfConfigured(ctx, opts.QueryLogStore, opts.ProjectID, q, plan.AnswerMode, 0); err != nil {
@@ -828,6 +798,7 @@ func answerRoutedQuery(ctx context.Context, opts QueryOptions, agent QueryAgent,
 			Question: q,
 			Plan:     plan,
 			Answer:   missingEvidenceAnswer(q),
+			Status:   "degraded",
 			Notes: []string{
 				"Router reported missing evidence before wiki tool execution.",
 				"Route: " + routeDecisionObservation(decision),
@@ -843,6 +814,7 @@ func answerRoutedQuery(ctx context.Context, opts QueryOptions, agent QueryAgent,
 			Question: q,
 			Plan:     plan,
 			Answer:   unsupportedQuestionAnswer(q),
+			Status:   "degraded",
 			Notes: []string{
 				"Unsupported intent was not sent to the wiki tool loop.",
 				"Route: " + routeDecisionObservation(decision),
@@ -1278,17 +1250,78 @@ func queryCitations(docs []QueryReadDocument) []core.QueryCitation {
 	return citations
 }
 
-func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversation string, plan core.QueryPlan, results []core.QueryResult, docs []QueryReadDocument, agent QueryActionAgent, searchStore SearchEvidenceStore, graphStore GraphEvidenceStore, embeddingProvider EmbeddingProvider, runtime QueryRuntimeOptions, verifications *[]core.QueryVerification, progress QueryProgressFunc) ([]core.QueryResult, []QueryReadDocument, []core.QueryTraceStep, string, string, error) {
+func queryCitationsForAnswer(docs []QueryReadDocument, checks []core.QueryEvidenceCheck) []core.QueryCitation {
+	if len(checks) == 0 {
+		return queryCitations(docs)
+	}
+	paths := map[string]bool{}
+	for _, check := range checks {
+		for _, path := range check.EvidencePaths {
+			if !isAggregateWikiPath(path) {
+				paths[normalizeQueryEvidencePath(path)] = true
+			}
+		}
+	}
+	filtered := make([]QueryReadDocument, 0, len(paths))
+	for _, doc := range docs {
+		if paths[normalizeQueryEvidencePath(doc.Path)] {
+			filtered = append(filtered, doc)
+		}
+	}
+	return queryCitations(filtered)
+}
+
+type queryLoopResult struct {
+	Results        []core.QueryResult
+	Docs           []QueryReadDocument
+	Trace          []core.QueryTraceStep
+	Answer         string
+	SuggestedTitle string
+	Assessments    []core.QueryCandidateAssessment
+	FinalAction    core.QueryAction
+	Verification   []core.QueryVerification
+	Status         string
+}
+
+func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversation string, plan core.QueryPlan, results []core.QueryResult, docs []QueryReadDocument, agent QueryActionAgent, searchStore SearchEvidenceStore, graphStore GraphEvidenceStore, embeddingProvider EmbeddingProvider, runtime QueryRuntimeOptions, progress QueryProgressFunc) (queryLoopResult, error) {
 	var trace []core.QueryTraceStep
 	var navigation []QueryNavigationObservation
+	var assessments []core.QueryCandidateAssessment
+	var verification []core.QueryVerification
 	noEvidenceFinalRejections := 0
 	enrichedCandidates := map[string]bool{}
+	pendingReviewPass := 0
+	reviewPasses := 0
+	if plan.RequireVerification {
+		reviewPasses = runtime.VerificationPasses
+	}
 	actionBudget := runtime.InitialActionBudget
 	lastEvidenceCount := len(docs)
 	stagnantWindows := 0
-	for step := 1; step <= runtime.MaxActionBudget; step++ {
+	enrichCandidate := func(step int, action core.QueryAction) (string, error) {
+		candidateKey := strings.ToLower(strings.TrimSpace(action.Candidate))
+		if !plan.RequireAll || candidateKey == "" || enrichedCandidates[candidateKey] {
+			return "", nil
+		}
+		enrichedCandidates[candidateKey] = true
+		candidateResults, candidateDocs, err := expandCandidateRequirementEvidence(ctx, projectPath, projectID, action.Candidate, plan, docs, searchStore, embeddingProvider)
+		if err != nil {
+			return "", err
+		}
+		before := len(docs)
+		results = appendQueryResults(candidateResults, results)
+		docs = appendQueryDocs(docs, candidateDocs)
+		trace = append(trace, core.QueryTraceStep{
+			Step:        step,
+			Action:      core.QueryAction{Action: "search", Query: action.Candidate + " × all requirements", Rationale: "runtime candidate-specific requirement coverage"},
+			Observation: fmt.Sprintf("candidate-specific requirement search read %d new document(s)", len(docs)-before),
+		})
+		return fmt.Sprintf("; candidate-specific searches covered every requirement and auto-read %d new document(s)", len(docs)-before), nil
+	}
+	hardBudget := runtime.MaxActionBudget + reviewPasses
+	for step := 1; step <= hardBudget; step++ {
 		if step > actionBudget {
-			if !plan.RequireAll || stagnantWindows >= runtime.StagnationRounds {
+			if pendingReviewPass == 0 && (!plan.RequireAll || stagnantWindows >= runtime.StagnationRounds) {
 				break
 			}
 			actionBudget += runtime.InitialActionBudget
@@ -1304,22 +1337,23 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 			emitQueryProgress(progress, QueryProgressEvent{Type: "budget_extended", Step: step, Message: "存在未决要求，扩展查询预算", Observation: fmt.Sprintf("action_budget=%d", actionBudget)})
 		}
 		if err := ctx.Err(); err != nil {
-			return nil, nil, nil, "", "", err
+			return queryLoopResult{}, err
 		}
 		emitQueryProgress(progress, QueryProgressEvent{Type: "action_planning_started", Step: step, Message: "正在决定下一步工具动作"})
 		action, err := nextQueryActionWithContext(ctx, agent, QueryActionInput{
-			Question:            q,
-			ConversationContext: conversation,
-			Plan:                plan,
-			Results:             results,
-			Docs:                docs,
-			Navigation:          navigation,
-			Trace:               trace,
-			Step:                step,
+			Question:             q,
+			ConversationContext:  conversation,
+			Plan:                 plan,
+			Results:              results,
+			Docs:                 docs,
+			Navigation:           navigation,
+			Trace:                trace,
+			CandidateAssessments: assessments,
+			Step:                 step,
 		})
 		if err != nil {
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return nil, nil, nil, "", "", ctxErr
+				return queryLoopResult{}, ctxErr
 			}
 			action := core.QueryAction{
 				Action:    "synthesize",
@@ -1340,12 +1374,12 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 			})
 			results, docs, err = ensureEvidenceAfterActionFailure(ctx, projectPath, projectID, q, plan, results, docs, searchStore, embeddingProvider)
 			if err != nil {
-				return nil, nil, nil, "", "", err
+				return queryLoopResult{}, err
 			}
 			if !hasAnswerEvidence(docs) {
-				return results, docs, trace, degradedNoEvidenceAnswer(q), "", nil
+				return queryLoopResult{Results: results, Docs: docs, Trace: trace, Answer: degradedNoEvidenceAnswer(q), Status: "degraded"}, nil
 			}
-			return results, docs, trace, "", "", nil
+			return queryLoopResult{Results: results, Docs: docs, Trace: trace, Assessments: assessments, Verification: verification, Status: "incomplete"}, nil
 		}
 		action.Action = strings.ToLower(strings.TrimSpace(action.Action))
 		if action.Action == "" && strings.TrimSpace(action.Answer) != "" {
@@ -1369,7 +1403,7 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 			afterDocument := len(docs)
 			provenanceDocs, provenanceErr := readDocumentProvenance(projectPath, doc, 4, 12000)
 			if provenanceErr != nil {
-				return nil, nil, nil, "", "", provenanceErr
+				return queryLoopResult{}, provenanceErr
 			}
 			docs = appendQueryDocs(docs, provenanceDocs)
 			addedProvenance := len(docs) - afterDocument
@@ -1391,7 +1425,7 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 			}
 			pages, err := listWikiPages(projectPath, action.Query, listLimit)
 			if err != nil {
-				return nil, nil, nil, "", "", err
+				return queryLoopResult{}, err
 			}
 			navigation = append(navigation, QueryNavigationObservation{
 				Action: action.Action,
@@ -1412,7 +1446,7 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 			}
 			linkDocs, skipped, err := followWikiPageLinks(projectPath, action.Path, linkLimit, 6000)
 			if err != nil {
-				return nil, nil, nil, "", "", err
+				return queryLoopResult{}, err
 			}
 			docs = appendQueryDocs(docs, linkDocs)
 			navigation = append(navigation, QueryNavigationObservation{
@@ -1451,12 +1485,12 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 			}
 			searchResults, err := SearchWikiCandidatesWithStore(ctx, projectPath, projectID, searchStore, embeddingProvider, searchPlan, searchLimit)
 			if err != nil {
-				return nil, nil, nil, "", "", err
+				return queryLoopResult{}, err
 			}
 			results = appendQueryResults(results, searchResults)
 			searchDocs, skipped, err := readSearchResultDocuments(projectPath, searchResults, minInt(searchLimit, 5), 6000)
 			if err != nil {
-				return nil, nil, nil, "", "", err
+				return queryLoopResult{}, err
 			}
 			docs = appendQueryDocs(docs, searchDocs)
 			if len(searchDocs) > 0 {
@@ -1468,7 +1502,7 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 				}
 				graphDocs, graphErr := SearchWikiGraphDocuments(projectPath, searchText, seedPaths, 3, 6000)
 				if graphErr != nil {
-					return nil, nil, nil, "", "", graphErr
+					return queryLoopResult{}, graphErr
 				}
 				docs = appendQueryDocs(docs, graphDocs)
 			}
@@ -1490,11 +1524,11 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 			}
 			graphDocs, err := searchCodeGraphDocuments(ctx, projectPath, projectID, graphStore, graphText, graphLimit)
 			if err != nil {
-				return nil, nil, nil, "", "", err
+				return queryLoopResult{}, err
 			}
 			wikiGraphDocs, err := SearchWikiGraphDocuments(projectPath, graphText, nil, graphLimit, 6000)
 			if err != nil {
-				return nil, nil, nil, "", "", err
+				return queryLoopResult{}, err
 			}
 			docs = appendQueryDocs(docs, graphDocs)
 			docs = appendQueryDocs(docs, wikiGraphDocs)
@@ -1505,30 +1539,25 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 			}
 			trace = append(trace, traceStep)
 			emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: step, Action: &action, Message: "图谱检索完成", Observation: traceStep.Observation})
+		case "assess", "assess_candidate":
+			enrichmentNote, enrichErr := enrichCandidate(step, action)
+			if enrichErr != nil {
+				return queryLoopResult{}, enrichErr
+			}
+			assessment := buildCandidateAssessment(plan, action, docs, trace, step)
+			assessments = upsertCandidateAssessment(assessments, assessment)
+			observation := formatCandidateAssessmentObservation(assessment) + enrichmentNote
+			trace = append(trace, core.QueryTraceStep{Step: step, Action: action, Observation: observation})
+			emitQueryProgress(progress, QueryProgressEvent{Type: "candidate_assessed", Step: step, Action: &action, Message: "候选证据核验完成", Observation: observation})
 		case "final", "save", "writeback":
 			action.Answer = scopeNegativeRequirementAnswer(plan, action)
-			enrichmentNote := ""
-			candidateKey := strings.ToLower(strings.TrimSpace(action.Candidate))
-			if plan.RequireAll && candidateKey != "" && !enrichedCandidates[candidateKey] {
-				enrichedCandidates[candidateKey] = true
-				candidateResults, candidateDocs, enrichErr := expandCandidateRequirementEvidence(ctx, projectPath, projectID, action.Candidate, plan, docs, searchStore, embeddingProvider)
-				if enrichErr != nil {
-					return nil, nil, nil, "", "", enrichErr
-				}
-				before := len(docs)
-				// Candidate-specific results must be visible in the next bounded
-				// action prompt instead of sitting behind the original wide-recall
-				// list. They are still recall only until their documents are read.
-				results = appendQueryResults(candidateResults, results)
-				docs = appendQueryDocs(docs, candidateDocs)
-				enrichmentNote = fmt.Sprintf("; candidate-specific searches covered every requirement and auto-read %d new document(s)", len(docs)-before)
-				// Candidate enrichment is a real corpus search and must be visible to
-				// the negative-claim guard and independent verifiers.
-				trace = append(trace, core.QueryTraceStep{
-					Step:        step,
-					Action:      core.QueryAction{Action: "search", Query: action.Candidate + " × all requirements", Rationale: "runtime candidate-specific requirement coverage"},
-					Observation: fmt.Sprintf("candidate-specific requirement search read %d new document(s)", len(docs)-before),
-				})
+			enrichmentNote, enrichErr := enrichCandidate(step, action)
+			if enrichErr != nil {
+				return queryLoopResult{}, enrichErr
+			}
+			if plan.RequireAll {
+				assessment := buildCandidateAssessment(plan, action, docs, trace, step)
+				assessments = upsertCandidateAssessment(assessments, assessment)
 			}
 			finalAnswer, suggestedTitle, accepted := acceptFinalQueryAction(step, q, plan, action, results, docs, &trace)
 			if enrichmentNote != "" && len(trace) > 0 {
@@ -1542,63 +1571,52 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 				if noEvidenceFinalRejections >= 2 {
 					results, docs, err = ensureEvidenceAfterActionFailure(ctx, projectPath, projectID, q, plan, results, docs, searchStore, embeddingProvider)
 					if err != nil {
-						return nil, nil, nil, "", "", err
+						return queryLoopResult{}, err
 					}
 					if !hasAnswerEvidence(docs) {
-						return results, docs, trace, degradedNoEvidenceAnswer(q), "", nil
+						return queryLoopResult{Results: results, Docs: docs, Trace: trace, Answer: degradedNoEvidenceAnswer(q), Assessments: assessments, Status: "degraded"}, nil
 					}
-					return results, docs, trace, "", "", nil
+					return queryLoopResult{Results: results, Docs: docs, Trace: trace, Assessments: assessments, Status: "incomplete"}, nil
 				}
 				continue
 			}
-			checks, verified, verifyErr := verifyProposedQueryAnswer(ctx, agent, q, plan, action, docs, trace, runtime.VerificationPasses)
-			if verifyErr != nil {
-				return nil, nil, nil, "", "", verifyErr
+			if pendingReviewPass > 0 {
+				kind := "coverage_self_review"
+				if pendingReviewPass == 2 {
+					kind = "adversarial_self_review"
+				}
+				verification = append(verification, core.QueryVerification{Pass: pendingReviewPass, Kind: kind, Accepted: true, Summary: "same-agent stop review completed with a structurally valid final answer"})
+				pendingReviewPass = 0
 			}
-			if verifications != nil {
-				*verifications = append(*verifications, checks...)
-			}
-			if !verified {
-				observation := "final rejected by independent verification"
-				if len(checks) > 0 && strings.TrimSpace(checks[len(checks)-1].Summary) != "" {
-					observation += ": " + checks[len(checks)-1].Summary
+			if len(verification) < reviewPasses {
+				pendingReviewPass = len(verification) + 1
+				kind := "coverage"
+				instruction := "recheck every requirement against the same candidate and cited read evidence"
+				if pendingReviewPass == 2 {
+					kind = "adversarial"
+					instruction = "actively seek subject mixups, counterexamples, unsupported negatives, and a better alternative candidate"
 				}
-				if len(checks) > 0 && len(checks[len(checks)-1].Unresolved) > 0 {
-					observation += "; unresolved=" + strings.Join(checks[len(checks)-1].Unresolved, ", ")
-				}
-				if len(checks) > 0 && len(checks[len(checks)-1].NextQueries) > 0 {
-					observation += "; next_queries=" + strings.Join(checks[len(checks)-1].NextQueries, " | ")
-				}
-				if len(checks) > 0 && len(checks[len(checks)-1].NextQueries) > 0 {
-					verificationResults, verificationDocs, expandErr := expandVerificationNextQueries(ctx, projectPath, projectID, checks[len(checks)-1].NextQueries, searchStore, embeddingProvider)
-					if expandErr != nil {
-						return nil, nil, nil, "", "", expandErr
-					}
-					before := len(docs)
-					results = appendQueryResults(verificationResults, results)
-					docs = appendQueryDocs(docs, verificationDocs)
-					observation += fmt.Sprintf("; auto-executed verifier queries and read %d new document(s)", len(docs)-before)
-				}
+				observation := fmt.Sprintf("stop review pass %d (%s) required: %s; use tools if needed, then submit final again", pendingReviewPass, kind, instruction)
 				trace = append(trace, core.QueryTraceStep{Step: step, Action: action, Observation: observation})
-				emitQueryProgress(progress, QueryProgressEvent{Type: "verification_rejected", Step: step, Action: &action, Message: "独立验证未通过，继续检索", Observation: observation})
+				emitQueryProgress(progress, QueryProgressEvent{Type: "verification_started", Step: step, Action: &action, Message: "同一代理执行停止前复核", Observation: observation})
 				continue
 			}
 			emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: step, Action: &action, Message: "最终答案已生成"})
-			return results, docs, trace, finalAnswer, suggestedTitle, nil
+			return queryLoopResult{Results: results, Docs: docs, Trace: trace, Answer: finalAnswer, SuggestedTitle: suggestedTitle, Assessments: assessments, FinalAction: action, Verification: verification, Status: "complete"}, nil
 		default:
-			return nil, nil, nil, "", "", fmt.Errorf("unknown query action %q", action.Action)
+			return queryLoopResult{}, fmt.Errorf("unknown query action %q", action.Action)
 		}
 	}
 	trace = append(trace, core.QueryTraceStep{
-		Step: runtime.MaxActionBudget + 1,
+		Step: hardBudget + 1,
 		Action: core.QueryAction{
 			Action:    "synthesize",
 			Rationale: "query action step limit reached",
 		},
 		Observation: "synthesizing with collected evidence",
 	})
-	emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: runtime.MaxActionBudget + 1, Message: "达到深度查询预算，停止继续检索", Observation: "requirements remain unresolved"})
-	return results, docs, trace, "", "", nil
+	emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: hardBudget + 1, Message: "达到深度查询预算，停止继续检索", Observation: "requirements remain unresolved"})
+	return queryLoopResult{Results: results, Docs: docs, Trace: trace, Assessments: assessments, Verification: verification, Status: "incomplete"}, nil
 }
 
 func expandVerificationNextQueries(ctx context.Context, projectPath, projectID string, queries []string, searchStore SearchEvidenceStore, embeddingProvider EmbeddingProvider) ([]core.QueryResult, []QueryReadDocument, error) {
@@ -1955,13 +1973,180 @@ func extractNumberedQueryRequirements(question string) []core.QueryRequirement {
 	return requirements
 }
 
-func unresolvedQueryRequirements(plan core.QueryPlan, trace []core.QueryTraceStep) string {
+func buildCandidateAssessment(plan core.QueryPlan, action core.QueryAction, docs []QueryReadDocument, trace []core.QueryTraceStep, step int) core.QueryCandidateAssessment {
+	assessment := core.QueryCandidateAssessment{
+		Candidate: strings.TrimSpace(action.Candidate),
+		Reason:    strings.TrimSpace(action.Rationale),
+		Step:      step,
+	}
+	read := make(map[string]bool, len(docs))
+	for _, doc := range docs {
+		if doc.Path != "" && !isAggregateWikiPath(doc.Path) {
+			read[normalizeQueryEvidencePath(doc.Path)] = true
+		}
+	}
+	provided := make(map[string]core.QueryEvidenceCheck, len(action.Checks))
+	for _, check := range action.Checks {
+		if id := strings.TrimSpace(check.RequirementID); id != "" {
+			provided[id] = check
+		}
+	}
+	for _, requirement := range plan.Requirements {
+		check, ok := provided[requirement.ID]
+		if !ok {
+			check = core.QueryEvidenceCheck{RequirementID: requirement.ID, Status: "unknown", Explanation: "candidate has not been checked against this requirement"}
+		}
+		check.RequirementID = requirement.ID
+		check.Status = strings.ToLower(strings.TrimSpace(check.Status))
+		if check.Status == "" {
+			check.Status = "unknown"
+		}
+		statusNeedsEvidence := check.Status == "supported" || check.Status == "contradicted" || check.Status == "not_found_in_corpus"
+		validEvidence := len(check.EvidencePaths) > 0
+		for _, path := range check.EvidencePaths {
+			if isAggregateWikiPath(path) || !read[normalizeQueryEvidencePath(path)] {
+				validEvidence = false
+				break
+			}
+		}
+		if statusNeedsEvidence && !validEvidence {
+			check.Status = "unknown"
+			check.Explanation = strings.TrimSpace(check.Explanation + "; cited evidence was not read or is navigation-only")
+		}
+		if check.Status == "not_found_in_corpus" && strings.EqualFold(requirement.Kind, "negative") && !queryTraceContainsCandidateSearch(trace, action.Candidate) {
+			check.Status = "unknown"
+			check.Explanation = strings.TrimSpace(check.Explanation + "; negative claim lacks a candidate-specific corpus search")
+		}
+		assessment.Checks = append(assessment.Checks, check)
+		accepted := check.Status == "supported" || (strings.EqualFold(requirement.Kind, "negative") && check.Status == "not_found_in_corpus")
+		if !accepted {
+			assessment.UnresolvedRequirementIDs = append(assessment.UnresolvedRequirementIDs, requirement.ID)
+		}
+		if check.Status == "contradicted" {
+			assessment.ContradictedRequirementIDs = append(assessment.ContradictedRequirementIDs, requirement.ID)
+		}
+	}
+	switch {
+	case assessment.Candidate == "":
+		assessment.Disposition = "rejected"
+	case len(assessment.ContradictedRequirementIDs) > 0:
+		assessment.Disposition = "rejected"
+	case len(assessment.UnresolvedRequirementIDs) > 0:
+		assessment.Disposition = "partial"
+	default:
+		assessment.Disposition = "accepted"
+	}
+	return assessment
+}
+
+func upsertCandidateAssessment(items []core.QueryCandidateAssessment, assessment core.QueryCandidateAssessment) []core.QueryCandidateAssessment {
+	key := strings.ToLower(strings.TrimSpace(assessment.Candidate))
+	if key == "" {
+		return items
+	}
+	for index := range items {
+		if strings.ToLower(strings.TrimSpace(items[index].Candidate)) == key {
+			items[index] = assessment
+			return items
+		}
+	}
+	return append(items, assessment)
+}
+
+func bestCandidateAssessment(items []core.QueryCandidateAssessment) *core.QueryCandidateAssessment {
+	if len(items) == 0 {
+		return nil
+	}
+	ordered := append([]core.QueryCandidateAssessment(nil), items...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		closed := func(item core.QueryCandidateAssessment) int {
+			return len(item.Checks) - len(item.UnresolvedRequirementIDs)
+		}
+		if closed(ordered[i]) != closed(ordered[j]) {
+			return closed(ordered[i]) > closed(ordered[j])
+		}
+		if len(ordered[i].ContradictedRequirementIDs) != len(ordered[j].ContradictedRequirementIDs) {
+			return len(ordered[i].ContradictedRequirementIDs) < len(ordered[j].ContradictedRequirementIDs)
+		}
+		if len(ordered[i].UnresolvedRequirementIDs) != len(ordered[j].UnresolvedRequirementIDs) {
+			return len(ordered[i].UnresolvedRequirementIDs) < len(ordered[j].UnresolvedRequirementIDs)
+		}
+		return ordered[i].Step > ordered[j].Step
+	})
+	best := ordered[0]
+	return &best
+}
+
+func formatCandidateAssessmentObservation(assessment core.QueryCandidateAssessment) string {
+	observation := fmt.Sprintf("candidate=%s disposition=%s", assessment.Candidate, assessment.Disposition)
+	if len(assessment.UnresolvedRequirementIDs) > 0 {
+		observation += " unresolved=" + strings.Join(assessment.UnresolvedRequirementIDs, ",")
+	}
+	if len(assessment.ContradictedRequirementIDs) > 0 {
+		observation += " contradicted=" + strings.Join(assessment.ContradictedRequirementIDs, ",")
+	}
+	return observation
+}
+
+func formatIncompleteCandidateAnswer(plan core.QueryPlan, assessment core.QueryCandidateAssessment) string {
+	var supported []string
+	for _, requirement := range plan.Requirements {
+		for _, check := range assessment.Checks {
+			if check.RequirementID != requirement.ID {
+				continue
+			}
+			if check.Status == "supported" || (requirement.Kind == "negative" && check.Status == "not_found_in_corpus") {
+				supported = append(supported, requirement.ID+". "+requirement.Text)
+			}
+			break
+		}
+	}
+	answer := "当前语料尚未找到满足全部条件的人物。已核验的最佳候选是“" + assessment.Candidate + "”，但仍不能作为完整答案。"
+	if len(supported) > 0 {
+		answer += "\n\n已满足：" + strings.Join(supported, "；") + "。"
+	}
+	if reason := unresolvedQueryRequirements(plan, assessment.Checks); reason != "" {
+		answer += "\n\n" + strings.TrimSpace(reason)
+	}
+	return answer
+}
+
+func unresolvedRequirementIDs(plan core.QueryPlan, checks []core.QueryEvidenceCheck) []string {
+	byID := make(map[string]core.QueryEvidenceCheck, len(checks))
+	for _, check := range checks {
+		byID[strings.TrimSpace(check.RequirementID)] = check
+	}
+	var ids []string
+	for _, requirement := range plan.Requirements {
+		check, ok := byID[requirement.ID]
+		if !ok {
+			ids = append(ids, requirement.ID)
+			continue
+		}
+		status := strings.ToLower(strings.TrimSpace(check.Status))
+		if status != "supported" && !(requirement.Kind == "negative" && status == "not_found_in_corpus") {
+			ids = append(ids, requirement.ID)
+		}
+	}
+	return ids
+}
+
+func unresolvedQueryRequirements(plan core.QueryPlan, checks []core.QueryEvidenceCheck) string {
 	if len(plan.Requirements) == 0 {
 		return ""
 	}
-	ids := make([]string, 0, len(plan.Requirements))
+	unresolved := map[string]bool{}
+	for _, id := range unresolvedRequirementIDs(plan, checks) {
+		unresolved[id] = true
+	}
+	ids := make([]string, 0, len(unresolved))
 	for _, requirement := range plan.Requirements {
-		ids = append(ids, requirement.ID+". "+requirement.Text)
+		if unresolved[requirement.ID] {
+			ids = append(ids, requirement.ID+". "+requirement.Text)
+		}
+	}
+	if len(ids) == 0 {
+		return ""
 	}
 	return " 未完成核验：" + strings.Join(ids, "；")
 }
@@ -2091,8 +2276,8 @@ func validateQueryRequirementChecks(plan core.QueryPlan, action core.QueryAction
 			unresolved = append(unresolved, requirement.ID+" has no evidence path")
 			continue
 		}
-		if requirement.Kind == "negative" && status == "not_found_in_corpus" && !queryTraceContainsSearch(trace) {
-			unresolved = append(unresolved, requirement.ID+" negative claim has no corpus search")
+		if requirement.Kind == "negative" && status == "not_found_in_corpus" && !queryTraceContainsCandidateSearch(trace, action.Candidate) {
+			unresolved = append(unresolved, requirement.ID+" negative claim has no candidate-specific corpus search")
 			continue
 		}
 		for _, path := range check.EvidencePaths {

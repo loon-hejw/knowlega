@@ -80,6 +80,17 @@ On success it writes `VERIFY_REPORT.md` inside the temporary wiki project with
 source, generated-page, link, lint, and review evidence. Missing YAML or real
 credentials is a hard failure; the script must not silently fall back to mock.
 
+For the real 100-chapter constraint-query acceptance, reuse a completed
+Xiyouji wiki and run:
+
+```bash
+bash scripts/verify-xiyouji-query-llm.sh config.yaml /private/tmp/kbcore-xiyouji-wiki
+```
+
+This check requires 唐太宗 as the canonical candidate, supported evidence for
+requirements 1–8, and a corpus-scoped `not_found_in_corpus` result for the
+ninth negative requirement.
+
 ## Manual Corpus Flow
 
 ```bash
@@ -100,4 +111,3 @@ env GOCACHE=/private/tmp/kbcore-gocache \
 Use the real provider for product acceptance. Use deterministic agents only
 when a test explicitly targets orchestration, parsing, validation, or storage
 plumbing.
-

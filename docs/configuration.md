@@ -111,12 +111,14 @@ binding unless the service is intentionally protected and exposed.
 
 ### `query`
 
-Controls the adaptive deep-query agent. `initial_action_budget` is the first
-tool window; unresolved structured requirements may extend it up to
-`max_action_budget`. `verification_passes` enables independent coverage and
-adversarial checks, `stagnation_rounds` stops loops that are no longer finding
-evidence, and `total_timeout` bounds the complete query rather than one LLM
-request. Defaults are 8, 32, 2, 2, and 20 minutes respectively.
+Controls the adaptive single-agent deep-query loop. `initial_action_budget` is
+the first tool window; unresolved structured requirements may extend it up to
+`max_action_budget`. `verification_passes` adds same-agent stop reviews: the
+answer, tool results, canonical candidate ledger, and runtime feedback stay in
+one context for coverage and adversarial re-checks. `stagnation_rounds` stops
+loops that are no longer finding evidence, and `total_timeout` bounds the
+complete query rather than one LLM request. Defaults are 8, 32, 2, 2, and 20
+minutes respectively.
 
 ### `research`
 

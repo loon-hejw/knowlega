@@ -69,6 +69,9 @@ func WriteQueryAnswer(opts QueryWritebackOptions) (QueryWritebackResult, error) 
 }
 
 func validateQueryWritebackEligibility(answer *core.QueryAnswer) error {
+	if answer.Status != "" && answer.Status != "complete" {
+		return fmt.Errorf("incomplete query answer is not eligible for writeback")
+	}
 	if !answer.Plan.CanWriteBack {
 		return fmt.Errorf("query answer is not eligible for writeback")
 	}

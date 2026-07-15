@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -322,7 +323,7 @@ Token validation calls the auth service.
 	}
 }
 
-func TestDeepQueryVerifierRejectsThenAcceptsCorrectedFinal(t *testing.T) {
+func TestDeepQueryUsesSameAgentStopReviews(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "kb")
 	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
 		t.Fatal(err)
@@ -338,27 +339,23 @@ OAuth uses signed tokens.
 		plan: core.QueryPlan{
 			Question:       "How does OAuth work?",
 			Intent:         "answer_from_persistent_wiki",
+			ReasoningMode:  "constraint_satisfaction",
+			Requirements:   []core.QueryRequirement{{ID: "1", Text: "uses signed tokens", Kind: "positive"}},
+			RequireAll:     true,
 			ReadFirst:      []string{"wiki/concepts/oauth.md"},
 			CandidateLimit: 5,
 			CanWriteBack:   true,
 		},
 		actions: []core.QueryAction{
-			{Action: "final", Answer: "OAuth uses tokens [wiki/concepts/oauth.md]."},
-			{Action: "final", Answer: "OAuth uses signed tokens [wiki/concepts/oauth.md]."},
-		},
-	}
-	agent := &verifyingActionAgent{
-		scriptedActionAgent: base,
-		results: []core.QueryVerification{
-			{Accepted: false, Summary: "signature evidence was omitted", Unresolved: []string{"token signature"}, NextQueries: []string{"OAuth signed token"}},
-			{Accepted: true, Summary: "coverage complete"},
-			{Accepted: true, Summary: "no counterexample found"},
+			{Action: "final", Candidate: "OAuth", Answer: "OAuth uses signed tokens [wiki/concepts/oauth.md].", Checks: []core.QueryEvidenceCheck{{RequirementID: "1", Status: "supported", EvidencePaths: []string{"wiki/concepts/oauth.md"}}}},
+			{Action: "final", Candidate: "OAuth", Answer: "OAuth uses signed tokens [wiki/concepts/oauth.md].", Checks: []core.QueryEvidenceCheck{{RequirementID: "1", Status: "supported", EvidencePaths: []string{"wiki/concepts/oauth.md"}}}},
+			{Action: "final", Candidate: "OAuth", Answer: "OAuth uses signed tokens [wiki/concepts/oauth.md].", Checks: []core.QueryEvidenceCheck{{RequirementID: "1", Status: "supported", EvidencePaths: []string{"wiki/concepts/oauth.md"}}}},
 		},
 	}
 	answer, err := QueryLLMWikiWithOptions(QueryOptions{
 		ProjectPath: root,
 		Question:    "How does OAuth work?",
-		Agent:       agent,
+		Agent:       base,
 		Runtime: QueryRuntimeOptions{
 			InitialActionBudget: 4,
 			MaxActionBudget:     8,
@@ -373,11 +370,11 @@ OAuth uses signed tokens.
 	if answer.Answer != "OAuth uses signed tokens [wiki/concepts/oauth.md]." {
 		t.Fatalf("answer=%q", answer.Answer)
 	}
-	if len(answer.Verification) != 3 || answer.Verification[0].Accepted || !answer.Verification[2].Accepted {
+	if len(answer.Verification) != 2 || !answer.Verification[0].Accepted || !answer.Verification[1].Accepted {
 		t.Fatalf("verification=%+v", answer.Verification)
 	}
-	if !answer.Plan.CanWriteBack {
-		t.Fatalf("fully verified reusable answer should remain writeback eligible: %+v", answer.Plan)
+	if answer.Plan.CanWriteBack {
+		t.Fatalf("one-off constraint answer should not become writeback eligible: %+v", answer.Plan)
 	}
 }
 
@@ -731,6 +728,106 @@ func TestQueryTraceContainsCandidateSearchSurvivesLongTrace(t *testing.T) {
 	}
 	if !queryTraceContainsCandidateSearch(trace, "唐太宗") {
 		t.Fatal("candidate-specific search was lost behind recent trace budget")
+	}
+}
+
+func TestUnresolvedQueryRequirementsUsesCanonicalChecks(t *testing.T) {
+	plan := core.QueryPlan{Requirements: []core.QueryRequirement{
+		{ID: "1", Text: "有结义的情节", Kind: "positive"},
+		{ID: "7", Text: "见过阎罗王", Kind: "positive"},
+		{ID: "9", Text: "不曾到过花果山", Kind: "negative"},
+	}}
+	checks := []core.QueryEvidenceCheck{
+		{RequirementID: "1", Status: "supported"},
+		{RequirementID: "7", Status: "not_found_in_corpus"},
+		{RequirementID: "9", Status: "not_found_in_corpus"},
+	}
+	reason := unresolvedQueryRequirements(plan, checks)
+	if !strings.Contains(reason, "7. 见过阎罗王") {
+		t.Fatalf("positive corpus absence must remain unresolved: %q", reason)
+	}
+	if strings.Contains(reason, "1. 有结义") || strings.Contains(reason, "9. 不曾到过") {
+		t.Fatalf("closed requirements leaked into unresolved reason: %q", reason)
+	}
+}
+
+func TestBuildCandidateAssessmentDistinguishesPositiveAndNegativeAbsence(t *testing.T) {
+	plan := core.QueryPlan{Requirements: []core.QueryRequirement{
+		{ID: "7", Text: "见过阎罗王", Kind: "positive"},
+		{ID: "9", Text: "不曾到过花果山", Kind: "negative"},
+	}}
+	docs := []QueryReadDocument{{Path: "wiki/entities/镇元子.md", Title: "镇元子", Kind: "wiki-page"}}
+	action := core.QueryAction{Candidate: "镇元子", Checks: []core.QueryEvidenceCheck{
+		{RequirementID: "7", Status: "not_found_in_corpus", EvidencePaths: []string{"wiki/entities/镇元子.md"}},
+		{RequirementID: "9", Status: "not_found_in_corpus", EvidencePaths: []string{"wiki/entities/镇元子.md"}},
+	}}
+	trace := []core.QueryTraceStep{{Action: core.QueryAction{Action: "search", Query: "镇元子 × all requirements"}}}
+	assessment := buildCandidateAssessment(plan, action, docs, trace, 2)
+	if assessment.Disposition != "partial" || !slices.Contains(assessment.UnresolvedRequirementIDs, "7") || slices.Contains(assessment.UnresolvedRequirementIDs, "9") {
+		t.Fatalf("assessment=%+v", assessment)
+	}
+}
+
+func TestConstraintLoopSwitchesFromPartialCandidateToCompleteCandidate(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(root, "wiki", "entities", "镇元子.md"), "---\ntype: entity\ntitle: 镇元子\n---\n# 镇元子\n镇元子与孙悟空结为兄弟。\n")
+	mustWrite(t, filepath.Join(root, "wiki", "entities", "唐太宗.md"), "---\ntype: entity\ntitle: 唐太宗\n---\n# 唐太宗\n唐太宗与玄奘结拜，并魂游地府见十代冥王。\n")
+	agent := &scriptedActionAgent{
+		plan: core.QueryPlan{
+			Intent: "answer_from_persistent_wiki", ReasoningMode: "constraint_satisfaction", RequireAll: true,
+			Requirements: []core.QueryRequirement{{ID: "1", Text: "有结义情节", Kind: "positive"}, {ID: "7", Text: "见过阎罗王", Kind: "positive"}},
+			ReadFirst:    []string{"wiki/entities/镇元子.md"}, CandidateLimit: 5,
+		},
+		actions: []core.QueryAction{
+			{Action: "assess_candidate", Candidate: "镇元子", Rationale: "缺少阎罗王证据", Checks: []core.QueryEvidenceCheck{{RequirementID: "1", Status: "supported", EvidencePaths: []string{"wiki/entities/镇元子.md"}}, {RequirementID: "7", Status: "unknown"}}},
+			{Action: "read", Path: "wiki/entities/唐太宗.md"},
+			{Action: "final", Candidate: "唐太宗", Answer: "答案是唐太宗 [wiki/entities/唐太宗.md]。", Checks: []core.QueryEvidenceCheck{{RequirementID: "1", Status: "supported", EvidencePaths: []string{"wiki/entities/唐太宗.md"}}, {RequirementID: "7", Status: "supported", EvidencePaths: []string{"wiki/entities/唐太宗.md"}}}},
+		},
+	}
+	answer, err := QueryLLMWikiWithOptions(QueryOptions{
+		ProjectPath: root, Question: "谁符合条件？", Agent: agent,
+		Runtime: QueryRuntimeOptions{InitialActionBudget: 3, MaxActionBudget: 3, VerificationPasses: -1, StagnationRounds: 1, TotalTimeout: time.Minute},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer.Status != "complete" || answer.Candidate != "唐太宗" || len(answer.EvidenceChecks) != 2 {
+		t.Fatalf("answer=%+v", answer)
+	}
+	if len(answer.Citations) != 1 || answer.Citations[0].Path != "wiki/entities/唐太宗.md" {
+		t.Fatalf("final citations must come only from the canonical ledger: %+v", answer.Citations)
+	}
+	if len(answer.CandidateAssessments) != 2 || answer.CandidateAssessments[0].Candidate != "镇元子" || answer.CandidateAssessments[0].Disposition != "partial" {
+		t.Fatalf("candidate assessments=%+v", answer.CandidateAssessments)
+	}
+}
+
+func TestConstraintLoopBudgetExhaustionReturnsBestCandidateExactGaps(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(root, "wiki", "entities", "镇元子.md"), "---\ntype: entity\ntitle: 镇元子\n---\n# 镇元子\n镇元子与孙悟空结为兄弟。\n")
+	agent := &scriptedActionAgent{
+		plan: core.QueryPlan{
+			Intent: "answer_from_persistent_wiki", ReasoningMode: "constraint_satisfaction", RequireAll: true,
+			Requirements: []core.QueryRequirement{{ID: "1", Text: "有结义情节", Kind: "positive"}, {ID: "7", Text: "见过阎罗王", Kind: "positive"}},
+			ReadFirst:    []string{"wiki/entities/镇元子.md"}, CandidateLimit: 5,
+		},
+		actions: []core.QueryAction{{Action: "assess_candidate", Candidate: "镇元子", Checks: []core.QueryEvidenceCheck{{RequirementID: "1", Status: "supported", EvidencePaths: []string{"wiki/entities/镇元子.md"}}, {RequirementID: "7", Status: "unknown"}}}},
+	}
+	answer, err := QueryLLMWikiWithOptions(QueryOptions{
+		ProjectPath: root, Question: "谁符合条件？", Agent: agent,
+		Runtime: QueryRuntimeOptions{InitialActionBudget: 1, MaxActionBudget: 1, VerificationPasses: -1, StagnationRounds: 1, TotalTimeout: time.Minute},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer.Status != "incomplete" || answer.Candidate != "镇元子" || !strings.Contains(answer.IncompleteReason, "7. 见过阎罗王") || strings.Contains(answer.IncompleteReason, "1. 有结义") {
+		t.Fatalf("answer=%+v", answer)
 	}
 }
 

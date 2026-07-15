@@ -300,6 +300,7 @@ Actions:
 - {"action":"follow_links","path":"wiki/...","limit":5,"rationale":"why linked wiki pages should be inspected"}
 - {"action":"search","query":"search terms","limit":5,"rationale":"why recall is needed"}
 - {"action":"graph","query":"symbol, file, relation, route, or concept","limit":5,"rationale":"why graph evidence is needed"}
+- {"action":"assess_candidate","candidate":"one candidate","evidence_checks":[{"requirement_id":"1","status":"supported|contradicted|unknown|not_found_in_corpus","evidence_paths":["wiki/..."],"explanation":"candidate-specific finding"}],"rationale":"record the current candidate ledger before switching or filling gaps"}
 - {"action":"final","candidate":"single checked candidate when applicable","evidence_checks":[{"requirement_id":"1","status":"supported|contradicted|unknown|not_found_in_corpus","evidence_paths":["wiki/..."],"explanation":"brief audit"}],"answer":"final cited answer","rationale":"why every requirement is closed"}
 - {"action":"writeback","title":"short synthesis page title","answer":"final cited answer","rationale":"why this synthesis should be saved"}
 
@@ -308,14 +309,14 @@ Rules:
 - list_pages is navigation only, not factual evidence for final answers.
 - follow_links reads linked wiki pages and can provide final-answer evidence.
 - Search is candidate recall only; use read after search before making factual claims.
-- Follow the plan's reasoning_mode. For constraint_satisfaction, build one candidate-by-requirement ledger, eliminate a candidate on any contradiction, and keep searching while any requirement is unknown.
-- For constraint_satisfaction, inspect the independently generated plan.hypotheses before broad recall. Read their suggested pages or search each candidate with the rarest requirements; do not ignore a later hypothesis merely because an early famous candidate partially matches.
-- When plan.hypotheses contain evidence_checks, they are an independent candidate audit over already-read evidence. Start with the highest-coverage candidate, preserve supported checks, and retrieve only its unknown/contradicted gaps before exploring lower-coverage candidates.
-- If the highest candidate's audit coverage equals the number of requirements and its cited documents appear in All read document paths, return final immediately using that same candidate and those checks unless a concrete read passage contradicts it.
+- Follow the plan's reasoning_mode. For constraint_satisfaction, you own one continuing candidate-by-requirement ledger across every tool action. Start from the rarest conjunction, not from the first or most famous clue.
+- Use assess_candidate when a candidate remains partial or is contradicted. The runtime will preserve the ledger and tell you its exact gaps. Then retrieve those gaps or switch to a different role/person; do not repeatedly submit an unchanged rejected candidate.
+- Treat prior candidate assessments as durable tool state, not as separate agents. Preserve supported checks when new evidence is read, but correct them when a cited passage disproves them.
 - Never combine facts about different subjects into one candidate. Evidence paths in evidence_checks must be documents actually read.
 - wiki/index.md, wiki/overview.md, wiki/log.md, and wiki/reviews.md are navigation/aggregate pages and are forbidden in evidence_checks. Cite concrete entity, concept, source-summary, raw-source, or graph evidence instead.
 - Copy evidence paths exactly from "All read document paths". A path appearing only in the plan, navigation observations, or search results is not read evidence.
 - A negative requirement may use not_found_in_corpus only after searching the supplied corpus scope; phrase it as absence in the current corpus, not universal proof.
+- not_found_in_corpus never satisfies a positive requirement. A candidate missing a positive requirement is incomplete and you must keep searching alternatives.
 - For an ambiguous "forced someone to do something" requirement, prefer a primary-source refusal/insistence/compliance sequence over broad causal claims such as starting a journey, blocking a route, or belonging to the coercer's family.
 - If a prior candidate from conversation fails requirements, discard it and generate independent alternatives. Do not answer with the closest partial match.
 - Use graph for code questions, impact/trace questions, symbol relationships, routes, tools, and graphify/GitNexus evidence.
@@ -329,6 +330,9 @@ Conversation context:
 %s
 
 Query plan:
+%s
+
+Canonical candidate assessments from prior tool actions:
 %s
 
 Step: %d
@@ -346,7 +350,7 @@ All read document paths (aggregate paths are navigation only):
 %s
 
 	Read documents:
-%s`, input.Question, input.ConversationContext, mustJSON(input.Plan), input.Step, mustJSON(input.Trace), results.String(), navigation.String(), allReadPaths, docs.String())
+%s`, input.Question, input.ConversationContext, mustJSON(input.Plan), mustJSON(input.CandidateAssessments), input.Step, mustJSON(input.Trace), results.String(), navigation.String(), allReadPaths, docs.String())
 	retryOpts := a.retryOptions()
 	return llmretry.DoValue[core.QueryAction](ctx, retryOpts, queryLLMRetryCallback(ctx), func(attempt int) (core.QueryAction, bool, error) {
 		content, retryable, err := a.chatOnce(ctx, system, user)

@@ -151,21 +151,26 @@ export function EvidenceAudit({
   answer: QueryAnswer;
   onOpenFile?: (path: string) => void;
 }) {
-  const finalChecks = [...(answer.trace ?? [])]
-    .reverse()
-    .find((step) => (step.action.evidence_checks?.length ?? 0) > 0)?.action.evidence_checks ?? [];
-  const checks = new Map(finalChecks.map((check) => [check.requirement_id, check]));
+  const checks = new Map((answer.evidence_checks ?? []).map((check) => [check.requirement_id, check]));
   const rows = (answer.plan.requirements ?? []).map((requirement) => ({
     ...requirement,
     check: checks.get(requirement.id),
   }));
-  const statusColor = (status?: string) => {
-    if (status === "supported" || status === "not_found_in_corpus") return "green";
+  const statusColor = (status: string | undefined, kind: string | undefined) => {
+    if (status === "supported" || (status === "not_found_in_corpus" && kind === "negative")) return "green";
     if (status === "contradicted") return "red";
     return "orange";
   };
+  const statusLabel = (status: string | undefined, kind: string | undefined) => {
+    if (!status) return "未核验";
+    if (status === "not_found_in_corpus") {
+      return kind === "negative" ? "当前语料未发现反例" : "当前语料未找到证据";
+    }
+    return status;
+  };
   return (
     <Space direction="vertical" className="page-stack" size="middle">
+      {answer.candidate && <Alert type={answer.status === "complete" ? "success" : "info"} showIcon message={`${answer.status === "complete" ? "最终候选" : "最佳候选"}：${answer.candidate}`} />}
       {answer.incomplete_reason && <Alert type="warning" showIcon message="证据尚未闭合" description={answer.incomplete_reason} />}
       <Table
         rowKey="id"
@@ -178,7 +183,7 @@ export function EvidenceAudit({
           {
             title: "状态",
             width: 160,
-            render: (_, row) => <Tag color={statusColor(row.check?.status)}>{row.check?.status ?? "未核验"}</Tag>,
+            render: (_, row) => <Tag color={statusColor(row.check?.status, row.kind)}>{statusLabel(row.check?.status, row.kind)}</Tag>,
           },
           { title: "说明", render: (_, row) => row.check?.explanation ?? "-" },
           {
@@ -193,6 +198,15 @@ export function EvidenceAudit({
           },
         ]}
       />
+      {(answer.candidate_assessments ?? []).filter((item) => item.candidate !== answer.candidate).map((item) => (
+        <Alert
+          key={item.candidate}
+          type={item.disposition === "rejected" ? "error" : "info"}
+          showIcon
+          message={`已核验候选：${item.candidate} · ${item.disposition}`}
+          description={item.reason || [...(item.unresolved_requirement_ids ?? []), ...(item.contradicted_requirement_ids ?? [])].join("、")}
+        />
+      ))}
       {(answer.verification ?? []).map((verification) => (
         <Alert
           key={`${verification.pass}-${verification.kind}`}

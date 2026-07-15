@@ -1239,6 +1239,12 @@ func runQuery(args []string) error {
 		return fmt.Errorf("query answer is not eligible for writeback; use --agent llm for LLM Wiki synthesis")
 	}
 	fmt.Printf("intent=%s\nmode=%s\nwriteback=%t\n", answer.Plan.Intent, answer.Plan.AnswerMode, answer.Plan.CanWriteBack)
+	if answer.Status != "" {
+		fmt.Printf("status=%s\n", answer.Status)
+	}
+	if answer.Candidate != "" {
+		fmt.Printf("candidate=%s\n", answer.Candidate)
+	}
 	if answer.Plan.ReasoningMode != "" {
 		fmt.Printf("reasoning_mode=%s\n", answer.Plan.ReasoningMode)
 	}
@@ -1283,6 +1289,12 @@ func runQuery(args []string) error {
 		fmt.Println("verification:")
 		for _, verification := range answer.Verification {
 			fmt.Printf("- pass=%d kind=%s accepted=%t summary=%s\n", verification.Pass, verification.Kind, verification.Accepted, verification.Summary)
+		}
+	}
+	if len(answer.EvidenceChecks) > 0 {
+		fmt.Println("evidence-checks:")
+		for _, check := range answer.EvidenceChecks {
+			fmt.Printf("- requirement=%s status=%s evidence=%s explanation=%s\n", check.RequirementID, check.Status, strings.Join(check.EvidencePaths, ","), check.Explanation)
 		}
 	}
 	if answer.IncompleteReason != "" {

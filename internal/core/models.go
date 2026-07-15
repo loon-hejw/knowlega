@@ -213,6 +213,16 @@ type QueryEvidenceCheck struct {
 	Explanation   string   `json:"explanation,omitempty"`
 }
 
+type QueryCandidateAssessment struct {
+	Candidate                  string               `json:"candidate"`
+	Disposition                string               `json:"disposition"`
+	Checks                     []QueryEvidenceCheck `json:"evidence_checks,omitempty"`
+	UnresolvedRequirementIDs   []string             `json:"unresolved_requirement_ids,omitempty"`
+	ContradictedRequirementIDs []string             `json:"contradicted_requirement_ids,omitempty"`
+	Reason                     string               `json:"reason,omitempty"`
+	Step                       int                  `json:"step,omitempty"`
+}
+
 type QueryVerification struct {
 	Pass           int      `json:"pass"`
 	Kind           string   `json:"kind"`
@@ -265,14 +275,19 @@ type QueryCitation struct {
 }
 
 type QueryAnswer struct {
-	Question                string              `json:"question"`
-	Plan                    QueryPlan           `json:"plan"`
-	Results                 []QueryResult       `json:"results"`
-	Answer                  string              `json:"answer"`
-	SuggestedWritebackTitle string              `json:"suggested_writeback_title,omitempty"`
-	Citations               []QueryCitation     `json:"citations"`
-	Trace                   []QueryTraceStep    `json:"trace,omitempty"`
-	Verification            []QueryVerification `json:"verification,omitempty"`
-	IncompleteReason        string              `json:"incomplete_reason,omitempty"`
-	Notes                   []string            `json:"notes"`
+	Question                 string                     `json:"question"`
+	Plan                     QueryPlan                  `json:"plan"`
+	Results                  []QueryResult              `json:"results"`
+	Answer                   string                     `json:"answer"`
+	Status                   string                     `json:"status,omitempty"`
+	Candidate                string                     `json:"candidate,omitempty"`
+	EvidenceChecks           []QueryEvidenceCheck       `json:"evidence_checks,omitempty"`
+	CandidateAssessments     []QueryCandidateAssessment `json:"candidate_assessments,omitempty"`
+	UnresolvedRequirementIDs []string                   `json:"unresolved_requirement_ids,omitempty"`
+	SuggestedWritebackTitle  string                     `json:"suggested_writeback_title,omitempty"`
+	Citations                []QueryCitation            `json:"citations"`
+	Trace                    []QueryTraceStep           `json:"trace,omitempty"`
+	Verification             []QueryVerification        `json:"verification,omitempty"`
+	IncompleteReason         string                     `json:"incomplete_reason,omitempty"`
+	Notes                    []string                   `json:"notes"`
 }
