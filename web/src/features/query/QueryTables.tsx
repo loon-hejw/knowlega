@@ -270,6 +270,12 @@ export function ResultsTable({
         ),
     },
     { title: "类型", dataIndex: "kind", width: 140 },
+    {
+      title: "条件覆盖",
+      dataIndex: "matched_requirement_ids",
+      width: 120,
+      render: (_, result) => result.matched_requirement_ids?.length ? result.matched_requirement_ids.join(", ") : "-",
+    },
     { title: "分数", dataIndex: "score", width: 100 },
     { title: "摘要", dataIndex: "snippet", ellipsis: true },
   ];

@@ -812,6 +812,36 @@ func TestExistingPagesForAnalysisExcludesCompilerManagedAndSourceSummaryPages(t 
 	}
 }
 
+func TestExistingPagesForSourceSelectsCanonicalPageByAliasBeforeAnalysis(t *testing.T) {
+	root := t.TempDir()
+	entityPath := filepath.Join(root, "wiki", "entities", "tang-taizong.md")
+	if err := os.MkdirAll(filepath.Dir(entityPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := `---
+type: entity
+title: 唐太宗
+aliases:
+  - 太宗
+  - 李世民
+sources:
+  - raw/sources/chapter-012.txt
+---
+# 唐太宗
+既有证据。
+`
+	if err := os.WriteFile(entityPath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	existing, dependencies := existingPagesForSource(root, "太宗亲迎玄奘，又向孙悟空等人问话。太宗设宴酬谢。")
+	if len(dependencies) != 1 || dependencies[0] != "wiki/entities/tang-taizong.md" {
+		t.Fatalf("dependencies=%+v", dependencies)
+	}
+	if !strings.Contains(existing, "---EXISTING PAGE: wiki/entities/tang-taizong.md") || !strings.Contains(existing, "既有证据") {
+		t.Fatalf("existing context missing canonical page:\n%s", existing)
+	}
+}
+
 func TestSanitizeGeneratedAliasCollisionsRemovesAliasButNotPage(t *testing.T) {
 	root := t.TempDir()
 	existing := filepath.Join(root, "wiki", "entities", "sun-wukong.md")

@@ -359,6 +359,71 @@ func TestUnifiedMissingEvidenceMustAttemptEvidenceTool(t *testing.T) {
 	}
 }
 
+func TestUnifiedConstraintQueryForcesIntersectionBeforeNavigationAction(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(root, "wiki", "entities", "唐太宗.md"), `---
+type: entity
+title: 唐太宗
+---
+# 唐太宗
+唐太宗与玄奘结拜，见过孙悟空，也亲见阎罗王。
+`)
+	canWriteBack := false
+	checks := []core.QueryEvidenceCheck{
+		{RequirementID: "1", Status: "supported", EvidencePaths: []string{"wiki/entities/唐太宗.md"}},
+		{RequirementID: "2", Status: "supported", EvidencePaths: []string{"wiki/entities/唐太宗.md"}},
+		{RequirementID: "7", Status: "supported", EvidencePaths: []string{"wiki/entities/唐太宗.md"}},
+	}
+	agent := &unifiedTurnTestAgent{decisions: []core.QueryTurnDecision{
+		{
+			Intent:           QueryIntentWikiQuery,
+			ResolvedQuestion: "谁满足全部条件？",
+			ReasoningMode:    "constraint_satisfaction",
+			Requirements: []core.QueryRequirement{
+				{ID: "1", Text: "有结义情节", Kind: "positive", SearchQueries: []string{"结拜"}},
+				{ID: "2", Text: "见过孙悟空", Kind: "positive", SearchQueries: []string{"见过孙悟空"}},
+				{ID: "7", Text: "见过阎罗王", Kind: "positive", SearchQueries: []string{"亲见阎罗王"}},
+			},
+			RequireAll:   true,
+			CanWriteBack: &canWriteBack,
+			Action:       core.QueryAction{Action: "list_pages", Query: "entity", Limit: 5},
+		},
+		{Action: core.QueryAction{
+			Action: "final", Candidate: "唐太宗",
+			Answer: "唐太宗满足全部条件 [wiki/entities/唐太宗.md]。", Checks: checks,
+		}},
+	}}
+	var events []QueryProgressEvent
+	answer, err := QueryLLMWikiWithOptions(QueryOptions{
+		ProjectPath: root,
+		Question:    "1.有结义情节\n2.见过孙悟空\n7.见过阎罗王",
+		Agent:       agent,
+		Progress:    func(event QueryProgressEvent) { events = append(events, event) },
+		Runtime: QueryRuntimeOptions{
+			InitialActionBudget: 4, MaxActionBudget: 8, VerificationPasses: -1,
+			StagnationRounds: 2, TotalTimeout: time.Minute,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer.Status != "complete" || answer.Candidate != "唐太宗" {
+		t.Fatalf("answer=%+v", answer)
+	}
+	if len(answer.Plan.Requirements[0].SearchQueries) < 2 || answer.Plan.Requirements[0].SearchQueries[1] != "结拜" {
+		t.Fatalf("numbered requirement lost model search expansion: %+v", answer.Plan.Requirements)
+	}
+	if len(agent.inputs) < 2 || len(agent.inputs[1].Results) == 0 || agent.inputs[1].Results[0].Path != "wiki/entities/唐太宗.md" {
+		t.Fatalf("constraint recall was not available after list_pages: %+v", agent.inputs)
+	}
+	if !queryProgressContains(events, "constraint_recall_started") || !queryProgressContains(events, "constraint_recall_done") {
+		t.Fatalf("constraint recall progress missing: %+v", events)
+	}
+}
+
 func TestLLMWikiQueryCanReadPlannedPagesWithoutSearch(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "kb")
 	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
@@ -642,8 +707,86 @@ func TestRecallRequirementCandidatesPromotesEntitiesBySourceOverlap(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) == 0 || results[0].Path != "wiki/entities/唐太宗.md" || !strings.Contains(results[0].Snippet, "source-overlap") {
+	if len(results) == 0 || results[0].Path != "wiki/entities/唐太宗.md" || !strings.Contains(results[0].Snippet, "requirement-coverage=1") {
 		t.Fatalf("source provenance did not promote the entity candidate: %+v", results)
+	}
+}
+
+func TestRecallRequirementCandidatesUsesReverseSourceLinksAcrossChapters(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "wiki", "entities", "唐太宗.md"), `---
+title: 唐太宗
+type: entity
+aliases:
+  - 太宗
+sources:
+  - raw/sources/chapter-010.txt
+  - raw/sources/chapter-012.txt
+---
+# 唐太宗
+`)
+	mustWrite(t, filepath.Join(root, "wiki", "entities", "牛魔王.md"), `---
+title: 牛魔王
+type: entity
+---
+# 牛魔王
+`)
+	mustWrite(t, filepath.Join(root, "wiki", "sources", "chapter-010.md"), `---
+title: 第十回
+type: source-summary
+sources:
+  - raw/sources/chapter-010.txt
+---
+# 第十回
+[[唐太宗]]亲见阎罗王。
+`)
+	mustWrite(t, filepath.Join(root, "wiki", "sources", "chapter-012.md"), `---
+title: 第十二回
+type: source-summary
+sources:
+  - raw/sources/chapter-012.txt
+---
+# 第十二回
+[[唐太宗]]与玄奘结拜。
+`)
+	mustWrite(t, filepath.Join(root, "wiki", "sources", "chapter-100.md"), `---
+title: 第一百回
+type: source-summary
+sources:
+  - raw/sources/chapter-100.txt
+---
+# 第一百回
+[[唐太宗]]亲迎并见到[[孙悟空]]。
+`)
+	mustWrite(t, filepath.Join(root, "wiki", "sources", "chapter-040.md"), `---
+title: 第四十回
+type: source-summary
+sources:
+  - raw/sources/chapter-040.txt
+---
+# 第四十回
+[[牛魔王]]曾与人结拜，并提及花果山。
+`)
+	plan := core.QueryPlan{CandidateLimit: 10, Requirements: []core.QueryRequirement{
+		{ID: "1", Text: "有结义情节", Kind: "positive", SearchQueries: []string{"结拜"}},
+		{ID: "2", Text: "见过孙悟空", Kind: "positive", SearchQueries: []string{"亲迎 孙悟空"}},
+		{ID: "7", Text: "见过阎罗王", Kind: "positive", SearchQueries: []string{"阎罗王"}},
+		{ID: "9", Text: "不曾到过花果山", Kind: "negative", SearchQueries: []string{"花果山"}},
+	}}
+	results, err := recallRequirementCandidates(context.Background(), root, "", plan, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 || results[0].Path != "wiki/entities/唐太宗.md" {
+		t.Fatalf("reverse source attribution did not rank 唐太宗 first: %+v", results)
+	}
+	if !slices.Equal(results[0].MatchedRequirementIDs, []string{"1", "2", "7"}) {
+		t.Fatalf("matched requirements=%+v", results[0].MatchedRequirementIDs)
+	}
+	for _, id := range results[0].MatchedRequirementIDs {
+		if id == "9" {
+			t.Fatalf("negative requirement promoted a candidate: %+v", results[0])
+		}
 	}
 }
 
@@ -1759,7 +1902,7 @@ Token validation calls the auth service.
 	if err != nil {
 		t.Fatal(err)
 	}
-	if searchStore.called != 1 || searchStore.projectID != "project-1" || searchStore.limit != 3 {
+	if searchStore.called != 1 || searchStore.projectID != "project-1" || searchStore.limit < 3 {
 		t.Fatalf("search store call mismatch: %+v", searchStore)
 	}
 	if len(answer.Results) != 1 || answer.Results[0].Path != "wiki/concepts/pg-oauth.md" {
@@ -1829,14 +1972,44 @@ Token validation uses semantic vector evidence.
 	if embeddingProvider.called != 1 || !strings.Contains(embeddingProvider.text, "token validation auth service") {
 		t.Fatalf("embedding provider not used correctly: %+v", embeddingProvider)
 	}
-	if searchStore.vectorCalled != 1 || searchStore.ftsCalled != 0 {
-		t.Fatalf("expected vector search only, got vector=%d fts=%d", searchStore.vectorCalled, searchStore.ftsCalled)
+	if searchStore.vectorCalled != 1 || searchStore.ftsCalled != 1 {
+		t.Fatalf("expected vector and FTS fusion, got vector=%d fts=%d", searchStore.vectorCalled, searchStore.ftsCalled)
 	}
 	if len(answer.Results) != 1 || answer.Results[0].Path != "wiki/concepts/vector-oauth.md" {
 		t.Fatalf("expected vector result, got %+v", answer.Results)
 	}
 	if !queryDocsContain(agent.inputs[1].Docs, "wiki/concepts/vector-oauth.md") {
 		t.Fatalf("final action should see auto-read vector candidate page: %+v", agent.inputs[1].Docs)
+	}
+}
+
+func TestSearchFusionFallsBackWhenVectorBackendFails(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(root, "wiki", "concepts", "fts-oauth.md"), `---
+type: concept
+title: FTS OAuth
+---
+# FTS OAuth
+Token validation uses AuthService.
+`)
+	store := &fakeVectorSearchEvidenceStore{
+		vectorErr: errors.New("vector unavailable"),
+		ftsResults: []core.QueryResult{{
+			Path: "wiki/concepts/fts-oauth.md", Title: "FTS OAuth", Kind: "concept", Score: 500,
+		}},
+	}
+	results, err := SearchWikiCandidatesWithStore(context.Background(), root, "project-1", store, &fakeEmbeddingProvider{embedding: []float32{0.1}}, core.QueryPlan{
+		Question: "token validation",
+		Searches: []core.QuerySearch{{Text: "token validation", Weight: 6}},
+	}, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if store.vectorCalled != 1 || store.ftsCalled != 1 || len(results) == 0 || results[0].Path != "wiki/concepts/fts-oauth.md" {
+		t.Fatalf("fusion did not degrade to FTS/file search: store=%+v results=%+v", store, results)
 	}
 }
 
@@ -2353,6 +2526,8 @@ type fakeQueryLogStore struct {
 type fakeVectorSearchEvidenceStore struct {
 	vectorResults []core.QueryResult
 	ftsResults    []core.QueryResult
+	vectorErr     error
+	ftsErr        error
 	vectorCalled  int
 	ftsCalled     int
 	embedding     []float32
@@ -2360,13 +2535,13 @@ type fakeVectorSearchEvidenceStore struct {
 
 func (s *fakeVectorSearchEvidenceStore) SearchWikiEvidence(_ context.Context, _ string, _ core.QueryPlan, _ int) ([]core.QueryResult, error) {
 	s.ftsCalled++
-	return s.ftsResults, nil
+	return s.ftsResults, s.ftsErr
 }
 
 func (s *fakeVectorSearchEvidenceStore) SearchWikiEvidenceVector(_ context.Context, _ string, _ core.QueryPlan, embedding []float32, _ int) ([]core.QueryResult, error) {
 	s.vectorCalled++
 	s.embedding = embedding
-	return s.vectorResults, nil
+	return s.vectorResults, s.vectorErr
 }
 
 type fakeEmbeddingProvider struct {

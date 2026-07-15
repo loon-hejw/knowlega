@@ -289,7 +289,7 @@ func (a OpenAICompatibleQueryAgent) NextQueryTurnContext(ctx context.Context, in
 	}
 	var results strings.Builder
 	for i, result := range input.Results {
-		fmt.Fprintf(&results, "%d. path=%s kind=%s title=%s score=%d snippet=%s\n", i+1, result.Path, result.Kind, result.Title, result.Score, result.Snippet)
+		fmt.Fprintf(&results, "%d. path=%s kind=%s title=%s score=%d matched_requirements=%s snippet=%s\n", i+1, result.Path, result.Kind, result.Title, result.Score, strings.Join(result.MatchedRequirementIDs, ","), result.Snippet)
 	}
 	var navigation strings.Builder
 	for i, obs := range input.Navigation {
@@ -304,7 +304,7 @@ func (a OpenAICompatibleQueryAgent) NextQueryTurnContext(ctx context.Context, in
 	system := `You are the single continuing agent operating a persistent LLM Wiki through tools.
 On the first turn, classify the request, decompose material conditions, and choose the first real action in the same response. On later turns, continue from the persisted plan, evidence, candidate ledger, and tool trace.
 Return only JSON in this envelope:
-{"intent":"wiki_query|direct_chat|system_faq|general_assistant|missing_evidence|unsupported","resolved_question":"standalone question","reasoning_mode":"constraint_satisfaction|fact_lookup|comparison|causal|temporal|negative|synthesis|code_graph","requirements":[{"id":"1","text":"...","kind":"positive|negative"}],"require_all_requirements":true,"can_write_back":false,"action":{...one action below...}}
+{"intent":"wiki_query|direct_chat|system_faq|general_assistant|missing_evidence|unsupported","resolved_question":"standalone question","reasoning_mode":"constraint_satisfaction|fact_lookup|comparison|causal|temporal|negative|synthesis|code_graph","requirements":[{"id":"1","text":"...","kind":"positive|negative","search_queries":["original wording","1-2 corpus-neutral aliases or event paraphrases"]}],"require_all_requirements":true,"can_write_back":false,"action":{...one action below...}}
 Intent and planning fields are required on step 1 and may be omitted later. action is always required.
 
 Actions:
@@ -319,6 +319,7 @@ Actions:
 
 Rules:
 - Every request receives at least this one model turn. direct_chat, system_faq, general_assistant, and unsupported should return final immediately without pretending to use wiki evidence.
+- On step 1, give every positive requirement 1-3 compact search_queries including its original wording and useful corpus-neutral aliases/event paraphrases. Do not inject a guessed candidate name. Negative requirements are elimination checks and need no discovery query.
 - wiki_query must use read/search/follow_links/graph evidence before final. missing_evidence must perform a search or read attempt before concluding that evidence is absent.
 - Prefer wiki navigation before broad search: read wiki/index.md, list_pages, follow_links from relevant pages, then search only when navigation is insufficient.
 - list_pages is navigation only, not factual evidence for final answers.

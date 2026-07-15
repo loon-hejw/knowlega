@@ -285,6 +285,8 @@ func analyzeLLMWikiSource(opts ValidateOptions) (*analyzedSource, *ValidateResul
 		Overview:         readOptional(filepath.Join(opts.ProjectPath, "wiki", "overview.md")),
 		GenerationPolicy: policy,
 	}
+	var workDependencies []string
+	input.ExistingPages, workDependencies = existingPagesForSource(opts.ProjectPath, input.SourceText)
 	emit("analysis", sourceTitle, ValidateResult{}, nil)
 	analysis, err := opts.Provider.Analyze(input)
 	if err != nil {
@@ -294,7 +296,7 @@ func analyzeLLMWikiSource(opts ValidateOptions) (*analyzedSource, *ValidateResul
 	}
 	return &analyzedSource{
 		opts: opts, started: started, title: sourceTitle, rawRel: sourceRel,
-		hash: hash, manifestKey: manifestKey, extracted: extracted, archive: archive, input: input, analysis: analysis,
+		hash: hash, manifestKey: manifestKey, extracted: extracted, archive: archive, input: input, analysis: analysis, dependencies: workDependencies,
 	}, nil, nil
 }
 
@@ -387,7 +389,9 @@ func generateAndPersistLLMWikiSource(work *analyzedSource) (ValidateResult, erro
 	work.input.Schema = readOptional(filepath.Join(opts.ProjectPath, "schema.md"))
 	work.input.Index = readOptional(filepath.Join(opts.ProjectPath, "wiki", "index.md"))
 	work.input.Overview = readOptional(filepath.Join(opts.ProjectPath, "wiki", "overview.md"))
-	work.input.ExistingPages, work.dependencies = existingPagesForAnalysis(opts.ProjectPath, work.analysis)
+	_, analysisDependencies := existingPagesForAnalysis(opts.ProjectPath, work.analysis)
+	work.dependencies = stableUniqueStrings(append(work.dependencies, analysisDependencies...))
+	work.input.ExistingPages, work.dependencies = existingPageContext(opts.ProjectPath, work.dependencies, 12, 48000)
 	summaryUpdatePaths := sourceSummaryUpdatePaths(opts.ProjectPath, work.manifestKey)
 	opts.AllowedUpdatePaths = sortedUniqueStrings(append(append([]string(nil), work.dependencies...), summaryUpdatePaths...))
 	work.input.GenerationPolicy = effectiveGenerationPolicy(work.input.GenerationPolicy, len(work.dependencies))
@@ -1639,8 +1643,65 @@ func existingPagesForAnalysis(projectPath, analysis string) (string, []string) {
 		ordered = append(ordered, path)
 	}
 	sort.Strings(ordered)
-	if len(ordered) > 12 {
-		ordered = ordered[:12]
+	return existingPageContext(projectPath, ordered, 12, 48000)
+}
+
+func existingPagesForSource(projectPath, sourceText string) (string, []string) {
+	type candidate struct {
+		path  string
+		score int
+	}
+	lowerSource := strings.ToLower(sourceText)
+	var candidates []candidate
+	pages, err := wiki.ScanWikiPages(wiki.ScanOptions{ProjectPath: projectPath})
+	if err != nil {
+		return "", nil
+	}
+	for _, page := range pages {
+		if !eligibleExistingMergePath(page.Path) || page.Type == "source-summary" {
+			continue
+		}
+		content := readOptional(filepath.Join(projectPath, filepath.FromSlash(page.Path)))
+		identities := append([]string{page.Title}, aliasesFromGeneratedMarkdown(content)...)
+		best := 0
+		for identityIndex, identity := range identities {
+			identity = strings.ToLower(strings.TrimSpace(identity))
+			if len([]rune(identity)) < 2 {
+				continue
+			}
+			count := strings.Count(lowerSource, identity)
+			if count == 0 {
+				continue
+			}
+			score := count*100 + len([]rune(identity))*10
+			if identityIndex == 0 {
+				score += 50
+			}
+			if score > best {
+				best = score
+			}
+		}
+		if best > 0 {
+			candidates = append(candidates, candidate{path: page.Path, score: best})
+		}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].score != candidates[j].score {
+			return candidates[i].score > candidates[j].score
+		}
+		return candidates[i].path < candidates[j].path
+	})
+	paths := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		paths = append(paths, candidate.path)
+	}
+	return existingPageContext(projectPath, paths, 12, 48000)
+}
+
+func existingPageContext(projectPath string, ordered []string, maxPages, maxBytes int) (string, []string) {
+	ordered = stableUniqueStrings(ordered)
+	if maxPages > 0 && len(ordered) > maxPages {
+		ordered = ordered[:maxPages]
 	}
 	var b strings.Builder
 	var included []string
@@ -1651,11 +1712,33 @@ func existingPagesForAnalysis(projectPath, analysis string) (string, []string) {
 		}
 		fmt.Fprintf(&b, "\n---EXISTING PAGE: %s\n%s\n", path, content)
 		included = append(included, path)
-		if b.Len() >= 48000 {
+		if maxBytes > 0 && b.Len() >= maxBytes {
 			break
 		}
 	}
 	return b.String(), included
+}
+
+func stableUniqueStrings(values []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = filepath.ToSlash(strings.TrimSpace(value))
+		if value == "" || seen[value] {
+			continue
+		}
+		seen[value] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func aliasesFromGeneratedMarkdown(content string) []string {
+	frontmatter, err := parseGeneratedFrontmatter(content)
+	if err != nil {
+		return nil
+	}
+	return frontmatterStrings(frontmatter["aliases"])
 }
 
 func eligibleExistingMergePath(path string) bool {

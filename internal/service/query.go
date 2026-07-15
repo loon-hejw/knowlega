@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -636,21 +637,17 @@ func queryLLMWikiUnified(ctx context.Context, opts QueryOptions, actionAgent Que
 
 func recallRequirementCandidates(ctx context.Context, projectPath, projectID string, plan core.QueryPlan, store SearchEvidenceStore, embeddingProvider EmbeddingProvider) ([]core.QueryResult, error) {
 	type aggregate struct {
-		result core.QueryResult
-		hits   int
-		score  int
+		result       core.QueryResult
+		requirements map[string]bool
+		score        int
 	}
-	byPath := map[string]*aggregate{}
-	var pinned []core.QueryResult
-	pinnedSeen := map[string]bool{}
-	pinnedSources := map[int]map[string]bool{}
-	queries := make([]core.QuerySearch, 0, len(plan.Requirements)+len(plan.Searches))
-	for _, requirement := range plan.Requirements {
-		queries = append(queries, core.QuerySearch{Text: requirement.Text, Weight: 10, Rationale: "independent requirement recall " + requirement.ID})
+	attribution, err := buildQueryEntityAttributionIndex(projectPath)
+	if err != nil {
+		return nil, err
 	}
-	// Planner searches carry semantic/lexical expansions such as aliases and
-	// event paraphrases. They are still recall hints, never answer evidence.
-	queries = append(queries, plan.Searches...)
+	byCandidate := map[string]*aggregate{}
+	var evidenceResults []core.QueryResult
+	evidencePositions := map[string]int{}
 	perQueryLimit := plan.CandidateLimit
 	if perQueryLimit < 20 {
 		perQueryLimit = 20
@@ -658,66 +655,65 @@ func recallRequirementCandidates(ctx context.Context, projectPath, projectID str
 	if perQueryLimit > 30 {
 		perQueryLimit = 30
 	}
-	for queryIndex, query := range queries {
-		if strings.TrimSpace(query.Text) == "" {
+	for _, requirement := range plan.Requirements {
+		if strings.EqualFold(requirement.Kind, "negative") {
 			continue
 		}
-		searchPlan := core.QueryPlan{
-			Question:       query.Text,
-			Searches:       []core.QuerySearch{query},
-			CandidateLimit: perQueryLimit,
-		}
-		items, err := SearchWikiCandidatesWithStore(ctx, projectPath, projectID, store, embeddingProvider, searchPlan, perQueryLimit)
-		if err != nil {
-			return nil, err
-		}
-		seenForRequirement := map[string]bool{}
-		pinnedForQuery := 0
-		for _, item := range items {
-			// Navigation and operational pages repeat vocabulary from the whole
-			// corpus. Counting those repetitions as requirement intersections
-			// makes index/overview/log/reviews look like candidate entities.
-			if isAggregateWikiPath(item.Path) {
-				continue
+		queries := append([]string{requirement.Text}, requirement.SearchQueries...)
+		queries = uniqueQueryStrings(queries, 3)
+		seenCandidatesForRequirement := map[string]bool{}
+		evidenceAddedForRequirement := 0
+		for _, queryText := range queries {
+			searchPlan := core.QueryPlan{
+				Question: queryText,
+				Searches: []core.QuerySearch{{
+					Text: queryText, Weight: 10,
+					Rationale: "independent requirement recall " + requirement.ID,
+				}},
+				CandidateLimit: perQueryLimit,
 			}
-			pinnedThisResult := queryIndex < len(plan.Requirements) && pinnedForQuery < 5
-			if pinnedThisResult {
-				pinnedForQuery++
-				if !pinnedSeen[item.Path] {
-					pinnedItem := item
-					pinnedItem.Snippet = "[pinned for requirement " + plan.Requirements[queryIndex].ID + "] " + pinnedItem.Snippet
-					pinned = append(pinned, pinnedItem)
-					pinnedSeen[item.Path] = true
+			items, searchErr := SearchWikiCandidatesWithStore(ctx, projectPath, projectID, store, embeddingProvider, searchPlan, perQueryLimit)
+			if searchErr != nil {
+				return nil, searchErr
+			}
+			for rank, item := range items {
+				if isAggregateWikiPath(item.Path) {
+					continue
 				}
-			}
-			if pinnedThisResult {
-				for _, source := range queryResultSourcePaths(projectPath, item) {
-					if pinnedSources[queryIndex] == nil {
-						pinnedSources[queryIndex] = map[string]bool{}
+				item.MatchedRequirementIDs = appendUniqueQueryStrings(item.MatchedRequirementIDs, requirement.ID)
+				path := normalizeQueryEvidencePath(item.Path)
+				if existingIndex, exists := evidencePositions[path]; exists {
+					evidenceResults[existingIndex].MatchedRequirementIDs = appendUniqueQueryStrings(evidenceResults[existingIndex].MatchedRequirementIDs, requirement.ID)
+				} else if evidenceAddedForRequirement < 4 {
+					evidenceResults = append(evidenceResults, item)
+					evidencePositions[path] = len(evidenceResults) - 1
+					evidenceAddedForRequirement++
+				}
+				for _, candidate := range attribution.candidatesForResult(item) {
+					entry := byCandidate[candidate.Path]
+					if entry == nil {
+						entry = &aggregate{result: candidate, requirements: map[string]bool{}}
+						byCandidate[candidate.Path] = entry
 					}
-					pinnedSources[queryIndex][source] = true
+					entry.requirements[requirement.ID] = true
+					if !seenCandidatesForRequirement[candidate.Path] {
+						entry.score += 10_000 / (rank + 1)
+						seenCandidatesForRequirement[candidate.Path] = true
+					}
 				}
-			}
-			entry := byPath[item.Path]
-			if entry == nil {
-				entry = &aggregate{result: item}
-				byPath[item.Path] = entry
-			}
-			entry.score += item.Score
-			if !seenForRequirement[item.Path] {
-				entry.hits++
-				seenForRequirement[item.Path] = true
 			}
 		}
 	}
-	items := make([]aggregate, 0, len(byPath))
-	for _, entry := range byPath {
-		entry.result.Score = entry.hits*10000 + entry.score
+	items := make([]aggregate, 0, len(byCandidate))
+	for _, entry := range byCandidate {
+		entry.result.MatchedRequirementIDs = sortedMapKeys(entry.requirements)
+		entry.result.Score = len(entry.requirements)*100_000 + entry.score
+		entry.result.Snippet = fmt.Sprintf("[requirement-coverage=%d] %s", len(entry.requirements), entry.result.Snippet)
 		items = append(items, *entry)
 	}
 	sort.SliceStable(items, func(i, j int) bool {
-		if items[i].hits != items[j].hits {
-			return items[i].hits > items[j].hits
+		if len(items[i].requirements) != len(items[j].requirements) {
+			return len(items[i].requirements) > len(items[j].requirements)
 		}
 		if items[i].score != items[j].score {
 			return items[i].score > items[j].score
@@ -729,143 +725,150 @@ func recallRequirementCandidates(ctx context.Context, projectPath, projectID str
 		limit = 64
 	}
 	out := make([]core.QueryResult, 0, limit)
-	promoted, err := sourceOverlapEntityCandidates(projectPath, pinnedSources, 24)
-	if err != nil {
-		return nil, err
-	}
-	for _, item := range promoted {
-		if len(out) >= limit {
-			break
-		}
-		out = append(out, item)
-	}
-	for _, item := range pinned {
-		if len(out) >= limit {
-			break
-		}
-		duplicate := false
-		for _, existing := range out {
-			if existing.Path == item.Path {
-				duplicate = true
-				break
-			}
-		}
-		if duplicate {
-			continue
-		}
-		out = append(out, item)
-	}
 	seenOut := map[string]bool{}
-	for _, item := range out {
-		seenOut[item.Path] = true
-	}
 	for _, item := range items {
 		if len(out) >= limit {
 			break
 		}
-		if seenOut[item.result.Path] {
-			continue
-		}
 		out = append(out, item.result)
 		seenOut[item.result.Path] = true
 	}
-	for index := range out {
-		if entry := byPath[out[index].Path]; entry != nil {
-			out[index].Snippet = fmt.Sprintf("[cross-query-hits=%d] %s", entry.hits, out[index].Snippet)
-			out[index].Score = entry.hits*10000 + entry.score
+	for _, item := range evidenceResults {
+		if len(out) >= limit {
+			break
+		}
+		if !seenOut[item.Path] {
+			out = append(out, item)
+			seenOut[item.Path] = true
 		}
 	}
 	return out, nil
 }
 
-func queryResultSourcePaths(projectPath string, result core.QueryResult) []string {
-	path := filepath.ToSlash(strings.TrimSpace(result.Path))
-	if strings.HasPrefix(path, "raw/sources/") {
-		return []string{normalizeQueryEvidencePath(path)}
+func sortedMapKeys(values map[string]bool) []string {
+	out := make([]string, 0, len(values))
+	for value := range values {
+		out = append(out, value)
 	}
-	if !strings.HasPrefix(path, "wiki/") {
-		return nil
-	}
-	content, err := readProjectText(projectPath, path)
-	if err != nil || strings.TrimSpace(content) == "" {
-		return nil
-	}
-	page := wiki.ParseWikiPage("query", path, content)
-	out := make([]string, 0, len(page.Sources))
-	for _, source := range page.Sources {
-		if strings.HasPrefix(normalizeQueryEvidencePath(source), "raw/sources/") {
-			out = append(out, normalizeQueryEvidencePath(source))
-		}
-	}
+	sort.Strings(out)
 	return out
 }
 
-func sourceOverlapEntityCandidates(projectPath string, sourcesByRequirement map[int]map[string]bool, limit int) ([]core.QueryResult, error) {
-	if len(sourcesByRequirement) == 0 || limit <= 0 {
-		return nil, nil
+type queryEntityAttributionIndex struct {
+	entitiesByPath     map[string]core.QueryResult
+	entitiesByIdentity map[string]string
+	entitiesByEvidence map[string]map[string]bool
+}
+
+func buildQueryEntityAttributionIndex(projectPath string) (queryEntityAttributionIndex, error) {
+	index := queryEntityAttributionIndex{
+		entitiesByPath:     map[string]core.QueryResult{},
+		entitiesByIdentity: map[string]string{},
+		entitiesByEvidence: map[string]map[string]bool{},
 	}
-	root := filepath.Join(projectPath, "wiki", "entities")
-	if _, err := os.Stat(root); os.IsNotExist(err) {
-		return nil, nil
-	}
-	type candidate struct {
-		result core.QueryResult
-		hits   int
-	}
-	var candidates []candidate
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil || entry.IsDir() || strings.ToLower(filepath.Ext(path)) != ".md" {
-			return walkErr
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(projectPath, path)
-		if err != nil {
-			return err
-		}
-		page := wiki.ParseWikiPage("query", filepath.ToSlash(rel), string(data))
-		hits := 0
-		for _, requirementSources := range sourcesByRequirement {
-			matched := false
-			for _, source := range page.Sources {
-				if requirementSources[normalizeQueryEvidencePath(source)] {
-					matched = true
-					break
+	entityRoot := filepath.Join(projectPath, "wiki", "entities")
+	if _, err := os.Stat(entityRoot); err == nil {
+		err = filepath.WalkDir(entityRoot, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil || entry.IsDir() || strings.ToLower(filepath.Ext(path)) != ".md" {
+				return walkErr
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(projectPath, path)
+			if err != nil {
+				return err
+			}
+			rel = normalizeQueryEvidencePath(filepath.ToSlash(rel))
+			page := wiki.ParseWikiPage("query", rel, string(data))
+			result := core.QueryResult{Path: rel, Title: page.Title, Kind: "entity", Snippet: runeWindow(page.Body, 0, 500)}
+			index.entitiesByPath[rel] = result
+			identities := append([]string{page.Title, strings.TrimSuffix(filepath.Base(rel), filepath.Ext(rel))}, aliasesFromMarkdown(string(data))...)
+			for _, identity := range identities {
+				if key := canonicalWikiLinkID(identity); key != "" {
+					index.entitiesByIdentity[key] = rel
 				}
 			}
-			if matched {
-				hits++
+			for _, source := range page.Sources {
+				index.addEvidenceEntity(source, rel)
 			}
-		}
-		if hits == 0 {
 			return nil
+		})
+		if err != nil {
+			return queryEntityAttributionIndex{}, err
 		}
-		candidates = append(candidates, candidate{result: core.QueryResult{
-			Path: filepath.ToSlash(rel), Title: page.Title, Kind: "wiki",
-			Score:   hits * 20000,
-			Snippet: fmt.Sprintf("[source-overlap requirement-hits=%d] %s", hits, runeWindow(page.Body, 0, 500)),
-		}, hits: hits})
-		return nil
-	})
-	if err != nil {
-		return nil, err
 	}
-	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].hits != candidates[j].hits {
-			return candidates[i].hits > candidates[j].hits
+	sourceRoot := filepath.Join(projectPath, "wiki", "sources")
+	if _, err := os.Stat(sourceRoot); err == nil {
+		err = filepath.WalkDir(sourceRoot, func(path string, entry os.DirEntry, walkErr error) error {
+			if walkErr != nil || entry.IsDir() || strings.ToLower(filepath.Ext(path)) != ".md" {
+				return walkErr
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			rel, err := filepath.Rel(projectPath, path)
+			if err != nil {
+				return err
+			}
+			rel = normalizeQueryEvidencePath(filepath.ToSlash(rel))
+			page := wiki.ParseWikiPage("query", rel, string(data))
+			var entityPaths []string
+			for _, link := range extractWikiMarkdownLinks(string(data)) {
+				target := strings.Split(link, "|")[0]
+				if entityPath := index.entitiesByIdentity[canonicalWikiLinkID(target)]; entityPath != "" {
+					entityPaths = appendUniqueQueryStrings(entityPaths, entityPath)
+				}
+			}
+			for _, entityPath := range entityPaths {
+				index.addEvidenceEntity(rel, entityPath)
+				for _, source := range page.Sources {
+					index.addEvidenceEntity(source, entityPath)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return queryEntityAttributionIndex{}, err
 		}
-		return candidates[i].result.Path < candidates[j].result.Path
-	})
-	if len(candidates) > limit {
-		candidates = candidates[:limit]
 	}
-	out := make([]core.QueryResult, 0, len(candidates))
-	for _, item := range candidates {
-		out = append(out, item.result)
+	return index, nil
+}
+
+func (index queryEntityAttributionIndex) addEvidenceEntity(evidencePath, entityPath string) {
+	evidencePath = normalizeQueryEvidencePath(evidencePath)
+	entityPath = normalizeQueryEvidencePath(entityPath)
+	if evidencePath == "" || entityPath == "" {
+		return
 	}
-	return out, nil
+	if index.entitiesByEvidence[evidencePath] == nil {
+		index.entitiesByEvidence[evidencePath] = map[string]bool{}
+	}
+	index.entitiesByEvidence[evidencePath][entityPath] = true
+}
+
+func (index queryEntityAttributionIndex) candidatesForResult(result core.QueryResult) []core.QueryResult {
+	path := normalizeQueryEvidencePath(result.Path)
+	paths := map[string]bool{}
+	if _, ok := index.entitiesByPath[path]; ok {
+		paths[path] = true
+	}
+	for entityPath := range index.entitiesByEvidence[path] {
+		paths[entityPath] = true
+	}
+	if entityPath := index.entitiesByIdentity[canonicalWikiLinkID(result.Title)]; entityPath != "" {
+		paths[entityPath] = true
+	}
+	ordered := sortedMapKeys(paths)
+	out := make([]core.QueryResult, 0, len(ordered))
+	for _, entityPath := range ordered {
+		if candidate, ok := index.entitiesByPath[entityPath]; ok {
+			out = append(out, candidate)
+		}
+	}
+	return out
 }
 
 func insertQueryLogIfConfigured(ctx context.Context, store QueryLogStore, projectID, q, mode string, resultCount int) error {
@@ -1064,31 +1067,125 @@ func QueryWiki(projectPath, q string, limit int) ([]core.QueryResult, error) {
 }
 
 func SearchWikiCandidatesWithStore(ctx context.Context, projectPath, projectID string, store SearchEvidenceStore, embeddingProvider EmbeddingProvider, plan core.QueryPlan, limit int) ([]core.QueryResult, error) {
+	if limit <= 0 {
+		limit = plan.CandidateLimit
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	backendLimit := limit * 3
+	if backendLimit < 20 {
+		backendLimit = 20
+	}
+	if backendLimit > 60 {
+		backendLimit = 60
+	}
+	var rankedLists [][]core.QueryResult
+	var backendErrors []error
+	successfulBackends := 0
 	if store != nil && strings.TrimSpace(projectID) != "" {
 		if vectorStore, ok := store.(VectorSearchEvidenceStore); ok && embeddingProvider != nil {
 			embedding, err := embeddingProvider.EmbedText(ctx, queryTextForEmbedding(plan))
 			if err != nil {
-				return nil, err
-			}
-			if len(embedding) > 0 {
-				results, err := vectorStore.SearchWikiEvidenceVector(ctx, projectID, plan, embedding, limit)
-				if err != nil {
-					return nil, err
-				}
-				if len(results) > 0 {
-					return results, nil
+				backendErrors = append(backendErrors, fmt.Errorf("vector embedding: %w", err))
+			} else if len(embedding) > 0 {
+				results, searchErr := vectorStore.SearchWikiEvidenceVector(ctx, projectID, plan, embedding, backendLimit)
+				if searchErr != nil {
+					backendErrors = append(backendErrors, fmt.Errorf("vector search: %w", searchErr))
+				} else {
+					successfulBackends++
+					rankedLists = append(rankedLists, results)
 				}
 			}
 		}
-		results, err := store.SearchWikiEvidence(ctx, projectID, plan, limit)
+		results, err := store.SearchWikiEvidence(ctx, projectID, plan, backendLimit)
 		if err != nil {
-			return nil, err
-		}
-		if len(results) > 0 {
-			return results, nil
+			backendErrors = append(backendErrors, fmt.Errorf("postgres search: %w", err))
+		} else {
+			successfulBackends++
+			rankedLists = append(rankedLists, results)
 		}
 	}
-	return SearchWikiCandidates(projectPath, plan, limit)
+	fileResults, err := SearchWikiCandidates(projectPath, plan, backendLimit)
+	if err != nil {
+		backendErrors = append(backendErrors, fmt.Errorf("file search: %w", err))
+	} else {
+		successfulBackends++
+		rankedLists = append(rankedLists, fileResults)
+	}
+	if successfulBackends == 0 {
+		return nil, errors.Join(backendErrors...)
+	}
+	return fuseQueryResultRankings(rankedLists, limit), nil
+}
+
+func fuseQueryResultRankings(lists [][]core.QueryResult, limit int) []core.QueryResult {
+	type fusedResult struct {
+		result core.QueryResult
+		score  int
+	}
+	byPath := map[string]*fusedResult{}
+	for _, list := range lists {
+		seen := map[string]bool{}
+		for index, result := range list {
+			path := normalizeQueryEvidencePath(result.Path)
+			if path == "" || seen[path] {
+				continue
+			}
+			seen[path] = true
+			entry := byPath[path]
+			if entry == nil {
+				copy := result
+				copy.Path = path
+				entry = &fusedResult{result: copy}
+				byPath[path] = entry
+			} else {
+				if entry.result.Title == "" {
+					entry.result.Title = result.Title
+				}
+				if entry.result.Snippet == "" {
+					entry.result.Snippet = result.Snippet
+				}
+				if entry.result.Kind == "" {
+					entry.result.Kind = result.Kind
+				}
+			}
+			entry.score += 1_000_000 / (60 + index + 1)
+			entry.result.MatchedRequirementIDs = appendUniqueQueryStrings(entry.result.MatchedRequirementIDs, result.MatchedRequirementIDs...)
+		}
+	}
+	items := make([]core.QueryResult, 0, len(byPath))
+	for _, entry := range byPath {
+		entry.result.Score = entry.score
+		if isAggregateWikiPath(entry.result.Path) {
+			entry.result.Score /= 4
+		}
+		items = append(items, entry.result)
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].Score != items[j].Score {
+			return items[i].Score > items[j].Score
+		}
+		return items[i].Path < items[j].Path
+	})
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return items
+}
+
+func appendUniqueQueryStrings(base []string, values ...string) []string {
+	seen := make(map[string]bool, len(base)+len(values))
+	for _, value := range base {
+		seen[value] = true
+	}
+	for _, value := range values {
+		if value = strings.TrimSpace(value); value != "" && !seen[value] {
+			base = append(base, value)
+			seen[value] = true
+		}
+	}
+	return base
 }
 
 func queryTextForEmbedding(plan core.QueryPlan) string {
@@ -1567,6 +1664,34 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 				Message:     "首轮决策已生成，开始执行工具",
 				Observation: fmt.Sprintf("intent=%s mode=%s requirements=%d action=%s", plan.Intent, plan.ReasoningMode, len(plan.Requirements), decision.Action.Action),
 			})
+			if plan.RequireAll && len(plan.Requirements) > 0 {
+				emitQueryProgress(progress, QueryProgressEvent{Type: "constraint_recall_started", Step: step, Message: "正在按条件交集召回候选"})
+				constraintResults, recallErr := recallRequirementCandidates(ctx, projectPath, projectID, plan, searchStore, embeddingProvider)
+				if recallErr != nil {
+					return queryLoopResult{}, recallErr
+				}
+				results = appendQueryResults(constraintResults, results)
+				candidateReads, evidenceReads := splitConstraintRecallResults(constraintResults, 5, 12)
+				candidateDocs, _, readErr := readSearchResultDocuments(projectPath, candidateReads, len(candidateReads), 6000)
+				if readErr != nil {
+					return queryLoopResult{}, readErr
+				}
+				evidenceDocs, _, readErr := readSearchResultDocuments(projectPath, evidenceReads, len(evidenceReads), 9000)
+				if readErr != nil {
+					return queryLoopResult{}, readErr
+				}
+				docs = appendQueryDocs(docs, candidateDocs)
+				docs = appendQueryDocs(docs, evidenceDocs)
+				observation := formatConstraintRecallObservation(plan, constraintResults, len(candidateDocs), len(evidenceDocs))
+				trace = append(trace, core.QueryTraceStep{
+					Step: step,
+					Action: core.QueryAction{
+						Action: "search", Query: "all positive requirements", Rationale: "runtime-enforced constraint intersection",
+					},
+					Observation: observation,
+				})
+				emitQueryProgress(progress, QueryProgressEvent{Type: "constraint_recall_done", Step: step, Message: "条件交集候选召回完成", Observation: observation})
+			}
 		}
 		action := decision.Action
 		action.Action = strings.ToLower(strings.TrimSpace(action.Action))
@@ -2116,6 +2241,17 @@ func enrichQueryPlan(question string, plan core.QueryPlan) core.QueryPlan {
 	}
 	extracted := extractNumberedQueryRequirements(question)
 	if len(extracted) >= 3 {
+		planned := map[string]core.QueryRequirement{}
+		for _, requirement := range plan.Requirements {
+			planned[strings.TrimSpace(requirement.ID)] = requirement
+		}
+		for index := range extracted {
+			if prior, ok := planned[extracted[index].ID]; ok {
+				extracted[index].SearchQueries = uniqueQueryStrings(append([]string{extracted[index].Text}, prior.SearchQueries...), 3)
+			} else {
+				extracted[index].SearchQueries = []string{extracted[index].Text}
+			}
+		}
 		plan.Requirements = extracted
 		plan.ReasoningMode = "constraint_satisfaction"
 	} else if len(plan.Requirements) == 0 {
@@ -2445,8 +2581,29 @@ func normalizeQueryRequirements(requirements []core.QueryRequirement) []core.Que
 		requirement.ID = id
 		requirement.Text = strings.TrimSpace(requirement.Text)
 		requirement.Kind = kind
+		queries := []string{requirement.Text}
+		queries = append(queries, requirement.SearchQueries...)
+		requirement.SearchQueries = uniqueQueryStrings(queries, 3)
 		out = append(out, requirement)
 		seen[id] = true
+	}
+	return out
+}
+
+func uniqueQueryStrings(values []string, limit int) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		key := strings.ToLower(value)
+		if value == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, value)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
 	}
 	return out
 }
@@ -3420,18 +3577,82 @@ func scoreGraphText(text string, terms []searchTerm) int {
 }
 
 func appendQueryResults(base, extra []core.QueryResult) []core.QueryResult {
-	seen := make(map[string]bool, len(base)+len(extra))
-	for _, result := range base {
-		seen[result.Path] = true
+	positions := make(map[string]int, len(base)+len(extra))
+	for index, result := range base {
+		positions[normalizeQueryEvidencePath(result.Path)] = index
 	}
 	for _, result := range extra {
-		if seen[result.Path] {
+		key := normalizeQueryEvidencePath(result.Path)
+		if index, exists := positions[key]; exists {
+			base[index].MatchedRequirementIDs = appendUniqueQueryStrings(base[index].MatchedRequirementIDs, result.MatchedRequirementIDs...)
+			if result.Score > base[index].Score {
+				base[index].Score = result.Score
+			}
 			continue
 		}
 		base = append(base, result)
-		seen[result.Path] = true
+		positions[key] = len(base) - 1
 	}
 	return base
+}
+
+func splitConstraintRecallResults(results []core.QueryResult, candidateLimit, evidenceLimit int) ([]core.QueryResult, []core.QueryResult) {
+	var candidates []core.QueryResult
+	var evidencePool []core.QueryResult
+	for _, result := range results {
+		if strings.HasPrefix(normalizeQueryEvidencePath(result.Path), "wiki/entities/") {
+			if len(candidates) < candidateLimit {
+				candidates = append(candidates, result)
+			}
+			continue
+		}
+		evidencePool = append(evidencePool, result)
+	}
+	var evidence []core.QueryResult
+	selectedPaths := map[string]bool{}
+	coveredRequirements := map[string]bool{}
+	for _, result := range evidencePool {
+		addsCoverage := false
+		for _, id := range result.MatchedRequirementIDs {
+			if !coveredRequirements[id] {
+				addsCoverage = true
+				break
+			}
+		}
+		if !addsCoverage || len(evidence) >= evidenceLimit {
+			continue
+		}
+		evidence = append(evidence, result)
+		selectedPaths[result.Path] = true
+		for _, id := range result.MatchedRequirementIDs {
+			coveredRequirements[id] = true
+		}
+	}
+	for _, result := range evidencePool {
+		if len(evidence) >= evidenceLimit {
+			break
+		}
+		if !selectedPaths[result.Path] {
+			evidence = append(evidence, result)
+			selectedPaths[result.Path] = true
+		}
+	}
+	return candidates, evidence
+}
+
+func formatConstraintRecallObservation(plan core.QueryPlan, results []core.QueryResult, candidateReads, evidenceReads int) string {
+	positive := 0
+	for _, requirement := range plan.Requirements {
+		if !strings.EqualFold(requirement.Kind, "negative") {
+			positive++
+		}
+	}
+	candidates, _ := splitConstraintRecallResults(results, len(results), 0)
+	top := "none"
+	if len(candidates) > 0 {
+		top = fmt.Sprintf("%s coverage=%d/%d", candidates[0].Title, len(candidates[0].MatchedRequirementIDs), positive)
+	}
+	return fmt.Sprintf("positive_requirements=%d candidates=%d top=%s auto_read_candidates=%d auto_read_evidence=%d", positive, len(candidates), top, candidateReads, evidenceReads)
 }
 
 func formatSearchObservation(results []core.QueryResult) string {

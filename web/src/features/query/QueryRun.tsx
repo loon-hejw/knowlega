@@ -469,6 +469,8 @@ export function eventTypeLabel(type: string): string {
     context_started: "上下文",
     context_ready: "上下文就绪",
     strategy_ready: "策略",
+    constraint_recall_started: "条件召回",
+    constraint_recall_done: "候选交集",
     routing_started: "意图",
     routing_done: "路由",
     planning_started: "规划",

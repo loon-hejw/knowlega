@@ -445,6 +445,7 @@ export interface QueryRequirement {
   id: string;
   text: string;
   kind?: string;
+  search_queries?: string[];
 }
 
 export interface QueryHypothesis {
@@ -530,6 +531,7 @@ export interface QueryResult {
   snippet: string;
   score: number;
   kind: string;
+  matched_requirement_ids?: string[];
 }
 
 export interface QueryAnswer {

@@ -178,11 +178,12 @@ type ReviewOption struct {
 }
 
 type QueryResult struct {
-	Path    string
-	Title   string
-	Snippet string
-	Score   int
-	Kind    string
+	Path                  string   `json:"path"`
+	Title                 string   `json:"title"`
+	Snippet               string   `json:"snippet"`
+	Score                 int      `json:"score"`
+	Kind                  string   `json:"kind"`
+	MatchedRequirementIDs []string `json:"matched_requirement_ids,omitempty"`
 }
 
 type QuerySearch struct {
@@ -192,9 +193,10 @@ type QuerySearch struct {
 }
 
 type QueryRequirement struct {
-	ID   string `json:"id"`
-	Text string `json:"text"`
-	Kind string `json:"kind,omitempty"`
+	ID            string   `json:"id"`
+	Text          string   `json:"text"`
+	Kind          string   `json:"kind,omitempty"`
+	SearchQueries []string `json:"search_queries,omitempty"`
 }
 
 type QueryHypothesis struct {

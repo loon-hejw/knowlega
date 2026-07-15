@@ -346,7 +346,7 @@ func TestDecodeQueryTurnDecisionEnvelope(t *testing.T) {
   "intent":"wiki_query",
   "resolved_question":"谁满足全部条件？",
   "reasoning_mode":"constraint_satisfaction",
-  "requirements":[{"id":"1","text":"见过孙悟空","kind":"positive"}],
+  "requirements":[{"id":"1","text":"见过孙悟空","kind":"positive","search_queries":["见过孙悟空","与孙悟空相见"]}],
   "require_all_requirements":true,
   "can_write_back":false,
   "action":{"action":"search","query":"见过孙悟空","limit":10}
@@ -356,6 +356,9 @@ func TestDecodeQueryTurnDecisionEnvelope(t *testing.T) {
 	}
 	if decision.Intent != QueryIntentWikiQuery || decision.Action.Action != "search" || len(decision.Requirements) != 1 || !decision.RequireAll {
 		t.Fatalf("decision=%+v", decision)
+	}
+	if len(decision.Requirements[0].SearchQueries) != 2 {
+		t.Fatalf("search queries=%+v", decision.Requirements[0].SearchQueries)
 	}
 	if decision.CanWriteBack == nil || *decision.CanWriteBack != canWriteBack {
 		t.Fatalf("can_write_back=%v", decision.CanWriteBack)

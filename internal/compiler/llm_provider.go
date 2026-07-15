@@ -72,6 +72,8 @@ Return a concise markdown analysis with:
 - an explicit Wiki Plan using exactly: - LABEL | wiki/path.md | durability=recurring|central|link-target | evidence=...
 - LABEL must be SOURCE SUMMARY, UPDATE EXISTING, CREATE NEW, or REVIEW ONLY; durability and evidence are required for CREATE NEW
 - never plan more CREATE NEW targets than the hard remaining new-page budget`
+	system += `
+- Existing pages were selected deterministically from known titles and aliases mentioned by the source. For each supplied existing page, use UPDATE EXISTING when the source materially adds evidence, or REVIEW ONLY with a reason when it should remain unchanged. Never silently omit a materially changed canonical page.`
 	user := fmt.Sprintf(`Source title: %s
 Source path: %s
 
