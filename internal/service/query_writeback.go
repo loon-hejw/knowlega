@@ -26,6 +26,11 @@ func WriteQueryAnswer(opts QueryWritebackOptions) (QueryWritebackResult, error) 
 	if strings.TrimSpace(opts.ProjectPath) == "" {
 		return QueryWritebackResult{}, fmt.Errorf("project path is required")
 	}
+	release, err := acquireServiceProjectLock(opts.ProjectPath)
+	if err != nil {
+		return QueryWritebackResult{}, err
+	}
+	defer release()
 	if opts.Answer == nil {
 		return QueryWritebackResult{}, fmt.Errorf("query answer is required")
 	}
@@ -43,6 +48,9 @@ func WriteQueryAnswer(opts QueryWritebackOptions) (QueryWritebackResult, error) 
 	rel := filepath.ToSlash(filepath.Join("wiki", "syntheses", slug+".md"))
 	content := renderQuerySynthesisPage(title, opts.Answer)
 	if err := wiki.WriteVersionedPage(opts.ProjectPath, rel, []byte(content), "query-writeback: "+opts.Answer.Question); err != nil {
+		return QueryWritebackResult{}, err
+	}
+	if err := registerPageOwnership(opts.ProjectPath, rel, "query"); err != nil {
 		return QueryWritebackResult{}, err
 	}
 	if err := appendIndex(opts.ProjectPath, "Syntheses", title, rel); err != nil {
@@ -66,6 +74,9 @@ func validateQueryWritebackEligibility(answer *core.QueryAnswer) error {
 	}
 	if strings.HasPrefix(answer.Plan.Intent, "offline_") || strings.HasPrefix(answer.Plan.AnswerMode, "offline_") {
 		return fmt.Errorf("offline query answers are not eligible for writeback")
+	}
+	if answer.Plan.RequireVerification && !queryVerificationsAccepted(answer.Verification, answer.Plan.VerificationPasses) {
+		return fmt.Errorf("query writeback requires completed independent verification")
 	}
 	for _, citation := range answer.Citations {
 		if citation.Path == "" || isAggregateWikiPath(citation.Path) {
@@ -96,6 +107,7 @@ func renderQuerySynthesisPage(title string, answer *core.QueryAnswer) string {
 	}
 	planJSON, _ := json.MarshalIndent(answer.Plan, "", "  ")
 	traceJSON, _ := json.MarshalIndent(answer.Trace, "", "  ")
+	verificationJSON, _ := json.MarshalIndent(answer.Verification, "", "  ")
 	body := fmt.Sprintf(`# %s
 
 ## Question
@@ -120,6 +132,13 @@ func renderQuerySynthesisPage(title string, answer *core.QueryAnswer) string {
 
 %s
 `, fenced(string(traceJSON)))
+	}
+	if len(answer.Verification) > 0 {
+		body += fmt.Sprintf(`
+## Independent Verification
+
+%s
+`, fenced(string(verificationJSON)))
 	}
 	return wiki.RenderPage(wiki.Page{
 		Title:       title,

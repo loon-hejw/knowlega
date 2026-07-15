@@ -37,7 +37,23 @@ Defines the active workspace and optional service bootstrap.
 | `bootstrap.reuse_existing` | Resume from existing Markdown and manifest state. |
 | `bootstrap.retry_initial_delay` | First transient-failure retry delay. |
 | `bootstrap.retry_max_delay` | Retry backoff ceiling. |
-| `bootstrap.concurrency` | Configured bootstrap concurrency. Compilation remains bounded by write safety. |
+| `bootstrap.concurrency` | Maximum number of complete source-file tasks. A completed task is replaced immediately; this is not a stage batch size. |
+| `bootstrap.max_task_attempts` | Per-source convergence guard; defaults to `4`. Exhaustion is a permanent bootstrap failure until the source or generation contract changes. |
+| `bootstrap.max_conflict_attempts` | Separate optimistic-commit conflict allowance; defaults to `8` and does not consume ordinary failure attempts. |
+| `bootstrap.max_impact_attempts` | Separate semantic impact re-integration allowance; defaults to `2`, so impact churn cannot consume the ordinary generation/conflict retry budget. |
+| `bootstrap.max_files_per_task` | Maximum generated/updated wiki pages per source task; defaults to `12` to prevent page fragmentation. |
+| `bootstrap.max_new_pages_per_source` | Lifetime maximum of new non-summary pages per source and generation contract; defaults to `3`. Existing canonical page updates do not count, and impact re-integration is update-only. |
+
+`purpose.md` is part of the generation contract. The default is domain-neutral
+and requires source-language output, evidence fidelity, reuse-first page
+selection, and durable provenance. Empty files and the legacy initialization
+placeholder are rejected before a real LLM request. Changing `purpose.md`,
+`schema.md`, the pipeline version, or either page budget invalidates unchanged
+manifest entries so the corpus is re-integrated under one consistent contract.
+Source files larger than 64 MiB are rejected before in-memory extraction, and
+multipart source uploads are limited to 128 MiB in total. Both HTTP and direct
+service uploads enforce the aggregate limit while source archive bytes are
+streamed to disk.
 
 ### `llm`
 
@@ -50,7 +66,10 @@ review.
 - `user_agent`: optional gateway identity; defaults to
   `knowledge-core/0.1`.
 - `anthropic_version`: defaults to `2023-06-01`.
-- `timeout`, `retries`, `retry_base_delay`, `retry_max_delay`: request policy.
+- `timeout`: per-request HTTP deadline.
+- `concurrency`: provider request ceiling. `0` inherits `project.bootstrap.concurrency`; set it lower when the upstream model has less stable parallel capacity than the file-task scheduler.
+- `operation_timeout`: total deadline for one logical LLM call including retries; when omitted, it inherits `timeout`.
+- `retries`, `retry_base_delay`, `retry_max_delay`: retry policy within that total deadline.
 - `max_input_chars`, `max_output_tokens`: prompt/response bounds.
 - `disable_thinking`: asks compatible providers to suppress extended thinking.
 
@@ -89,6 +108,15 @@ remains authoritative.
 
 Non-loopback access requires a configured token. Keep the default loopback
 binding unless the service is intentionally protected and exposed.
+
+### `query`
+
+Controls the adaptive deep-query agent. `initial_action_budget` is the first
+tool window; unresolved structured requirements may extend it up to
+`max_action_budget`. `verification_passes` enables independent coverage and
+adversarial checks, `stagnation_rounds` stops loops that are no longer finding
+evidence, and `total_timeout` bounds the complete query rather than one LLM
+request. Defaults are 8, 32, 2, 2, and 20 minutes respectively.
 
 ### `research`
 
@@ -134,4 +162,3 @@ Set `database.dsn` and `database.project_id` in `config.yaml`, then start with:
 ```bash
 go run ./cmd/kbcore --config config.yaml serve --migrate-db
 ```
-

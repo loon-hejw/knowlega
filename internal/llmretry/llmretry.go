@@ -6,9 +6,10 @@ import (
 )
 
 type Options struct {
-	Retries   int
-	BaseDelay time.Duration
-	MaxDelay  time.Duration
+	Retries    int
+	BaseDelay  time.Duration
+	MaxDelay   time.Duration
+	MaxElapsed time.Duration
 }
 
 type RetryInfo struct {
@@ -47,6 +48,11 @@ func Do(ctx context.Context, opts Options, onRetry OnRetry, fn func(attempt int)
 func DoValue[T any](ctx context.Context, opts Options, onRetry OnRetry, fn func(attempt int) (T, bool, error)) (T, error) {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if opts.MaxElapsed > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, opts.MaxElapsed)
+		defer cancel()
 	}
 	var lastErr error
 	var zero T

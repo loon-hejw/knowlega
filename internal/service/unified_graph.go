@@ -206,7 +206,11 @@ func buildUnifiedProjectGraph(projectPath string) (WikiGraphAPIResult, error) {
 		}
 	}
 
-	result := WikiGraphAPIResult{Stats: ProjectGraphStats{ByDomain: map[string]int{}, ByKind: map[string]int{}}}
+	result := WikiGraphAPIResult{
+		Nodes: []WikiGraphAPINode{},
+		Edges: []WikiGraphAPIEdge{},
+		Stats: ProjectGraphStats{ByDomain: map[string]int{}, ByKind: map[string]int{}},
+	}
 	for _, node := range nodes {
 		result.Nodes = append(result.Nodes, node)
 		result.Stats.ByDomain[node.Domain]++
@@ -384,7 +388,7 @@ func QueryProjectGraph(query ProjectGraphQuery) (WikiGraphAPIResult, error) {
 		end = len(order)
 	}
 	pageIDs := map[string]bool{}
-	result := WikiGraphAPIResult{Stats: full.Stats}
+	result := WikiGraphAPIResult{Nodes: []WikiGraphAPINode{}, Edges: []WikiGraphAPIEdge{}, Stats: full.Stats}
 	for _, id := range order[offset:end] {
 		pageIDs[id] = true
 		result.Nodes = append(result.Nodes, eligible[id])

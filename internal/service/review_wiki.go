@@ -87,9 +87,10 @@ func NewWikiReviewAgent(cfg config.LLMConfig) (WikiReviewAgent, error) {
 		MaxOutputTokens:  cfg.MaxOutputTokens,
 		DisableThinking:  cfg.DisableThinking,
 		RetryOptions: llmretry.Options{
-			Retries:   cfg.Retries,
-			BaseDelay: cfg.RetryBaseDelay.Duration,
-			MaxDelay:  cfg.RetryMaxDelay.Duration,
+			Retries:    cfg.Retries,
+			BaseDelay:  cfg.RetryBaseDelay.Duration,
+			MaxDelay:   cfg.RetryMaxDelay.Duration,
+			MaxElapsed: cfg.OperationTimeout.Duration,
 		},
 	}, nil
 }
@@ -201,6 +202,7 @@ Return only JSON with this shape:
 {"issues":[{"type":"contradiction|duplicate|missing-page|stale-claim|source-gap|review-needed","path":"wiki/...","detail":"specific actionable issue"}]}
 
 Rules:
+- Return at most 20 issues. Keep each detail concise and evidence-specific.
 - Focus on semantic wiki maintenance, not markdown formatting.
 - Report contradictions, duplicate pages, missing concept/entity/synthesis pages, stale or weakly sourced claims, and source gaps.
 - Pay special attention to concrete unresolved review items in wiki/reviews.md, raw source excerpts, and source manifest entries that conflict with generated wiki pages.
@@ -246,6 +248,10 @@ Pages:
 }
 
 func (a OpenAICompatibleWikiReviewAgent) chat(system, user string) (string, error) {
+	maxOutputTokens := a.MaxOutputTokens
+	if maxOutputTokens <= 0 || maxOutputTokens > 2048 {
+		maxOutputTokens = 2048
+	}
 	queryAgent := OpenAICompatibleQueryAgent{
 		Protocol:         a.Protocol,
 		BaseURL:          a.BaseURL,
@@ -255,7 +261,7 @@ func (a OpenAICompatibleWikiReviewAgent) chat(system, user string) (string, erro
 		AnthropicVersion: a.AnthropicVersion,
 		Client:           a.Client,
 		MaxInputChars:    a.MaxInputChars,
-		MaxOutputTokens:  a.MaxOutputTokens,
+		MaxOutputTokens:  maxOutputTokens,
 		DisableThinking:  a.DisableThinking,
 		RetryOptions:     a.RetryOptions,
 	}

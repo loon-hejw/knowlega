@@ -3,15 +3,16 @@ package service
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/hejw/knowledge-core/internal/core"
+	manifestfile "github.com/hejw/knowledge-core/internal/manifest"
 	"github.com/hejw/knowledge-core/internal/sourcearchive"
 	"github.com/hejw/knowledge-core/internal/wiki"
 )
@@ -36,6 +37,11 @@ func IngestSource(opts IngestOptions) (IngestResult, error) {
 	if strings.TrimSpace(opts.SourcePath) == "" {
 		return IngestResult{}, fmt.Errorf("source path is required")
 	}
+	release, err := acquireServiceProjectLock(opts.ProjectPath)
+	if err != nil {
+		return IngestResult{}, err
+	}
+	defer release()
 	sourcePath := opts.SourcePath
 	archive, archived, err := sourcearchive.FindBySourcePath(opts.ProjectPath, sourcePath)
 	if err != nil {
@@ -44,13 +50,13 @@ func IngestSource(opts IngestOptions) (IngestResult, error) {
 	if archived {
 		sourcePath = filepath.Join(opts.ProjectPath, filepath.FromSlash(archive.Metadata.ContentPath))
 	}
-	data, err := os.ReadFile(sourcePath)
+	data, err := readBoundedSourceFile(sourcePath)
 	if err != nil {
 		return IngestResult{}, err
 	}
 	originalData := data
 	if archived && archive.Metadata.ContentPath != archive.Metadata.OriginalRawPath {
-		originalData, err = os.ReadFile(filepath.Join(opts.ProjectPath, filepath.FromSlash(archive.Metadata.OriginalRawPath)))
+		originalData, err = readBoundedSourceFile(filepath.Join(opts.ProjectPath, filepath.FromSlash(archive.Metadata.OriginalRawPath)))
 		if err != nil {
 			return IngestResult{}, err
 		}
@@ -127,35 +133,14 @@ func IngestSource(opts IngestOptions) (IngestResult, error) {
 	return IngestResult{RawPath: rawRel, WikiPath: wikiRel, SHA256: hash}, nil
 }
 
-type ingestSourceManifest struct {
-	Version int                                  `json:"version"`
-	Sources map[string]ingestSourceManifestEntry `json:"sources"`
-}
-
-type ingestSourceManifestEntry struct {
-	OriginalPath    string          `json:"original_path"`
-	PipelineVersion int             `json:"pipeline_version,omitempty"`
-	SHA256          string          `json:"sha256"`
-	RawPath         string          `json:"raw_path"`
-	ArchivePath     string          `json:"archive_path,omitempty"`
-	OriginalRawPath string          `json:"original_raw_path,omitempty"`
-	ContentPath     string          `json:"content_path,omitempty"`
-	OriginalSHA256  string          `json:"original_sha256,omitempty"`
-	ContentSHA256   string          `json:"content_sha256,omitempty"`
-	Title           string          `json:"title"`
-	Files           []string        `json:"files"`
-	ReviewCount     int             `json:"review_count"`
-	UpdatedAt       string          `json:"updated_at"`
-	Extraction      json.RawMessage `json:"extraction,omitempty"`
-}
-
 func upsertIngestSourceManifest(projectPath, sourcePath, rawRel, title, hash string, files []string, archive *sourcearchive.Metadata) error {
-	manifest, err := loadIngestSourceManifest(projectPath)
+	value, err := manifestfile.Load(projectPath)
 	if err != nil {
 		return err
 	}
-	key := sourceManifestKey(sourcePath)
-	entry := ingestSourceManifestEntry{
+	key := manifestfile.Key(sourcePath)
+	previous, existed := value.Sources[key]
+	entry := manifestfile.Entry{
 		OriginalPath: key,
 		SHA256:       hash,
 		RawPath:      filepath.ToSlash(rawRel),
@@ -172,8 +157,24 @@ func upsertIngestSourceManifest(projectPath, sourcePath, rawRel, title, hash str
 		entry.OriginalSHA256 = archive.OriginalSHA256
 		entry.ContentSHA256 = archive.ContentSHA256
 	}
-	manifest.Sources[key] = entry
-	return saveIngestSourceManifest(projectPath, manifest)
+	if existed && previous.SHA256 == hash {
+		entry.PipelineVersion = previous.PipelineVersion
+		entry.GenerationContractSHA256 = previous.GenerationContractSHA256
+		entry.NewPageBudget = previous.NewPageBudget
+		entry.NewPageCount = previous.NewPageCount
+		entry.CreatedPages = append([]string(nil), previous.CreatedPages...)
+		entry.ReviewCount = previous.ReviewCount
+		entry.Extraction = previous.Extraction
+		entry.Versions = append([]manifestfile.SourceVersion(nil), previous.Versions...)
+		entry.Files = mergePathLists(previous.Files, files)
+	} else if existed {
+		manifestfile.AppendPriorVersion(previous, &entry)
+	}
+	value.Sources[key] = entry
+	for _, path := range files {
+		manifestfile.RegisterPageOwner(&value, path, "source", key)
+	}
+	return manifestfile.Save(projectPath, value)
 }
 
 func archiveMetadata(archive sourcearchive.Archive, ok bool) *sourcearchive.Metadata {
@@ -197,56 +198,25 @@ func sourceInsideRawSources(projectPath, sourcePath string) bool {
 	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-func loadIngestSourceManifest(projectPath string) (ingestSourceManifest, error) {
-	manifest := ingestSourceManifest{
-		Version: 1,
-		Sources: map[string]ingestSourceManifestEntry{},
-	}
-	data, err := os.ReadFile(ingestSourceManifestPath(projectPath))
-	if os.IsNotExist(err) {
-		return manifest, nil
-	}
-	if err != nil {
-		return ingestSourceManifest{}, err
-	}
-	if len(strings.TrimSpace(string(data))) == 0 {
-		return manifest, nil
-	}
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		return ingestSourceManifest{}, fmt.Errorf("read source manifest: %w", err)
-	}
-	if manifest.Version == 0 {
-		manifest.Version = 1
-	}
-	if manifest.Sources == nil {
-		manifest.Sources = map[string]ingestSourceManifestEntry{}
-	}
-	return manifest, nil
-}
-
-func saveIngestSourceManifest(projectPath string, manifest ingestSourceManifest) error {
-	path := ingestSourceManifestPath(projectPath)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	return writeFileAtomic(path, data)
-}
-
-func ingestSourceManifestPath(projectPath string) string {
-	return filepath.Join(projectPath, ".kbcore", "source-manifest.json")
-}
-
 func sourceManifestKey(path string) string {
-	abs, err := filepath.Abs(path)
-	if err != nil {
-		return filepath.ToSlash(path)
+	return manifestfile.Key(path)
+}
+
+func mergePathLists(values ...[]string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, list := range values {
+		for _, value := range list {
+			value = filepath.ToSlash(strings.TrimSpace(value))
+			if value == "" || seen[value] {
+				continue
+			}
+			seen[value] = true
+			out = append(out, value)
+		}
 	}
-	return filepath.ToSlash(abs)
+	sort.Strings(out)
+	return out
 }
 
 func renderSourceSummaryBody(title, rawRel, hash, content string) string {

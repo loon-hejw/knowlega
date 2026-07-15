@@ -8,7 +8,7 @@ import (
 // SourceManifestPipelineVersion is bumped when unchanged sources must be
 // recompiled to pick up a materially different LLM Wiki generation contract.
 // It is stored per source so a partially migrated corpus remains resumable.
-const SourceManifestPipelineVersion = 2
+const SourceManifestPipelineVersion = 4
 
 type Confidence string
 
@@ -80,21 +80,25 @@ type WikiPageVersion struct {
 }
 
 type SourceManifestEntry struct {
-	ID              string
-	ProjectID       string
-	OriginalPath    string
-	PipelineVersion int
-	SHA256          string
-	RawPath         string
-	ArchivePath     string
-	OriginalRawPath string
-	ContentPath     string
-	OriginalSHA256  string
-	ContentSHA256   string
-	Title           string
-	Files           []string
-	ReviewCount     int
-	UpdatedAt       time.Time
+	ID                       string
+	ProjectID                string
+	OriginalPath             string
+	PipelineVersion          int
+	SHA256                   string
+	RawPath                  string
+	ArchivePath              string
+	OriginalRawPath          string
+	ContentPath              string
+	OriginalSHA256           string
+	ContentSHA256            string
+	Title                    string
+	Files                    []string
+	GenerationContractSHA256 string
+	NewPageBudget            int
+	NewPageCount             int
+	CreatedPages             []string
+	ReviewCount              int
+	UpdatedAt                time.Time
 }
 
 type CodeRepo struct {
@@ -159,6 +163,7 @@ type ReviewItem struct {
 	Severity       string
 	Status         string
 	SourcePath     string
+	SourcePaths    []string
 	AffectedPages  []string
 	SearchQueries  []string
 	Options        []ReviewOption
@@ -186,24 +191,65 @@ type QuerySearch struct {
 	Rationale string `json:"rationale"`
 }
 
+type QueryRequirement struct {
+	ID   string `json:"id"`
+	Text string `json:"text"`
+	Kind string `json:"kind,omitempty"`
+}
+
+type QueryHypothesis struct {
+	Candidate      string               `json:"candidate"`
+	Rationale      string               `json:"rationale,omitempty"`
+	Discriminators []string             `json:"discriminators,omitempty"`
+	SuggestedReads []string             `json:"suggested_reads,omitempty"`
+	Checks         []QueryEvidenceCheck `json:"evidence_checks,omitempty"`
+	Coverage       int                  `json:"coverage,omitempty"`
+}
+
+type QueryEvidenceCheck struct {
+	RequirementID string   `json:"requirement_id"`
+	Status        string   `json:"status"`
+	EvidencePaths []string `json:"evidence_paths,omitempty"`
+	Explanation   string   `json:"explanation,omitempty"`
+}
+
+type QueryVerification struct {
+	Pass           int      `json:"pass"`
+	Kind           string   `json:"kind"`
+	Accepted       bool     `json:"accepted"`
+	Summary        string   `json:"summary,omitempty"`
+	Unresolved     []string `json:"unresolved,omitempty"`
+	Contradictions []string `json:"contradictions,omitempty"`
+	NextQueries    []string `json:"next_queries,omitempty"`
+}
+
 type QueryPlan struct {
-	Question       string        `json:"question"`
-	Intent         string        `json:"intent"`
-	ReadFirst      []string      `json:"read_first"`
-	Searches       []QuerySearch `json:"searches"`
-	CandidateLimit int           `json:"candidate_limit"`
-	AnswerMode     string        `json:"answer_mode"`
-	CanWriteBack   bool          `json:"can_write_back"`
+	Question            string             `json:"question"`
+	ResolvedQuestion    string             `json:"resolved_question,omitempty"`
+	Intent              string             `json:"intent"`
+	ReasoningMode       string             `json:"reasoning_mode,omitempty"`
+	Requirements        []QueryRequirement `json:"requirements,omitempty"`
+	Hypotheses          []QueryHypothesis  `json:"hypotheses,omitempty"`
+	RequireAll          bool               `json:"require_all_requirements,omitempty"`
+	RequireVerification bool               `json:"require_verification,omitempty"`
+	VerificationPasses  int                `json:"verification_passes,omitempty"`
+	ReadFirst           []string           `json:"read_first"`
+	Searches            []QuerySearch      `json:"searches"`
+	CandidateLimit      int                `json:"candidate_limit"`
+	AnswerMode          string             `json:"answer_mode"`
+	CanWriteBack        bool               `json:"can_write_back"`
 }
 
 type QueryAction struct {
-	Action    string `json:"action"`
-	Path      string `json:"path,omitempty"`
-	Query     string `json:"query,omitempty"`
-	Limit     int    `json:"limit,omitempty"`
-	Title     string `json:"title,omitempty"`
-	Answer    string `json:"answer,omitempty"`
-	Rationale string `json:"rationale,omitempty"`
+	Action    string               `json:"action"`
+	Path      string               `json:"path,omitempty"`
+	Query     string               `json:"query,omitempty"`
+	Limit     int                  `json:"limit,omitempty"`
+	Title     string               `json:"title,omitempty"`
+	Answer    string               `json:"answer,omitempty"`
+	Rationale string               `json:"rationale,omitempty"`
+	Candidate string               `json:"candidate,omitempty"`
+	Checks    []QueryEvidenceCheck `json:"evidence_checks,omitempty"`
 }
 
 type QueryTraceStep struct {
@@ -219,12 +265,14 @@ type QueryCitation struct {
 }
 
 type QueryAnswer struct {
-	Question                string           `json:"question"`
-	Plan                    QueryPlan        `json:"plan"`
-	Results                 []QueryResult    `json:"results"`
-	Answer                  string           `json:"answer"`
-	SuggestedWritebackTitle string           `json:"suggested_writeback_title,omitempty"`
-	Citations               []QueryCitation  `json:"citations"`
-	Trace                   []QueryTraceStep `json:"trace,omitempty"`
-	Notes                   []string         `json:"notes"`
+	Question                string              `json:"question"`
+	Plan                    QueryPlan           `json:"plan"`
+	Results                 []QueryResult       `json:"results"`
+	Answer                  string              `json:"answer"`
+	SuggestedWritebackTitle string              `json:"suggested_writeback_title,omitempty"`
+	Citations               []QueryCitation     `json:"citations"`
+	Trace                   []QueryTraceStep    `json:"trace,omitempty"`
+	Verification            []QueryVerification `json:"verification,omitempty"`
+	IncompleteReason        string              `json:"incomplete_reason,omitempty"`
+	Notes                   []string            `json:"notes"`
 }

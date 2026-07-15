@@ -45,16 +45,30 @@ func TestOpenAICompatibleProviderWorksWithValidateFlow(t *testing.T) {
 			t.Fatalf("unexpected path %s", r.URL.Path)
 		}
 		call++
+		var request chatCompletionRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
 		content := "# Analysis\n\n- Create an OAuth concept page."
-		if call == 2 {
-			var request chatCompletionRequest
-			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-				t.Fatal(err)
+		if call == 1 {
+			analysisPrompt := request.Messages[len(request.Messages)-1].Content
+			for _, want := range []string{"at most 12 total ---FILE blocks", "at most 3 new non-summary pages"} {
+				if !strings.Contains(analysisPrompt, want) {
+					t.Fatalf("analysis prompt missing %q: %s", want, analysisPrompt)
+				}
 			}
+		}
+		if call == 2 {
 			if len(request.Messages) < 1 ||
 				!strings.Contains(request.Messages[0].Content, "Always include exactly one source-summary page") ||
 				!strings.Contains(request.Messages[0].Content, "add that wording to the target page aliases") {
 				t.Fatalf("generate prompt missing alias-link rule: %+v", request.Messages)
+			}
+			userPrompt := request.Messages[len(request.Messages)-1].Content
+			for _, want := range []string{"at most 4 total ---FILE blocks", "at most 3 new non-summary pages", "primary language of the current source"} {
+				if !strings.Contains(userPrompt, want) {
+					t.Fatalf("generate prompt missing %q: %s", want, userPrompt)
+				}
 			}
 			if enabled, ok := request.ChatTemplateKwargs["enable_thinking"].(bool); !ok || enabled {
 				t.Fatalf("thinking must be disabled for wiki compilation: %+v", request.ChatTemplateKwargs)
@@ -90,6 +104,12 @@ Token validation calls the auth service.
 ---REVIEW: suggestion | Expand AuthService
 SEARCH: AuthService token validation`, sourceRel, sourceRel)
 		}
+		if call == 3 {
+			if request.MaxTokens != 2048 {
+				t.Fatalf("page gate max_tokens=%d", request.MaxTokens)
+			}
+			content = `{"accepted":["wiki/concepts/oauth-token-validation.md"],"rejected":[]}`
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"choices": []map[string]any{{
@@ -124,8 +144,8 @@ SEARCH: AuthService token validation`, sourceRel, sourceRel)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if call != 2 {
-		t.Fatalf("expected analyze and generate calls, got %d", call)
+	if call != 3 {
+		t.Fatalf("expected analyze, generate, and page-gate calls, got %d", call)
 	}
 	if len(result.Files) != 2 {
 		t.Fatalf("files=%v", result.Files)
@@ -134,7 +154,11 @@ SEARCH: AuthService token validation`, sourceRel, sourceRel)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(page), "aliases: \"token auth\"") {
+	frontmatter, err := parseGeneratedFrontmatter(string(page))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aliases := frontmatterStrings(frontmatter["aliases"]); len(aliases) != 1 || aliases[0] != "token auth" {
 		t.Fatalf("generated page lost aliases frontmatter:\n%s", page)
 	}
 	if result.ReviewCount != 1 {

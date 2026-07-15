@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hejw/knowledge-core/internal/core"
 	"github.com/hejw/knowledge-core/internal/wiki"
@@ -318,6 +319,418 @@ Token validation calls the auth service.
 	}
 	if !queryDocsContain(agent.inputs[2].Docs, "wiki/concepts/oauth.md") {
 		t.Fatalf("final action should see read document: %+v", agent.inputs[2].Docs)
+	}
+}
+
+func TestDeepQueryVerifierRejectsThenAcceptsCorrectedFinal(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(root, "wiki", "concepts", "oauth.md"), `---
+type: concept
+title: OAuth
+---
+# OAuth
+OAuth uses signed tokens.
+`)
+	base := &scriptedActionAgent{
+		plan: core.QueryPlan{
+			Question:       "How does OAuth work?",
+			Intent:         "answer_from_persistent_wiki",
+			ReadFirst:      []string{"wiki/concepts/oauth.md"},
+			CandidateLimit: 5,
+			CanWriteBack:   true,
+		},
+		actions: []core.QueryAction{
+			{Action: "final", Answer: "OAuth uses tokens [wiki/concepts/oauth.md]."},
+			{Action: "final", Answer: "OAuth uses signed tokens [wiki/concepts/oauth.md]."},
+		},
+	}
+	agent := &verifyingActionAgent{
+		scriptedActionAgent: base,
+		results: []core.QueryVerification{
+			{Accepted: false, Summary: "signature evidence was omitted", Unresolved: []string{"token signature"}, NextQueries: []string{"OAuth signed token"}},
+			{Accepted: true, Summary: "coverage complete"},
+			{Accepted: true, Summary: "no counterexample found"},
+		},
+	}
+	answer, err := QueryLLMWikiWithOptions(QueryOptions{
+		ProjectPath: root,
+		Question:    "How does OAuth work?",
+		Agent:       agent,
+		Runtime: QueryRuntimeOptions{
+			InitialActionBudget: 4,
+			MaxActionBudget:     8,
+			VerificationPasses:  2,
+			StagnationRounds:    2,
+			TotalTimeout:        time.Minute,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer.Answer != "OAuth uses signed tokens [wiki/concepts/oauth.md]." {
+		t.Fatalf("answer=%q", answer.Answer)
+	}
+	if len(answer.Verification) != 3 || answer.Verification[0].Accepted || !answer.Verification[2].Accepted {
+		t.Fatalf("verification=%+v", answer.Verification)
+	}
+	if !answer.Plan.CanWriteBack {
+		t.Fatalf("fully verified reusable answer should remain writeback eligible: %+v", answer.Plan)
+	}
+}
+
+func TestQueryActionLoopRecoversFromMissingRead(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(root, "wiki", "entities", "king.md"), `---
+type: entity
+title: King
+---
+# King
+The king returned safely.
+`)
+	agent := &scriptedActionAgent{
+		plan: core.QueryPlan{Intent: "answer_from_persistent_wiki", CandidateLimit: 5},
+		actions: []core.QueryAction{
+			{Action: "read", Path: "wiki/entities/missing.md"},
+			{Action: "read", Path: "wiki/entities/king.md"},
+			{Action: "final", Answer: "The king returned safely [wiki/entities/king.md]."},
+		},
+	}
+	answer, err := QueryLLMWikiWithAgent(root, "What happened?", 5, agent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(answer.Answer, "returned safely") {
+		t.Fatalf("answer=%q", answer.Answer)
+	}
+	if len(answer.Trace) != 3 || !strings.Contains(answer.Trace[0].Observation, "read failed") {
+		t.Fatalf("trace=%+v", answer.Trace)
+	}
+}
+
+func TestAcceptFinalQueryActionNormalizesRawEvidencePath(t *testing.T) {
+	docs := []QueryReadDocument{{
+		Path:    "raw/sources/chapter-071/original/chapter-071.txt",
+		Title:   "Chapter 71",
+		Kind:    "raw-source",
+		Content: "source evidence",
+	}}
+	action := core.QueryAction{
+		Action: "final",
+		Answer: "The claim is supported by [chapter 71](wiki/raw/sources/chapter-071/original/chapter-071.txt).",
+	}
+	var trace []core.QueryTraceStep
+	answer, _, accepted := acceptFinalQueryAction(1, "what happened?", core.QueryPlan{}, action, nil, docs, &trace)
+	if !accepted {
+		t.Fatalf("final action was rejected: %+v", trace)
+	}
+	if strings.Contains(answer, "wiki/raw/") {
+		t.Fatalf("answer still contains noncanonical raw path: %q", answer)
+	}
+	if !strings.Contains(answer, "(raw/sources/chapter-071/original/chapter-071.txt)") {
+		t.Fatalf("answer does not contain canonical raw path: %q", answer)
+	}
+	if len(trace) != 1 || strings.Contains(trace[0].Action.Answer, "wiki/raw/") {
+		t.Fatalf("trace did not retain the normalized action: %+v", trace)
+	}
+}
+
+func TestEnrichQueryPlanExtractsNumberedConstraintRequirements(t *testing.T) {
+	question := "1.有结义的情节\n2.见过孙悟空\n3.不曾到过花果山"
+	plan := enrichQueryPlan(question, core.QueryPlan{CanWriteBack: true})
+	if plan.ReasoningMode != "constraint_satisfaction" || !plan.RequireAll {
+		t.Fatalf("plan was not switched to constraint mode: %+v", plan)
+	}
+	if plan.CanWriteBack {
+		t.Fatal("one-off constraint question must not be writeback eligible")
+	}
+	if len(plan.Requirements) != 3 || plan.Requirements[2].Kind != "negative" {
+		t.Fatalf("requirements=%+v", plan.Requirements)
+	}
+}
+
+func TestRecallRequirementCandidatesRanksCrossRequirementIntersection(t *testing.T) {
+	store := requirementSearchStore{byQuestion: map[string][]core.QueryResult{
+		"结义":   {{Path: "wiki/Overview.md", Score: 1000}, {Path: "wiki/entities/唐太宗.md", Score: 20}, {Path: "wiki/entities/牛魔王.md", Score: 30}},
+		"见阎罗王": {{Path: "wiki/overview.md", Score: 1000}, {Path: "wiki/entities/唐太宗.md", Score: 15}, {Path: "wiki/entities/孙悟空.md", Score: 40}},
+		"见观音":  {{Path: "wiki/overview.md", Score: 1000}, {Path: "wiki/entities/唐太宗.md", Score: 10}, {Path: "wiki/entities/红孩儿.md", Score: 50}},
+	}}
+	plan := core.QueryPlan{
+		CandidateLimit: 10,
+		Requirements: []core.QueryRequirement{
+			{ID: "1", Text: "结义"}, {ID: "2", Text: "见阎罗王"}, {ID: "3", Text: "见观音"},
+		},
+	}
+	results, err := recallRequirementCandidates(context.Background(), t.TempDir(), "project", plan, store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 || results[0].Path != "wiki/entities/唐太宗.md" {
+		t.Fatalf("cross-requirement candidate was not ranked first: %+v", results)
+	}
+	for _, result := range results {
+		if isAggregateWikiPath(result.Path) {
+			t.Fatalf("aggregate navigation page leaked into requirement candidates: %+v", results)
+		}
+	}
+}
+
+func TestRecallRequirementCandidatesPromotesEntitiesBySourceOverlap(t *testing.T) {
+	root := t.TempDir()
+	rawRel := "raw/sources/chapter-010/original/chapter-010.txt"
+	entityPath := filepath.Join(root, "wiki", "entities", "唐太宗.md")
+	if err := os.MkdirAll(filepath.Dir(entityPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	page := "---\ntitle: 唐太宗\ntype: entity\nsources:\n  - " + rawRel + "\n---\n\n# 唐太宗\n"
+	if err := os.WriteFile(entityPath, []byte(page), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	store := requirementSearchStore{byQuestion: map[string][]core.QueryResult{
+		"见过阎罗王": {{Path: rawRel, Title: "第十回", Kind: "raw-source", Score: 100}},
+	}}
+	results, err := recallRequirementCandidates(context.Background(), root, "project", core.QueryPlan{
+		Requirements: []core.QueryRequirement{{ID: "7", Text: "见过阎罗王"}},
+	}, store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 || results[0].Path != "wiki/entities/唐太宗.md" || !strings.Contains(results[0].Snippet, "source-overlap") {
+		t.Fatalf("source provenance did not promote the entity candidate: %+v", results)
+	}
+}
+
+func TestFindNamedEntityCooccurrenceSourcesFindsSharedChapter(t *testing.T) {
+	root := t.TempDir()
+	mustWrite(t, filepath.Join(root, "wiki", "entities", "唐太宗.md"), `---
+title: 唐太宗
+type: entity
+---
+
+# 唐太宗
+`)
+	mustWrite(t, filepath.Join(root, "wiki", "entities", "孙悟空.md"), `---
+title: 孙悟空
+type: entity
+---
+
+# 孙悟空
+`)
+	mustWrite(t, filepath.Join(root, "wiki", "sources", "chapter-100.md"), `---
+title: 第一百回
+type: source-summary
+---
+
+# 第一百回
+
+[[唐太宗]]接见取经众人，玄奘向他引见了[[孙悟空]]。
+`)
+	mustWrite(t, filepath.Join(root, "wiki", "sources", "chapter-010.md"), `---
+title: 第十回
+type: source-summary
+---
+
+# 第十回
+
+[[唐太宗]]还魂。
+`)
+
+	results, docs, err := findNamedEntityCooccurrenceSources(root, "唐太宗 孙悟空 直接见面 章回", 5, 12000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].Path != "wiki/sources/chapter-100.md" {
+		t.Fatalf("shared source chapter was not found: %+v", results)
+	}
+	if len(docs) != 1 || !strings.Contains(docs[0].Content, "玄奘向他引见了[[孙悟空]]") {
+		t.Fatalf("shared source chapter was not read as evidence: %+v", docs)
+	}
+}
+
+func TestPrioritizeQueryActionDocumentsKeepsCandidateProvenance(t *testing.T) {
+	entity := `---
+title: 唐太宗
+type: entity
+sources:
+  - raw/sources/chapter-012/original/chapter-012.txt
+---
+
+# 唐太宗
+`
+	docs := []QueryReadDocument{
+		{Path: "wiki/entities/唐太宗.md", Title: "唐太宗", Content: entity},
+		{Path: "raw/sources/chapter-012/original/chapter-012.txt", Title: "第十二回", Content: "太宗坚持奉饯，三藏不敢不受，复谢恩饮尽。"},
+		{Path: "wiki/entities/后来候选.md", Title: "后来候选", Content: "其他证据"},
+	}
+	ordered := prioritizeQueryActionDocuments(docs, nil, []core.QueryTraceStep{{
+		Step: 1,
+		Action: core.QueryAction{
+			Action:    "final",
+			Candidate: "唐太宗",
+			Checks:    []core.QueryEvidenceCheck{{RequirementID: "5", Status: "unknown"}},
+		},
+	}})
+	if len(ordered) != 3 || ordered[len(ordered)-2].Path != "wiki/entities/唐太宗.md" || ordered[len(ordered)-1].Path != "raw/sources/chapter-012/original/chapter-012.txt" {
+		t.Fatalf("candidate and provenance were not prioritized together: %+v", ordered)
+	}
+}
+
+func TestBuildCandidateEvidencePacksCombinesProvenanceAndSharedScenes(t *testing.T) {
+	root := t.TempDir()
+	rawRel := "raw/sources/chapter-012/original/chapter-012.txt"
+	mustWrite(t, filepath.Join(root, "wiki", "entities", "唐太宗.md"), "---\ntitle: 唐太宗\ntype: entity\nsources:\n  - "+rawRel+"\n---\n\n# 唐太宗\n")
+	mustWrite(t, filepath.Join(root, "wiki", "entities", "孙悟空.md"), "---\ntitle: 孙悟空\ntype: entity\n---\n\n# 孙悟空\n")
+	mustWrite(t, filepath.Join(root, filepath.FromSlash(rawRel)), "太宗坚持奉饯，三藏不敢不受，复谢恩饮尽。")
+	mustWrite(t, filepath.Join(root, "wiki", "sources", "chapter-100.md"), "---\ntitle: 第一百回\ntype: source-summary\n---\n\n[[唐太宗]]接见玄奘，并由玄奘引见[[孙悟空]]。\n")
+
+	packs, err := buildCandidateEvidencePacks(root, []core.QueryHypothesis{{Candidate: "唐太宗"}}, []core.QueryRequirement{{ID: "2", Text: "见过孙悟空"}}, 6, 12000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(packs) != 1 || !queryDocsContain(packs[0].Docs, rawRel) || !queryDocsContain(packs[0].Docs, "wiki/sources/chapter-100.md") {
+		t.Fatalf("candidate evidence pack is incomplete: %+v", packs)
+	}
+}
+
+func TestNormalizeCandidateAuditsRanksCoverageAndDropsUnreadPaths(t *testing.T) {
+	packs := []QueryCandidateEvidencePack{
+		{Candidate: "甲", Docs: []QueryReadDocument{{Path: "wiki/entities/a.md"}}},
+		{Candidate: "乙", Docs: []QueryReadDocument{{Path: "wiki/entities/b.md"}}},
+	}
+	audits := []core.QueryHypothesis{
+		{Candidate: "甲", Checks: []core.QueryEvidenceCheck{{RequirementID: "1", Status: "supported", EvidencePaths: []string{"wiki/entities/a.md"}}}},
+		{Candidate: "乙", Checks: []core.QueryEvidenceCheck{
+			{RequirementID: "1", Status: "supported", EvidencePaths: []string{"wiki/entities/b.md"}},
+			{RequirementID: "2", Status: "supported", EvidencePaths: []string{"wiki/entities/b.md", "wiki/entities/unread.md"}},
+		}},
+	}
+	normalized := normalizeCandidateAudits(audits, packs, []core.QueryRequirement{{ID: "1"}, {ID: "2"}})
+	if len(normalized) != 2 || normalized[0].Candidate != "乙" || normalized[0].Coverage != 2 {
+		t.Fatalf("candidate audits were not ranked by evidence coverage: %+v", normalized)
+	}
+	if got := normalized[0].Checks[1].EvidencePaths; len(got) != 1 || got[0] != "wiki/entities/b.md" {
+		t.Fatalf("unread audit evidence path was retained: %+v", got)
+	}
+}
+
+func TestReadHypothesisDocumentsResolvesCandidateTitlesAndSkipsMissingSuggestions(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "wiki", "entities"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	content := "---\ntitle: 唐太宗\ntype: entity\n---\n\n# 唐太宗\n\n候选证据。\n"
+	if err := os.WriteFile(filepath.Join(root, "wiki", "entities", "唐太宗.md"), []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	docs, err := readHypothesisDocuments(root, []core.QueryHypothesis{{
+		Candidate:      "唐太宗",
+		SuggestedReads: []string{"wiki/entities/不存在.md"},
+	}}, 4, 6000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(docs) != 1 || docs[0].Path != "wiki/entities/唐太宗.md" {
+		t.Fatalf("hypothesis candidate was not resolved and read: %+v", docs)
+	}
+}
+
+func TestExpandCandidateRequirementEvidenceReadsFrontmatterSources(t *testing.T) {
+	root := t.TempDir()
+	wikiPath := filepath.Join(root, "wiki", "entities", "唐太宗.md")
+	rawRel := "raw/sources/chapter-012/original/chapter-012.txt"
+	if err := os.MkdirAll(filepath.Dir(wikiPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(root, filepath.FromSlash(rawRel))), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	page := "---\ntitle: 唐太宗\ntype: entity\nsources:\n  - " + rawRel + "\n---\n\n# 唐太宗\n"
+	if err := os.WriteFile(wikiPath, []byte(page), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(rawRel)), []byte("太宗劝三藏饮素酒，三藏饮下。"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, docs, err := expandCandidateRequirementEvidence(context.Background(), root, "", "唐太宗", core.QueryPlan{
+		Requirements: []core.QueryRequirement{{ID: "5", Text: "曾逼迫唐僧做了某事"}},
+	}, []QueryReadDocument{{Path: "wiki/entities/唐太宗.md", Title: "唐太宗", Content: page}}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, doc := range docs {
+		if doc.Path == rawRel && strings.Contains(doc.Content, "素酒") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("candidate provenance source was not read: %+v", docs)
+	}
+}
+
+func TestAcceptFinalQueryActionRequiresEveryConstraintForSameCandidate(t *testing.T) {
+	plan := core.QueryPlan{
+		ReasoningMode: "constraint_satisfaction",
+		RequireAll:    true,
+		Requirements: []core.QueryRequirement{
+			{ID: "1", Text: "有结义", Kind: "positive"},
+			{ID: "2", Text: "见过阎罗王", Kind: "positive"},
+			{ID: "3", Text: "不曾到过花果山", Kind: "negative"},
+		},
+	}
+	docs := []QueryReadDocument{
+		{Path: "wiki/entities/唐太宗.md", Kind: "wiki-page", Content: "唐太宗证据"},
+		{Path: "raw/sources/chapter-010/original/chapter-010.txt", Kind: "raw-source", Content: "阎王证据"},
+	}
+	action := core.QueryAction{
+		Action:    "final",
+		Candidate: "唐太宗",
+		Answer:    "答案是唐太宗。",
+		Checks: []core.QueryEvidenceCheck{
+			{RequirementID: "1", Status: "supported", EvidencePaths: []string{"wiki/entities/唐太宗.md"}},
+			{RequirementID: "2", Status: "supported", EvidencePaths: []string{"raw/sources/chapter-010/original/chapter-010.txt"}},
+			{RequirementID: "3", Status: "unknown", EvidencePaths: []string{"wiki/entities/唐太宗.md"}},
+		},
+	}
+	var trace []core.QueryTraceStep
+	trace = []core.QueryTraceStep{{Step: 1, Action: core.QueryAction{Action: "search", Query: "唐太宗 花果山"}, Observation: "searched corpus"}}
+	if _, _, accepted := acceptFinalQueryAction(2, "谁？", plan, action, nil, docs, &trace); accepted {
+		t.Fatalf("unknown constraint was accepted: %+v", trace)
+	}
+	action.Checks[2].Status = "not_found_in_corpus"
+	trace = []core.QueryTraceStep{{Step: 1, Action: core.QueryAction{Action: "search", Query: "唐太宗 花果山"}, Observation: "searched corpus"}}
+	answer, _, accepted := acceptFinalQueryAction(2, "谁？", plan, action, nil, docs, &trace)
+	if !accepted || answer != "答案是唐太宗。" {
+		t.Fatalf("closed constraint ledger was rejected: answer=%q trace=%+v", answer, trace)
+	}
+	action.Checks[0].EvidencePaths = []string{"wiki/Overview.md"}
+	trace = []core.QueryTraceStep{{Step: 1, Action: core.QueryAction{Action: "search", Query: "唐太宗 花果山"}, Observation: "searched corpus"}}
+	if _, _, accepted := acceptFinalQueryAction(2, "谁？", plan, action, nil, docs, &trace); accepted || !strings.Contains(trace[len(trace)-1].Observation, "navigation-only evidence") {
+		t.Fatalf("aggregate evidence was not rejected clearly: %+v", trace)
+	}
+}
+
+func TestScopeNegativeRequirementAnswerAddsCorpusBoundary(t *testing.T) {
+	plan := core.QueryPlan{Requirements: []core.QueryRequirement{{ID: "9", Text: "不曾到过花果山", Kind: "negative"}}}
+	action := core.QueryAction{Answer: "答案是唐太宗。", Checks: []core.QueryEvidenceCheck{{RequirementID: "9", Status: "not_found_in_corpus"}}}
+	answer := scopeNegativeRequirementAnswer(plan, action)
+	if !strings.Contains(answer, "仅限当前知识库语料与本候选专项检索") || !strings.Contains(answer, "并非对语料之外事实的绝对证明") {
+		t.Fatalf("negative evidence scope was not appended: %q", answer)
+	}
+}
+
+func TestQueryTraceContainsCandidateSearchSurvivesLongTrace(t *testing.T) {
+	trace := []core.QueryTraceStep{{Action: core.QueryAction{Action: "search", Query: "唐太宗 × all requirements"}}}
+	for i := 0; i < 30; i++ {
+		trace = append(trace, core.QueryTraceStep{Action: core.QueryAction{Action: "read", Path: "wiki/entities/other.md"}})
+	}
+	if !queryTraceContainsCandidateSearch(trace, "唐太宗") {
+		t.Fatal("candidate-specific search was lost behind recent trace budget")
 	}
 }
 
@@ -1538,6 +1951,27 @@ func TestWriteQueryAnswerRejectsIneligibleAnswers(t *testing.T) {
 			},
 			want: "non-navigation citation",
 		},
+		{
+			name: "deep_answer_without_completed_verification",
+			answer: &core.QueryAnswer{
+				Question: "verified?",
+				Plan: core.QueryPlan{
+					Intent:              "answer_from_persistent_wiki",
+					AnswerMode:          "llm_synthesis",
+					CanWriteBack:        true,
+					RequireVerification: true,
+					VerificationPasses:  2,
+				},
+				Answer: "unchecked answer",
+				Citations: []core.QueryCitation{{
+					Path:  "wiki/concepts/oauth.md",
+					Title: "OAuth",
+					Kind:  "concept",
+				}},
+				Verification: []core.QueryVerification{{Pass: 1, Kind: "coverage", Accepted: true}},
+			},
+			want: "completed independent verification",
+		},
 	}
 
 	for _, tc := range cases {
@@ -1600,6 +2034,12 @@ type scriptedActionAgent struct {
 	synthCalled bool
 }
 
+type verifyingActionAgent struct {
+	*scriptedActionAgent
+	results []core.QueryVerification
+	calls   int
+}
+
 type failingActionAgent struct {
 	plan        core.QueryPlan
 	actionErr   error
@@ -1640,6 +2080,14 @@ type fakeSearchEvidenceStore struct {
 	projectID string
 	plan      core.QueryPlan
 	limit     int
+}
+
+type requirementSearchStore struct {
+	byQuestion map[string][]core.QueryResult
+}
+
+func (s requirementSearchStore) SearchWikiEvidence(_ context.Context, _ string, plan core.QueryPlan, _ int) ([]core.QueryResult, error) {
+	return s.byQuestion[plan.Question], nil
 }
 
 type fakeQueryLogStore struct {
@@ -1725,6 +2173,15 @@ func (f *scriptedActionAgent) NextQueryAction(input QueryActionInput) (core.Quer
 func (f *scriptedActionAgent) SynthesizeQuery(QuerySynthesisInput) (string, error) {
 	f.synthCalled = true
 	return "synthesized fallback", nil
+}
+
+func (f *verifyingActionAgent) VerifyQueryAnswerContext(_ context.Context, _ QueryVerificationInput) (core.QueryVerification, error) {
+	if f.calls >= len(f.results) {
+		return core.QueryVerification{Accepted: false, Summary: "no scripted verification"}, nil
+	}
+	result := f.results[f.calls]
+	f.calls++
+	return result, nil
 }
 
 func (f *failingActionAgent) PlanQuery(QueryPlanningInput) (core.QueryPlan, error) {

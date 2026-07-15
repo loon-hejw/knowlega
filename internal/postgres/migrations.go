@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS source_manifest (
   id text PRIMARY KEY,
   project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
   original_path text NOT NULL,
+  pipeline_version integer NOT NULL DEFAULT 0,
   sha256 text NOT NULL,
   raw_path text NOT NULL,
   archive_path text NOT NULL DEFAULT '',
@@ -81,15 +82,24 @@ CREATE TABLE IF NOT EXISTS source_manifest (
   content_sha256 text NOT NULL DEFAULT '',
   title text NOT NULL,
   files text[] NOT NULL DEFAULT '{}',
+  generation_contract_sha256 text NOT NULL DEFAULT '',
+  new_page_budget integer NOT NULL DEFAULT 0,
+  new_page_count integer NOT NULL DEFAULT 0,
+  created_pages text[] NOT NULL DEFAULT '{}',
   review_count integer NOT NULL DEFAULT 0,
   updated_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE(project_id, original_path)
 );
 
 ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS archive_path text NOT NULL DEFAULT '';
+ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS pipeline_version integer NOT NULL DEFAULT 0;
 ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS original_raw_path text NOT NULL DEFAULT '';
 ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS content_path text NOT NULL DEFAULT '';
 ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS original_sha256 text NOT NULL DEFAULT '';
+ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS generation_contract_sha256 text NOT NULL DEFAULT '';
+ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS new_page_budget integer NOT NULL DEFAULT 0;
+ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS new_page_count integer NOT NULL DEFAULT 0;
+ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS created_pages text[] NOT NULL DEFAULT '{}';
 ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS content_sha256 text NOT NULL DEFAULT '';
 
 CREATE INDEX IF NOT EXISTS source_manifest_sha_idx ON source_manifest(project_id, sha256);

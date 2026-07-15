@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/hejw/knowledge-core/internal/core"
 	"github.com/hejw/knowledge-core/internal/sourcearchive"
 )
 
@@ -54,6 +55,7 @@ func UploadSources(opts UploadSourcesOptions) (UploadSourcesResult, error) {
 		return UploadSourcesResult{}, err
 	}
 	result := UploadSourcesResult{}
+	var uploadedBytes int64
 	for _, file := range opts.Files {
 		relFile, err := cleanUploadPath(file.RelativePath, false)
 		if err != nil {
@@ -62,12 +64,13 @@ func UploadSources(opts UploadSourcesOptions) (UploadSourcesResult, error) {
 		if file.Reader == nil {
 			return UploadSourcesResult{}, fmt.Errorf("file %q reader is required", relFile)
 		}
+		stream := newAggregateBoundedReader(newBoundedSourceReader(file.Reader), &uploadedBytes, core.MaxUploadBytes, "upload")
 		archive, err := sourcearchive.ImportReader(sourcearchive.ImportOptions{
 			ProjectPath:      projectAbs,
 			Collection:       targetDir,
 			RelativePath:     relFile,
 			OriginalLocation: path.Join(targetDir, relFile),
-			Reader:           file.Reader,
+			Reader:           stream,
 		})
 		if err != nil {
 			return UploadSourcesResult{}, err

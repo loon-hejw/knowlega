@@ -40,6 +40,7 @@ type Server struct {
 	defaultAgent       string
 	bootstrap          *service.BootstrapTracker
 	graphManager       *service.GraphManager
+	queryRuntime       service.QueryRuntimeOptions
 }
 
 type ServerOptions struct {
@@ -61,6 +62,7 @@ type ServerOptions struct {
 	DefaultAgent       string
 	Bootstrap          *service.BootstrapTracker
 	GraphManager       *service.GraphManager
+	QueryRuntime       service.QueryRuntimeOptions
 }
 
 func NewServer() *Server {
@@ -88,6 +90,7 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 		defaultAgent:       opts.DefaultAgent,
 		bootstrap:          opts.Bootstrap,
 		graphManager:       opts.GraphManager,
+		queryRuntime:       opts.QueryRuntime,
 	}
 	s.routes()
 	if s.defaultProjectPath != "" {
@@ -545,7 +548,7 @@ func (s *Server) handleProjectGraphNode(w http.ResponseWriter, r *http.Request) 
 		if node.ID != id {
 			continue
 		}
-		var edges []service.WikiGraphAPIEdge
+		edges := []service.WikiGraphAPIEdge{}
 		for _, edge := range graph.Edges {
 			if edge.Source == id || edge.Target == id {
 				edges = append(edges, edge)
@@ -729,13 +732,12 @@ func (s *Server) handleResolveReviewsBulk(w http.ResponseWriter, r *http.Request
 	resolved := []core.ReviewItem{}
 	notFound := []string{}
 	for _, id := range req.IDs {
-		resolvedAt := time.Now().UTC()
-		item, err := wiki.UpdateReviewItemStatusWithAction(projectPath, projectID, id, status, action, resolvedAt)
+		items, err := service.UpdateReviewItemsStatus(projectPath, projectID, []string{id}, status, action)
 		if err != nil {
 			notFound = append(notFound, id)
 			continue
 		}
-		resolved = append(resolved, item)
+		resolved = append(resolved, items...)
 	}
 	if len(resolved) > 0 {
 		if err := s.syncWrittenWikiPages(r.Context(), projectPath, projectID, []string{"wiki/reviews.md"}); err != nil {
@@ -817,6 +819,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		QueryLogStore:     s.queryLogStore,
 		EmbeddingProvider: s.embeddingProvider,
 		Context:           r.Context(),
+		Runtime:           s.queryRuntime,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -901,7 +904,7 @@ func (s *Server) handleScanSources(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleUploadSources(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, 512<<20)
+	r.Body = http.MaxBytesReader(w, r.Body, core.MaxUploadBytes)
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -928,6 +931,10 @@ func (s *Server) handleUploadSources(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 	for _, header := range headers {
+		if header.Size > core.MaxSourceBytes {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Errorf("source %s exceeds maximum size of %d bytes", header.Filename, core.MaxSourceBytes))
+			return
+		}
 		file, err := header.Open()
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -999,6 +1006,18 @@ func (s *Server) handleRunQueue(w http.ResponseWriter, r *http.Request) {
 		KeepDone:      req.KeepDone,
 	})
 	if err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if _, err := compiler.ConvergeWikiArtifacts(projectPath); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if _, err := service.RepairKnownMentionLinks(projectPath); err != nil {
+		writeError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := wiki.RebuildIndex(projectPath); err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
@@ -1087,6 +1106,7 @@ func (s *Server) handleQueryPost(w http.ResponseWriter, r *http.Request) {
 		QueryLogStore:     s.queryLogStore,
 		EmbeddingProvider: s.embeddingProvider,
 		Context:           r.Context(),
+		Runtime:           s.queryRuntime,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -1199,6 +1219,7 @@ func (s *Server) handleAppendChatMessage(w http.ResponseWriter, r *http.Request)
 		QueryLogStore:     s.queryLogStore,
 		EmbeddingProvider: s.embeddingProvider,
 		Context:           r.Context(),
+		Runtime:           s.queryRuntime,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
@@ -1237,6 +1258,7 @@ func (s *Server) handleStartChatRun(w http.ResponseWriter, r *http.Request) {
 		GraphStore:        s.graphStore,
 		QueryLogStore:     s.queryLogStore,
 		EmbeddingProvider: s.embeddingProvider,
+		Runtime:           s.queryRuntime,
 		OnWriteback: func(ctx context.Context, writeback service.QueryWritebackResult) error {
 			return s.syncWrittenWikiPages(ctx, projectPath, projectID, aggregateWikiPaths(writeback.Path))
 		},
@@ -1376,13 +1398,9 @@ func (s *Server) handleResolveReview(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status := firstNonEmpty(req.Status, "resolved")
-	resolvedAt := time.Time{}
-	if status == "resolved" || status == "dismissed" {
-		resolvedAt = time.Now().UTC()
-	}
 	projectPath := s.projectPath(req.ProjectPath)
 	projectID := firstNonEmpty(req.ProjectID, s.defaultProjectID, "local")
-	item, err := wiki.UpdateReviewItemStatusWithAction(projectPath, projectID, req.ID, status, req.Action, resolvedAt)
+	items, err := service.UpdateReviewItemsStatus(projectPath, projectID, []string{req.ID}, status, req.Action)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -1391,7 +1409,7 @@ func (s *Server) handleResolveReview(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"review": item})
+	writeJSON(w, http.StatusOK, map[string]any{"review": items[0]})
 }
 
 type reviewActionRequest struct {
@@ -1730,7 +1748,7 @@ func batchWrittenWikiPaths(result compiler.BatchValidateResult) []string {
 }
 
 func aggregateWikiPaths(paths ...string) []string {
-	out := []string{"wiki/index.md", "wiki/log.md", "wiki/overview.md"}
+	out := []string{"wiki/index.md", "wiki/log.md", "wiki/overview.md", "wiki/reviews.md"}
 	for _, path := range paths {
 		if strings.TrimSpace(path) != "" {
 			out = append(out, filepath.ToSlash(path))

@@ -36,7 +36,7 @@ func InitProject(opts ProjectOptions) error {
 	}
 
 	files := map[string]string{
-		"purpose.md": fmt.Sprintf("# %s Purpose\n\nDefine the knowledge base goal, scope, questions, and evolving thesis here.\n", name),
+		"purpose.md": defaultPurpose(name),
 		"schema.md":  defaultSchema(),
 		"wiki/index.md": fmt.Sprintf(`# %s Index
 
@@ -59,6 +59,23 @@ func InitProject(opts ProjectOptions) error {
 		}
 	}
 	return nil
+}
+
+func defaultPurpose(name string) string {
+	return fmt.Sprintf(`# %s Purpose
+
+Maintain a durable, evidence-grounded wiki that compounds knowledge across immutable sources.
+
+## Generation Policy
+
+- Write page titles and prose in the primary language of the current source unless this purpose is explicitly customized otherwise.
+- Create exactly one source-summary for every source.
+- Prefer updating existing shared pages before creating new pages.
+- Create new pages only for durable entities, places, objects, concepts, or syntheses that are likely to remain useful across sources.
+- Keep minor or one-off names as plain text and record a review item when a durable page may be warranted later.
+- Preserve prior evidence, aliases, and source provenance when updating an existing page.
+- Do not invent facts or links that are unsupported by the supplied source and existing wiki evidence.
+`, name)
 }
 
 func defaultSchema() string {

@@ -61,6 +61,11 @@ type searxngResponse struct {
 }
 
 func RunReviewAction(opts ReviewActionOptions) (ReviewActionResult, error) {
+	release, err := acquireServiceProjectLock(opts.ProjectPath)
+	if err != nil {
+		return ReviewActionResult{}, err
+	}
+	defer release()
 	ctx := opts.Context
 	if ctx == nil {
 		ctx = context.Background()
@@ -89,6 +94,11 @@ func RunReviewAction(opts ReviewActionOptions) (ReviewActionResult, error) {
 }
 
 func SweepReviewItems(opts ReviewSweepOptions) (ReviewSweepResult, error) {
+	release, err := acquireServiceProjectLock(opts.ProjectPath)
+	if err != nil {
+		return ReviewSweepResult{}, err
+	}
+	defer release()
 	ctx := opts.Context
 	if ctx == nil {
 		ctx = context.Background()
@@ -132,6 +142,26 @@ func SweepReviewItems(opts ReviewSweepOptions) (ReviewSweepResult, error) {
 	return result, err
 }
 
+// UpdateReviewItemsStatus is the locked service boundary for callers that need
+// to update several durable review records without running a higher-level
+// review action. PostgreSQL remains derived from wiki/reviews.md.
+func UpdateReviewItemsStatus(projectPath, projectID string, ids []string, status, action string) ([]core.ReviewItem, error) {
+	release, err := acquireServiceProjectLock(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	updated := make([]core.ReviewItem, 0, len(ids))
+	for _, id := range ids {
+		item, err := wiki.UpdateReviewItemStatusWithAction(projectPath, projectID, id, status, action, time.Now().UTC())
+		if err != nil {
+			return nil, err
+		}
+		updated = append(updated, item)
+	}
+	return updated, nil
+}
+
 func runCreatePageReviewAction(_ context.Context, opts ReviewActionOptions, item core.ReviewItem) (ReviewActionResult, error) {
 	pageType := reviewPageType(item)
 	title := reviewPageTitle(item)
@@ -159,6 +189,9 @@ This page was created from review task %s.
 - Link related entity, concept, source, and synthesis pages.
 `, pageType, escapeYAML(title), item.SourcePath, title, item.ID, item.Description)
 	if err := wiki.WriteVersionedPage(opts.ProjectPath, rel, []byte(content), "review action: create-page"); err != nil {
+		return ReviewActionResult{}, err
+	}
+	if err := registerPageOwnership(opts.ProjectPath, rel, "review"); err != nil {
 		return ReviewActionResult{}, err
 	}
 	updated, err := wiki.UpdateReviewItemStatusWithAction(opts.ProjectPath, opts.ProjectID, item.ID, "resolved", "create-page", time.Now().UTC())
@@ -204,6 +237,9 @@ func runDeepResearchReviewAction(ctx context.Context, opts ReviewActionOptions, 
 	rel := filepath.ToSlash(filepath.Join("wiki", "syntheses", core.Slug("research-"+item.Title)+".md"))
 	content := researchSynthesisMarkdown(item, answer, results)
 	if err := wiki.WriteVersionedPage(opts.ProjectPath, rel, []byte(content), "review action: deep-research"); err != nil {
+		return ReviewActionResult{}, err
+	}
+	if err := registerPageOwnership(opts.ProjectPath, rel, "review"); err != nil {
 		return ReviewActionResult{}, err
 	}
 	updated, err := wiki.UpdateReviewItemStatusWithAction(opts.ProjectPath, opts.ProjectID, item.ID, "resolved", "deep-research", time.Now().UTC())

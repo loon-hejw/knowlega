@@ -167,6 +167,7 @@ func insertLine(lines []string, idx int, line string) []string {
 
 func parseReviewItemSection(projectID, dateText, reviewType, title string, lines []string) core.ReviewItem {
 	source := ""
+	var sources []string
 	status := "open"
 	resolvedAt := (*time.Time)(nil)
 	resolvedAction := ""
@@ -179,7 +180,13 @@ func parseReviewItemSection(projectID, dateText, reviewType, title string, lines
 		trimmed := strings.TrimSpace(line)
 		switch {
 		case strings.HasPrefix(trimmed, "- Source:"):
-			source = strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "- Source:")), "`")
+			value := strings.Trim(strings.TrimSpace(strings.TrimPrefix(trimmed, "- Source:")), "`")
+			if value != "" && !containsString(sources, value) {
+				sources = append(sources, value)
+				if source == "" {
+					source = value
+				}
+			}
 			inAffected = false
 			inDetail = false
 		case strings.HasPrefix(trimmed, "- Status:"):
@@ -221,8 +228,17 @@ func parseReviewItemSection(projectID, dateText, reviewType, title string, lines
 		createdAt = parsed
 	}
 	description := strings.TrimSpace(detail.String())
+	identityPage := ""
+	if len(affected) > 0 {
+		identityPage = affected[0]
+	}
 	return core.ReviewItem{
-		ID:             core.StableID(projectID, "review", reviewType, normalizeReviewTitle(title)),
+		// A resolved review and a later open review may intentionally reuse the
+		// same type/title. Include durable section anchors so PostgreSQL upserts
+		// cannot collapse distinct Markdown tasks and status updates cannot hit
+		// the wrong occurrence. Merge operations append sources/pages, preserving
+		// the first source and first affected page used here.
+		ID:             core.StableID(projectID, "review", reviewType, normalizeReviewTitle(title), dateText, source, identityPage),
 		ProjectID:      projectID,
 		Type:           reviewType,
 		Title:          title,
@@ -230,6 +246,7 @@ func parseReviewItemSection(projectID, dateText, reviewType, title string, lines
 		Severity:       "info",
 		Status:         status,
 		SourcePath:     source,
+		SourcePaths:    sources,
 		AffectedPages:  affected,
 		SearchQueries:  queries,
 		Options:        reviewOptions(reviewType),
@@ -237,6 +254,15 @@ func parseReviewItemSection(projectID, dateText, reviewType, title string, lines
 		CreatedAt:      createdAt,
 		ResolvedAt:     resolvedAt,
 	}
+}
+
+func containsString(values []string, value string) bool {
+	for _, candidate := range values {
+		if candidate == value {
+			return true
+		}
+	}
+	return false
 }
 
 func splitSearchQueries(value string) []string {

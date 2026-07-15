@@ -88,6 +88,11 @@ func MigrateSourceLayout(opts SourceLayoutMigrationOptions) (SourceLayoutMigrati
 	if !opts.Apply {
 		return PlanSourceLayoutMigration(opts.ProjectPath)
 	}
+	release, err := acquireServiceProjectLock(opts.ProjectPath)
+	if err != nil {
+		return SourceLayoutMigrationResult{}, err
+	}
+	defer release()
 	journal, err := loadSourceLayoutMigrationJournal(opts.ProjectPath)
 	if os.IsNotExist(err) || (err == nil && journal.Status == "complete") {
 		journal, err = buildSourceLayoutMigrationPlan(opts.ProjectPath)

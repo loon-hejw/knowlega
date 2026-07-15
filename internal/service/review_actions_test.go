@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	manifestfile "github.com/hejw/knowledge-core/internal/manifest"
 	"github.com/hejw/knowledge-core/internal/wiki"
 )
 
@@ -56,6 +57,13 @@ Create a durable concept page for Alpha.
 	}
 	if !strings.Contains(string(page), "Review Context") {
 		t.Fatalf("draft missing review context:\n%s", page)
+	}
+	manifest, err := manifestfile.Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner := manifest.PageOwners[result.WrittenPaths[0]]; owner.ManagedBy != "review" {
+		t.Fatalf("page owner=%+v", owner)
 	}
 }
 

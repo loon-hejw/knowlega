@@ -58,7 +58,8 @@ VALIDATE_OUT=/tmp/kbcore-xiyouji-validate.out
 run validate-llmwiki \
   --project "$ROOT" \
   --source tst/xiyouji-chapters \
-  --agent mock >"$VALIDATE_OUT"
+  --agent mock \
+  --db-dsn "" >"$VALIDATE_OUT"
 
 expect_line "$VALIDATE_OUT" "sources=100"
 expect_line "$VALIDATE_OUT" "files=300"
@@ -87,14 +88,15 @@ run code-import-graphify \
   --project "$ROOT" \
   --repo-id demo-repo \
   --repo-path /tmp/demo-repo \
-  --graph "$GRAPH_JSON" >"$CODE_IMPORT_OUT"
+  --graph "$GRAPH_JSON" \
+  --db-dsn "" >"$CODE_IMPORT_OUT"
 expect_line "$CODE_IMPORT_OUT" "snapshot=raw/code-graphs/demo-repo/graphify"
 expect_line "$CODE_IMPORT_OUT" "overview=wiki/code/demo-repo/overview.md"
 expect_line "$CODE_IMPORT_OUT" "nodes=2"
 expect_line "$CODE_IMPORT_OUT" "edges=1"
 
 HGS_OUT=/tmp/kbcore-xiyouji-query-huaguoshan.out
-run query --project "$ROOT" --q 花果山 --limit 5 --agent mock >"$HGS_OUT"
+run query --project "$ROOT" --q 花果山 --limit 5 --agent mock --db-dsn "" >"$HGS_OUT"
 expect_line "$HGS_OUT" "intent=answer_from_persistent_wiki"
 expect_line "$HGS_OUT" "mode=mock_tool_loop"
 expect_line "$HGS_OUT" "writeback=false"
@@ -103,7 +105,7 @@ grep -q 'action=final' "$HGS_OUT"
 assert_chapter_result "$HGS_OUT" "花果山"
 
 HSH_OUT=/tmp/kbcore-xiyouji-query-heishuihe.out
-run query --project "$ROOT" --q 黑水河 --limit 5 --agent mock >"$HSH_OUT"
+run query --project "$ROOT" --q 黑水河 --limit 5 --agent mock --db-dsn "" >"$HSH_OUT"
 expect_line "$HSH_OUT" "intent=answer_from_persistent_wiki"
 expect_line "$HSH_OUT" "mode=mock_tool_loop"
 expect_line "$HSH_OUT" "writeback=false"
@@ -114,7 +116,7 @@ grep -q 'action=final' "$HSH_OUT"
 assert_chapter_result "$HSH_OUT" "黑水河"
 
 GRAPH_QUERY_OUT=/tmp/kbcore-xiyouji-query-graph.out
-run query --project "$ROOT" --q "ValidateToken AuthService calls" --limit 5 --agent mock >"$GRAPH_QUERY_OUT"
+run query --project "$ROOT" --q "ValidateToken AuthService calls" --limit 5 --agent mock --db-dsn "" >"$GRAPH_QUERY_OUT"
 expect_line "$GRAPH_QUERY_OUT" "intent=answer_from_persistent_wiki"
 expect_line "$GRAPH_QUERY_OUT" "mode=mock_tool_loop"
 expect_line "$GRAPH_QUERY_OUT" "writeback=false"

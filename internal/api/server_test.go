@@ -354,6 +354,16 @@ func TestUploadSourcesEndpointWritesRawSourcesAndQueuesSupportedFiles(t *testing
 	}
 }
 
+func TestAggregateWikiPathsAlwaysIncludesDurableReviews(t *testing.T) {
+	paths := aggregateWikiPaths("wiki/entities/a.md")
+	for _, path := range paths {
+		if path == "wiki/reviews.md" {
+			return
+		}
+	}
+	t.Fatalf("paths=%v", paths)
+}
+
 func TestWorkspaceMaintainEndpointRunsLoop(t *testing.T) {
 	serverOptions := configureTestLLMProvider(t)
 	root := filepath.Join(t.TempDir(), "kb")

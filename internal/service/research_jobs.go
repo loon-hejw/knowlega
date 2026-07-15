@@ -196,7 +196,15 @@ func runResearchJobWork(ctx context.Context, req ResearchJobRequest, agent Query
 		return core.ReviewItem{}, nil, err
 	}
 	rel := filepath.ToSlash(filepath.Join("wiki", "syntheses", core.Slug("research-"+item.Title)+".md"))
+	release, err := acquireServiceProjectLock(req.ProjectPath)
+	if err != nil {
+		return core.ReviewItem{}, nil, err
+	}
+	defer release()
 	if err := wiki.WriteVersionedPage(req.ProjectPath, rel, []byte(researchSynthesisMarkdown(item, answer, results)), "research job"); err != nil {
+		return core.ReviewItem{}, nil, err
+	}
+	if err := registerPageOwnership(req.ProjectPath, rel, "query"); err != nil {
 		return core.ReviewItem{}, nil, err
 	}
 	return core.ReviewItem{}, []string{rel}, nil

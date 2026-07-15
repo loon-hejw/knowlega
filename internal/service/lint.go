@@ -21,6 +21,15 @@ type LintIssue struct {
 
 var wikiLinkPattern = regexp.MustCompile(`\[\[([^\]|]+)(?:\|[^\]]+)?\]\]`)
 
+var mentionProtectedPatterns = []*regexp.Regexp{
+	regexp.MustCompile("(?s)```.*?```"),
+	regexp.MustCompile(`(?s)~~~.*?~~~`),
+	regexp.MustCompile("`[^`\\n]*`"),
+	regexp.MustCompile(`\[\[[^\]]+\]\]`),
+	regexp.MustCompile(`!?\[[^\]\n]*\]\([^\)\n]+\)`),
+	regexp.MustCompile(`(?m)^#{1,6}[ \t].*$`),
+}
+
 func LintWiki(projectPath string) ([]LintIssue, error) {
 	pages, err := loadWikiPages(projectPath)
 	if err != nil {
@@ -86,6 +95,9 @@ func wikiLinkTargets(pages map[string]wikiPageContent) map[string]string {
 	for _, page := range pages {
 		addWikiLinkTarget(targets, page.RelPath, page.RelPath, 1000)
 		addWikiLinkTarget(targets, strings.TrimSuffix(page.RelPath, ".md"), page.RelPath, 1000)
+		wikiRelative := strings.TrimPrefix(page.RelPath, "wiki/")
+		addWikiLinkTarget(targets, wikiRelative, page.RelPath, 1000)
+		addWikiLinkTarget(targets, strings.TrimSuffix(wikiRelative, ".md"), page.RelPath, 1000)
 		title := titleFromMarkdown(page.Content, page.ID)
 		priority := pageLinkPriority(page)
 		addWikiLinkTarget(targets, page.ID, page.RelPath, priority)
@@ -150,22 +162,34 @@ type knownMention struct {
 	LinkID    string
 	Title     string
 	Term      string
+	Alias     bool
 }
 
 func knownPageMentions(pages map[string]wikiPageContent) []knownMention {
+	type mentionCandidate struct {
+		knownMention
+		termKey string
+	}
 	seen := map[string]bool{}
+	termTargets := map[string]map[string]bool{}
 	linkTargets := wikiLinkTargets(pages)
-	var mentions []knownMention
+	var candidates []mentionCandidate
 	for _, page := range pages {
 		if isSpecialWikiID(page.ID) || wikiPageType(page.Content) == "source-summary" {
 			continue
 		}
 		title := titleFromMarkdown(page.Content, page.ID)
-		for _, term := range append([]string{title}, aliasesFromMarkdown(page.Content)...) {
+		terms := append([]string{title}, aliasesFromMarkdown(page.Content)...)
+		for index, term := range terms {
 			term = strings.TrimSpace(term)
 			if !isUsefulMentionTerm(term) {
 				continue
 			}
+			termKey := strings.ToLower(term)
+			if termTargets[termKey] == nil {
+				termTargets[termKey] = map[string]bool{}
+			}
+			termTargets[termKey][page.RelPath] = true
 			targetKey := page.RelPath
 			if canonical, ok := linkTargets[normalizeLinkID(term)]; ok {
 				targetKey = canonical
@@ -178,13 +202,60 @@ func knownPageMentions(pages map[string]wikiPageContent) []knownMention {
 				continue
 			}
 			seen[key] = true
-			mentions = append(mentions, knownMention{
-				TargetKey: targetKey,
-				LinkID:    page.ID,
-				Title:     title,
-				Term:      strings.ToLower(term),
+			candidates = append(candidates, mentionCandidate{
+				knownMention: knownMention{
+					TargetKey: targetKey,
+					LinkID:    page.ID,
+					Title:     title,
+					Term:      termKey,
+					Alias:     index > 0,
+				},
+				termKey: termKey,
 			})
 		}
+	}
+	// Aggregate navigation/operations pages are rebuilt after link repair and
+	// are intentionally exempt from missing-link lint. Counting their transient
+	// contents here made an alias cross the frequency threshold before rebuild
+	// and become repairable only afterwards, leaving a clean repair pass followed
+	// by a failing final quality gate.
+	bodies := make([]string, 0, len(pages))
+	for _, page := range pages {
+		if isSpecialWikiID(page.ID) {
+			continue
+		}
+		bodies = append(bodies, strings.ToLower(mentionSearchBody(markdownBody(page.Content))))
+	}
+	frequencyLimit := len(bodies) / 50
+	if frequencyLimit < 8 {
+		frequencyLimit = 8
+	}
+	frequentAliases := map[string]bool{}
+	frequencyChecked := map[string]bool{}
+	var mentions []knownMention
+	for _, candidate := range candidates {
+		if len(termTargets[candidate.termKey]) != 1 {
+			continue
+		}
+		if candidate.Alias {
+			if !frequencyChecked[candidate.termKey] {
+				frequencyChecked[candidate.termKey] = true
+				matches := 0
+				for _, body := range bodies {
+					if containsMentionTerm(body, candidate.Term) {
+						matches++
+						if matches > frequencyLimit {
+							frequentAliases[candidate.termKey] = true
+							break
+						}
+					}
+				}
+			}
+			if frequentAliases[candidate.termKey] {
+				continue
+			}
+		}
+		mentions = append(mentions, candidate.knownMention)
 	}
 	sort.Slice(mentions, func(i, j int) bool {
 		if len([]rune(mentions[i].Term)) == len([]rune(mentions[j].Term)) {
@@ -196,24 +267,47 @@ func knownPageMentions(pages map[string]wikiPageContent) []knownMention {
 }
 
 func missingLinkIssues(page wikiPageContent, linkedTargets map[string]bool, mentions []knownMention) []LintIssue {
-	body := strings.ToLower(markdownBody(page.Content))
-	reportedTargets := map[string]bool{}
+	missing := missingLinkMentions(page, linkedTargets, mentions)
 	var issues []LintIssue
+	for _, mention := range missing {
+		issues = append(issues, LintIssue{
+			Type: "missing-link",
+			Path: page.RelPath,
+			Detail: fmt.Sprintf("Known page [[%s|%s]] is mentioned as %q but not linked.",
+				mention.LinkID, mention.Title, mention.Term),
+		})
+	}
+	return issues
+}
+
+func missingLinkMentions(page wikiPageContent, linkedTargets map[string]bool, mentions []knownMention) []knownMention {
+	body := strings.ToLower(mentionSearchBody(markdownBody(page.Content)))
+	reportedTargets := map[string]bool{}
+	var missing []knownMention
 	for _, mention := range mentions {
 		if mention.TargetKey == page.RelPath || linkedTargets[mention.TargetKey] || reportedTargets[mention.TargetKey] {
 			continue
 		}
 		if containsMentionTerm(body, mention.Term) {
-			issues = append(issues, LintIssue{
-				Type: "missing-link",
-				Path: page.RelPath,
-				Detail: fmt.Sprintf("Known page [[%s|%s]] is mentioned as %q but not linked.",
-					mention.LinkID, mention.Title, mention.Term),
-			})
+			missing = append(missing, mention)
 			reportedTargets[mention.TargetKey] = true
 		}
 	}
-	return issues
+	return missing
+}
+
+func mentionSearchBody(body string) string {
+	masked := []byte(body)
+	for _, pattern := range mentionProtectedPatterns {
+		for _, match := range pattern.FindAllStringIndex(body, -1) {
+			for index := match[0]; index < match[1]; index++ {
+				if masked[index] != '\n' && masked[index] != '\r' {
+					masked[index] = ' '
+				}
+			}
+		}
+	}
+	return string(masked)
 }
 
 func containsMentionTerm(body, term string) bool {

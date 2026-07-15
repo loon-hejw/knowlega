@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hejw/knowledge-core/internal/core"
 	"github.com/hejw/knowledge-core/internal/llmretry"
 )
 
@@ -478,5 +479,45 @@ func TestOpenAICompatibleQueryAgentBudgetsLargeSynthesisPrompt(t *testing.T) {
 	}
 	if answer != "bounded answer" {
 		t.Fatalf("answer=%q", answer)
+	}
+}
+
+func TestBudgetRecentReadDocumentsKeepsNewestEvidence(t *testing.T) {
+	docs := []QueryReadDocument{
+		{Path: "wiki/old.md", Content: strings.Repeat("旧", 6000)},
+		{Path: "wiki/middle.md", Content: strings.Repeat("中", 6000)},
+		{Path: "wiki/new.md", Content: strings.Repeat("新", 6000)},
+	}
+	bounded := budgetRecentReadDocuments(docs, 7000)
+	if len(bounded) != 2 || bounded[len(bounded)-1].Path != "wiki/new.md" {
+		t.Fatalf("newest evidence was not retained: %+v", bounded)
+	}
+	for _, doc := range bounded {
+		if doc.Path == "wiki/old.md" {
+			t.Fatalf("oldest evidence displaced newer evidence: %+v", bounded)
+		}
+	}
+}
+
+func TestBudgetQueryActionInputPinsCandidateAndTopRecallEvidence(t *testing.T) {
+	docs := []QueryReadDocument{
+		{Path: "wiki/sources/chapter-100.md", Content: strings.Repeat("终", 6000)},
+		{Path: "wiki/entities/唐太宗.md", Title: "唐太宗", Content: strings.Repeat("唐", 6000)},
+		{Path: "wiki/unrelated-old.md", Content: strings.Repeat("旧", 6000)},
+		{Path: "wiki/unrelated-new.md", Content: strings.Repeat("新", 6000)},
+	}
+	input := budgetQueryActionInput(QueryActionInput{
+		Docs:    docs,
+		Results: []core.QueryResult{{Path: "wiki/sources/chapter-100.md"}},
+		Trace: []core.QueryTraceStep{{Action: core.QueryAction{
+			Action: "final", Candidate: "唐太宗",
+		}}},
+	}, 7000)
+	paths := map[string]bool{}
+	for _, doc := range input.Docs {
+		paths[doc.Path] = true
+	}
+	if !paths["wiki/entities/唐太宗.md"] || !paths["wiki/sources/chapter-100.md"] {
+		t.Fatalf("candidate evidence was displaced by recency: %+v", input.Docs)
 	}
 }

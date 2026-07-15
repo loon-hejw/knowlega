@@ -22,6 +22,31 @@ export interface BootstrapStatus {
   current_source?: string;
   current_source_num: number;
   completed_sources: number;
+  restored_sources?: number;
+  completed_this_run?: number;
+  pending_sources?: number;
+  active_sources?: Array<{
+    path: string;
+    number: number;
+    phase: string;
+    attempt: number;
+  }>;
+  requeued_sources?: number;
+  conflict_requeues?: number;
+  failure_requeues?: number;
+  impact_requeues?: number;
+  requeue_rate?: number;
+  conflict_rate?: number;
+  impact_checks?: number;
+  queued_conflict_sources?: number;
+  llm_calls?: number;
+  llm_in_flight?: number;
+  oldest_llm_call_ms?: number;
+  llm_failures?: number;
+  llm_duration_ms?: number;
+  average_source_duration_ms?: number;
+  max_source_duration_ms?: number;
+  source_durations_ms?: Record<string, number>;
   total_sources: number;
   files: number;
   reviews: number;
@@ -416,9 +441,48 @@ export interface QuerySearch {
   rationale: string;
 }
 
+export interface QueryRequirement {
+  id: string;
+  text: string;
+  kind?: string;
+}
+
+export interface QueryHypothesis {
+  candidate: string;
+  rationale?: string;
+  discriminators?: string[];
+  suggested_reads?: string[];
+  evidence_checks?: QueryEvidenceCheck[];
+  coverage?: number;
+}
+
+export interface QueryEvidenceCheck {
+  requirement_id: string;
+  status: "supported" | "contradicted" | "unknown" | "not_found_in_corpus" | string;
+  evidence_paths?: string[];
+  explanation?: string;
+}
+
+export interface QueryVerification {
+  pass: number;
+  kind: string;
+  accepted: boolean;
+  summary?: string;
+  unresolved?: string[];
+  contradictions?: string[];
+  next_queries?: string[];
+}
+
 export interface QueryPlan {
   question: string;
+  resolved_question?: string;
   intent: string;
+  reasoning_mode?: string;
+  requirements?: QueryRequirement[];
+  hypotheses?: QueryHypothesis[];
+  require_all_requirements?: boolean;
+  require_verification?: boolean;
+  verification_passes?: number;
   read_first: string[] | null;
   searches: QuerySearch[] | null;
   candidate_limit: number;
@@ -434,6 +498,8 @@ export interface QueryAction {
   title?: string;
   answer?: string;
   rationale?: string;
+  candidate?: string;
+  evidence_checks?: QueryEvidenceCheck[];
 }
 
 export interface QueryTraceStep {
@@ -464,6 +530,8 @@ export interface QueryAnswer {
   suggested_writeback_title?: string;
   citations: QueryCitation[] | null;
   trace?: QueryTraceStep[];
+  verification?: QueryVerification[];
+  incomplete_reason?: string;
   notes: string[] | null;
 }
 

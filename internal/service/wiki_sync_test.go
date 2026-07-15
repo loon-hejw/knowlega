@@ -461,7 +461,12 @@ func TestSyncWikiPagesToStoreSyncsSourceManifestAndPrunesStaleEntries(t *testing
       "title": "OAuth Notes",
       "files": ["wiki/concepts/oauth.md"],
       "review_count": 2,
-      "updated_at": "2026-07-02T10:00:00Z"
+      "updated_at": "2026-07-02T10:00:00Z",
+      "versions": [{
+        "sha256": "older123",
+        "raw_path": "raw/sources/older-oauth-notes.md",
+        "updated_at": "2026-07-01T10:00:00Z"
+      }]
     }
   }
 }
@@ -479,7 +484,7 @@ func TestSyncWikiPagesToStoreSyncsSourceManifestAndPrunesStaleEntries(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.SourceManifestEntries != 1 || result.Sources != 1 || len(store.sourceManifestEntries) != 1 || len(store.sources) != 1 {
+	if result.SourceManifestEntries != 1 || result.Sources != 2 || len(store.sourceManifestEntries) != 1 || len(store.sources) != 2 {
 		t.Fatalf("expected one source manifest entry, result=%+v entries=%+v", result, store.sourceManifestEntries)
 	}
 	entry := store.sourceManifestEntries[0]
@@ -499,8 +504,15 @@ func TestSyncWikiPagesToStoreSyncsSourceManifestAndPrunesStaleEntries(t *testing
 		t.Fatalf("expected source manifest pruning keep ids, got %+v", store.deletedSourceManifestKeepIDs)
 	}
 	source := store.sources[0]
-	if source.ProjectID != "project-1" || source.Path != entry.RawPath || source.SHA256 != entry.SHA256 || !source.Immutable {
+	if source.ProjectID != "project-1" || !source.Immutable {
 		t.Fatalf("unexpected source row: %+v", source)
+	}
+	paths := map[string]string{}
+	for _, item := range store.sources {
+		paths[item.Path] = item.SHA256
+	}
+	if paths[entry.RawPath] != entry.SHA256 || paths["raw/sources/older-oauth-notes.md"] != "older123" {
+		t.Fatalf("source versions=%+v", store.sources)
 	}
 	if store.existingSources["stale-source-row"] {
 		t.Fatalf("expected stale source row to be pruned, existing=%+v", store.existingSources)

@@ -32,6 +32,10 @@ func (p *flakyBootstrapProvider) Generate(analysis string, input compiler.Analys
 	return (compiler.MockProvider{}).Generate(analysis, input)
 }
 
+func (p *flakyBootstrapProvider) SynthesizeOverview(input compiler.OverviewInput) (string, error) {
+	return (compiler.MockProvider{}).SynthesizeOverview(input)
+}
+
 func TestUsageDocumentsLLMAgentOnly(t *testing.T) {
 	output := captureStdout(t, usage)
 	for _, want := range []string{
@@ -98,7 +102,19 @@ func TestExtractConfigFlagSupportsGlobalPositions(t *testing.T) {
 	}
 }
 
-func TestRunServeBootstrapRetriesAndResumes(t *testing.T) {
+func TestConfiguredLLMConcurrencyCanDifferFromTaskConcurrency(t *testing.T) {
+	cfg := config.Defaults()
+	cfg.Project.Bootstrap.Concurrency = 4
+	if got := configuredLLMConcurrency(cfg); got != 4 {
+		t.Fatalf("inherited concurrency=%d", got)
+	}
+	cfg.LLM.Concurrency = 2
+	if got := configuredLLMConcurrency(cfg); got != 2 {
+		t.Fatalf("configured concurrency=%d", got)
+	}
+}
+
+func TestRunServeBootstrapRetriesSourceInsideSingleAttempt(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "kb")
 	source := filepath.Join(t.TempDir(), "source.md")
 	if err := os.WriteFile(source, []byte("# Source\n\n西游记来源"), 0o644); err != nil {
@@ -116,8 +132,42 @@ func TestRunServeBootstrapRetriesAndResumes(t *testing.T) {
 		Config: cfg, ProjectPath: root, Provider: provider, Tracker: tracker,
 	})
 	status := tracker.Snapshot()
-	if status.Status != "succeeded" || status.Attempt != 2 || provider.analyzeCalls != 2 {
+	if status.Status != "succeeded" || status.Attempt != 1 || provider.analyzeCalls != 2 {
 		t.Fatalf("status=%+v analyze_calls=%d", status, provider.analyzeCalls)
+	}
+}
+
+type exhaustedBootstrapProvider struct{ calls int }
+
+func (p *exhaustedBootstrapProvider) Analyze(compiler.AnalysisInput) (string, error) {
+	p.calls++
+	return "", errors.New("provider unavailable")
+}
+
+func (p *exhaustedBootstrapProvider) Generate(string, compiler.AnalysisInput) (string, error) {
+	p.calls++
+	return "", errors.New("provider unavailable")
+}
+
+func TestRunServeBootstrapStopsWhenSourceAttemptsExhausted(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	source := filepath.Join(t.TempDir(), "source.md")
+	if err := os.WriteFile(source, []byte("# Source\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Defaults()
+	cfg.Project.Name = "demo"
+	cfg.Project.Path = root
+	cfg.Project.Bootstrap.Source = source
+	cfg.Project.Bootstrap.MaxTaskAttempts = 1
+	tracker := service.NewBootstrapTracker(root, 1)
+	provider := &exhaustedBootstrapProvider{}
+	runServeBootstrap(context.Background(), serveBootstrapOptions{
+		Config: cfg, ProjectPath: root, Provider: provider, Tracker: tracker,
+	})
+	status := tracker.Snapshot()
+	if status.Status != "failed" || status.Attempt != 1 || provider.calls != 1 || !strings.Contains(status.Error, "failed after 1 attempts") {
+		t.Fatalf("status=%+v calls=%d", status, provider.calls)
 	}
 }
 
@@ -145,4 +195,14 @@ func captureStdout(t *testing.T, fn func()) string {
 		t.Fatal(err)
 	}
 	return buf.String()
+}
+
+func TestAggregateWikiPathsAlwaysIncludesDurableReviews(t *testing.T) {
+	paths := aggregateWikiPaths("wiki/entities/a.md")
+	for _, path := range paths {
+		if path == "wiki/reviews.md" {
+			return
+		}
+	}
+	t.Fatalf("paths=%v", paths)
 }

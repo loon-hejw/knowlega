@@ -126,7 +126,7 @@ func TestOpenAICompatibleWikiReviewAgentBudgetsLargeContext(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatal(err)
 		}
-		if request.MaxTokens != 321 {
+		if request.MaxTokens != 2048 {
 			t.Fatalf("max_tokens=%d", request.MaxTokens)
 		}
 		if len(request.Messages) < 2 {
@@ -166,7 +166,7 @@ func TestOpenAICompatibleWikiReviewAgentBudgetsLargeContext(t *testing.T) {
 		Model:           "test-model",
 		Client:          server.Client(),
 		MaxInputChars:   5000,
-		MaxOutputTokens: 321,
+		MaxOutputTokens: 8192,
 	}
 	issues, err := agent.ReviewWiki(WikiReviewInput{
 		Purpose:  strings.Repeat("purpose ", 200),

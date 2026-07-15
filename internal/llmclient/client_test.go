@@ -6,13 +6,51 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (fn roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return fn(req)
+}
+
+func TestGlobalConcurrencyLimitsIndependentClients(t *testing.T) {
+	SetGlobalConcurrency(2)
+	defer SetGlobalConcurrency(4)
+	block := make(chan struct{})
+	var active atomic.Int32
+	var maximum atomic.Int32
+	transport := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		current := active.Add(1)
+		for {
+			seen := maximum.Load()
+			if current <= seen || maximum.CompareAndSwap(seen, current) {
+				break
+			}
+		}
+		<-block
+		active.Add(-1)
+		return jsonResponse(http.StatusOK, `{"choices":[{"message":{"content":"ok"}}]}`), nil
+	})
+	client := Client{BaseURL: "https://models.example/v1", APIKey: "key", Model: "model", HTTPClient: &http.Client{Transport: transport}}
+	var wg sync.WaitGroup
+	for index := 0; index < 4; index++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _, _ = client.Chat(context.Background(), ChatRequest{MaxTokens: 1})
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := maximum.Load(); got != 2 {
+		t.Fatalf("global max=%d want 2", got)
+	}
+	close(block)
+	wg.Wait()
 }
 
 func TestClientUsesOpenAIChatCompletionsProtocol(t *testing.T) {
@@ -62,6 +100,19 @@ func TestClientUsesOpenAIChatCompletionsProtocol(t *testing.T) {
 	thinking := requestBody["chat_template_kwargs"].(map[string]any)
 	if thinking["enable_thinking"] != false {
 		t.Fatalf("thinking=%+v", thinking)
+	}
+}
+
+func TestClientRetriesCodexAccountModelRoutingResponse(t *testing.T) {
+	client := Client{
+		BaseURL: "https://models.example/v1", APIKey: "key", Model: "gpt-5.4",
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusBadRequest, `{"error":"The 'gpt-5.4' model is not supported when using Codex with a ChatGPT account."}`), nil
+		})},
+	}
+	_, retryable, err := client.Chat(context.Background(), ChatRequest{MaxTokens: 1})
+	if err == nil || !retryable {
+		t.Fatalf("err=%v retryable=%v; account routing rejection must be retryable", err, retryable)
 	}
 }
 

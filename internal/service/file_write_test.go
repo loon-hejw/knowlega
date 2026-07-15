@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	manifestfile "github.com/hejw/knowledge-core/internal/manifest"
 	"github.com/hejw/knowledge-core/internal/wiki"
 )
 
@@ -36,6 +37,13 @@ func TestWriteProjectFileContentArchivesWikiEdits(t *testing.T) {
 	}
 	if len(entries) != 1 {
 		t.Fatalf("versions=%d", len(entries))
+	}
+	manifest, err := manifestfile.Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner := manifest.PageOwners["wiki/concepts/alpha.md"]; owner.ManagedBy != "manual" {
+		t.Fatalf("page owner=%+v", owner)
 	}
 }
 

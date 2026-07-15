@@ -43,6 +43,7 @@ type Config struct {
 	Server    ServerConfig    `yaml:"server"`
 	Research  ResearchConfig  `yaml:"research"`
 	Graph     GraphConfig     `yaml:"graph"`
+	Query     QueryConfig     `yaml:"query"`
 
 	Path string `yaml:"-"`
 }
@@ -54,12 +55,17 @@ type ProjectConfig struct {
 }
 
 type BootstrapConfig struct {
-	Source            string   `yaml:"source"`
-	Agent             string   `yaml:"agent"`
-	ReuseExisting     bool     `yaml:"reuse_existing"`
-	RetryInitialDelay Duration `yaml:"retry_initial_delay"`
-	RetryMaxDelay     Duration `yaml:"retry_max_delay"`
-	Concurrency       int      `yaml:"concurrency"`
+	Source               string   `yaml:"source"`
+	Agent                string   `yaml:"agent"`
+	ReuseExisting        bool     `yaml:"reuse_existing"`
+	RetryInitialDelay    Duration `yaml:"retry_initial_delay"`
+	RetryMaxDelay        Duration `yaml:"retry_max_delay"`
+	Concurrency          int      `yaml:"concurrency"`
+	MaxTaskAttempts      int      `yaml:"max_task_attempts"`
+	MaxConflictAttempts  int      `yaml:"max_conflict_attempts"`
+	MaxImpactAttempts    int      `yaml:"max_impact_attempts"`
+	MaxFilesPerTask      int      `yaml:"max_files_per_task"`
+	MaxNewPagesPerSource int      `yaml:"max_new_pages_per_source"`
 }
 
 type LLMConfig struct {
@@ -70,6 +76,8 @@ type LLMConfig struct {
 	UserAgent        string   `yaml:"user_agent"`
 	AnthropicVersion string   `yaml:"anthropic_version"`
 	Timeout          Duration `yaml:"timeout"`
+	OperationTimeout Duration `yaml:"operation_timeout"`
+	Concurrency      int      `yaml:"concurrency"`
 	Retries          int      `yaml:"retries"`
 	RetryBaseDelay   Duration `yaml:"retry_base_delay"`
 	RetryMaxDelay    Duration `yaml:"retry_max_delay"`
@@ -106,6 +114,14 @@ type ResearchConfig struct {
 	Timeout    Duration `yaml:"timeout"`
 }
 
+type QueryConfig struct {
+	InitialActionBudget int      `yaml:"initial_action_budget"`
+	MaxActionBudget     int      `yaml:"max_action_budget"`
+	VerificationPasses  int      `yaml:"verification_passes"`
+	StagnationRounds    int      `yaml:"stagnation_rounds"`
+	TotalTimeout        Duration `yaml:"total_timeout"`
+}
+
 type GraphConfig struct {
 	Enabled            bool                 `yaml:"enabled"`
 	Worker             bool                 `yaml:"worker"`
@@ -139,9 +155,14 @@ func Defaults() Config {
 	return Config{
 		Project: ProjectConfig{Bootstrap: BootstrapConfig{
 			Agent: "llm", ReuseExisting: true,
-			RetryInitialDelay: Duration{15 * time.Second},
-			RetryMaxDelay:     Duration{5 * time.Minute},
-			Concurrency:       4,
+			RetryInitialDelay:    Duration{15 * time.Second},
+			RetryMaxDelay:        Duration{5 * time.Minute},
+			Concurrency:          4,
+			MaxTaskAttempts:      4,
+			MaxConflictAttempts:  8,
+			MaxImpactAttempts:    2,
+			MaxFilesPerTask:      12,
+			MaxNewPagesPerSource: 3,
 		}},
 		LLM: LLMConfig{
 			Protocol:         "openai",
@@ -149,6 +170,7 @@ func Defaults() Config {
 			UserAgent:        "knowledge-core/0.1",
 			AnthropicVersion: "2023-06-01",
 			Timeout:          Duration{180 * time.Second},
+			OperationTimeout: Duration{180 * time.Second},
 			Retries:          2,
 			RetryBaseDelay:   Duration{800 * time.Millisecond},
 			RetryMaxDelay:    Duration{5 * time.Second},
@@ -169,6 +191,13 @@ func Defaults() Config {
 		Research: ResearchConfig{
 			MaxResults: 10,
 			Timeout:    Duration{60 * time.Second},
+		},
+		Query: QueryConfig{
+			InitialActionBudget: 8,
+			MaxActionBudget:     32,
+			VerificationPasses:  2,
+			StagnationRounds:    2,
+			TotalTimeout:        Duration{20 * time.Minute},
 		},
 		Graph: GraphConfig{MaxParallelJobs: 2},
 	}
@@ -203,6 +232,20 @@ func Load(path string) (Config, error) {
 			return Config{}, fmt.Errorf("decode config %s: multiple YAML documents are not allowed", absPath)
 		}
 		return Config{}, fmt.Errorf("decode config %s: %w", absPath, err)
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return Config{}, fmt.Errorf("rewind config %s: %w", absPath, err)
+	}
+	var explicit struct {
+		LLM struct {
+			OperationTimeout *Duration `yaml:"operation_timeout"`
+		} `yaml:"llm"`
+	}
+	if err := yaml.NewDecoder(file).Decode(&explicit); err != nil {
+		return Config{}, fmt.Errorf("inspect config %s: %w", absPath, err)
+	}
+	if explicit.LLM.OperationTimeout == nil {
+		cfg.LLM.OperationTimeout = cfg.LLM.Timeout
 	}
 	cfg.Path = absPath
 	cfg.normalize()
@@ -315,6 +358,21 @@ func (c Config) Validate() error {
 	if c.Project.Bootstrap.RetryMaxDelay.Duration < c.Project.Bootstrap.RetryInitialDelay.Duration {
 		return fmt.Errorf("project.bootstrap.retry_max_delay must be greater than or equal to retry_initial_delay")
 	}
+	if c.Project.Bootstrap.MaxTaskAttempts < 0 {
+		return fmt.Errorf("project.bootstrap.max_task_attempts must be non-negative")
+	}
+	if c.Project.Bootstrap.MaxConflictAttempts <= 0 {
+		return fmt.Errorf("project.bootstrap.max_conflict_attempts must be positive")
+	}
+	if c.Project.Bootstrap.MaxImpactAttempts < 0 {
+		return fmt.Errorf("project.bootstrap.max_impact_attempts must be non-negative")
+	}
+	if c.Project.Bootstrap.MaxFilesPerTask <= 0 {
+		return fmt.Errorf("project.bootstrap.max_files_per_task must be positive")
+	}
+	if c.Project.Bootstrap.MaxNewPagesPerSource < 0 {
+		return fmt.Errorf("project.bootstrap.max_new_pages_per_source must be non-negative")
+	}
 	if c.Server.Agent != "llm" {
 		return fmt.Errorf("server.agent must be llm")
 	}
@@ -330,6 +388,9 @@ func (c Config) Validate() error {
 	if err := validateHTTPURL("llm.base_url", c.LLM.BaseURL, true); err != nil {
 		return err
 	}
+	if c.LLM.Concurrency < 0 {
+		return fmt.Errorf("llm.concurrency must be non-negative")
+	}
 	if c.LLM.Retries < 0 {
 		return fmt.Errorf("llm.retries must be non-negative")
 	}
@@ -342,7 +403,7 @@ func (c Config) Validate() error {
 	if c.LLM.MaxOutputTokens > 131072 {
 		return fmt.Errorf("llm.max_output_tokens must not exceed 131072")
 	}
-	if c.LLM.Timeout.Duration <= 0 || c.LLM.RetryBaseDelay.Duration <= 0 || c.LLM.RetryMaxDelay.Duration <= 0 {
+	if c.LLM.Timeout.Duration <= 0 || c.LLM.OperationTimeout.Duration <= 0 || c.LLM.RetryBaseDelay.Duration <= 0 || c.LLM.RetryMaxDelay.Duration <= 0 {
 		return fmt.Errorf("llm durations must be positive")
 	}
 	if c.LLM.RetryMaxDelay.Duration < c.LLM.RetryBaseDelay.Duration {
@@ -373,6 +434,15 @@ func (c Config) Validate() error {
 	}
 	if c.Research.MaxResults <= 0 || c.Research.Timeout.Duration <= 0 {
 		return fmt.Errorf("research max_results and timeout must be positive")
+	}
+	if c.Query.InitialActionBudget <= 0 || c.Query.MaxActionBudget < c.Query.InitialActionBudget {
+		return fmt.Errorf("query action budgets must be positive and max_action_budget must be greater than or equal to initial_action_budget")
+	}
+	if c.Query.VerificationPasses < 0 || c.Query.VerificationPasses > 2 {
+		return fmt.Errorf("query.verification_passes must be between 0 and 2")
+	}
+	if c.Query.StagnationRounds <= 0 || c.Query.TotalTimeout.Duration <= 0 {
+		return fmt.Errorf("query stagnation_rounds and total_timeout must be positive")
 	}
 	return nil
 }

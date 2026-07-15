@@ -73,7 +73,7 @@ MD
 run init --path "$ROOT" --name llmwiki-acceptance >/tmp/kbcore-llmwiki-init.out
 
 VALIDATE_OUT=/tmp/kbcore-llmwiki-validate.out
-run validate-llmwiki --project "$ROOT" --source "$SOURCES" --agent llm >"$VALIDATE_OUT"
+run validate-llmwiki --project "$ROOT" --source "$SOURCES" --agent llm --db-dsn "" >"$VALIDATE_OUT"
 
 require_grep '^sources=3$' "$VALIDATE_OUT"
 require_grep '^file=wiki/' "$VALIDATE_OUT"

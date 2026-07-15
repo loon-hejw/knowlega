@@ -3,7 +3,6 @@ package service
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	manifestfile "github.com/hejw/knowledge-core/internal/manifest"
 	"github.com/hejw/knowledge-core/internal/sourcearchive"
 	"github.com/hejw/knowledge-core/internal/wiki"
 )
@@ -46,6 +46,11 @@ func DeleteSource(opts DeleteSourceOptions) (DeleteSourceResult, error) {
 	if strings.TrimSpace(opts.SourcePath) == "" {
 		return DeleteSourceResult{}, fmt.Errorf("source path is required")
 	}
+	release, err := acquireServiceProjectLock(opts.ProjectPath)
+	if err != nil {
+		return DeleteSourceResult{}, err
+	}
+	defer release()
 	manifest, err := loadSourceManifestFile(opts.ProjectPath)
 	if err != nil {
 		return DeleteSourceResult{}, err
@@ -92,8 +97,10 @@ func DeleteSource(opts DeleteSourceOptions) (DeleteSourceResult, error) {
 			continue
 		}
 		if page.UpdateSources {
-			if err := removeSourceFromWikiPage(opts.ProjectPath, page.Path, result.RawPath); err != nil {
-				return DeleteSourceResult{}, err
+			for _, rawPath := range page.RemoveSources {
+				if err := removeSourceFromWikiPage(opts.ProjectPath, page.Path, rawPath); err != nil {
+					return DeleteSourceResult{}, err
+				}
 			}
 		}
 	}
@@ -110,6 +117,9 @@ func DeleteSource(opts DeleteSourceOptions) (DeleteSourceResult, error) {
 		if _, err := wiki.UpdateReviewItemStatusWithAction(opts.ProjectPath, firstNonEmptyString(opts.ProjectID, "local"), id, "dismissed", "source-delete", time.Now().UTC()); err != nil {
 			return DeleteSourceResult{}, err
 		}
+	}
+	for _, page := range manifestfile.OwnedFiles(entry) {
+		manifestfile.UnregisterSourceOwner(&manifest, page, key)
 	}
 	delete(manifest.Sources, key)
 	if err := saveSourceManifestFile(opts.ProjectPath, manifest); err != nil {
@@ -137,43 +147,15 @@ type sourceDeletePageAction struct {
 	Path          string
 	Delete        bool
 	UpdateSources bool
+	RemoveSources []string
 }
 
 func loadSourceManifestFile(projectPath string) (sourceManifestFile, error) {
-	manifest := sourceManifestFile{Version: 1, Sources: map[string]sourceManifestFileEntry{}}
-	data, err := os.ReadFile(filepath.Join(projectPath, ".kbcore", "source-manifest.json"))
-	if os.IsNotExist(err) {
-		return manifest, nil
-	}
-	if err != nil {
-		return sourceManifestFile{}, err
-	}
-	if strings.TrimSpace(string(data)) == "" {
-		return manifest, nil
-	}
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		return sourceManifestFile{}, fmt.Errorf("read source manifest: %w", err)
-	}
-	if manifest.Version == 0 {
-		manifest.Version = 1
-	}
-	if manifest.Sources == nil {
-		manifest.Sources = map[string]sourceManifestFileEntry{}
-	}
-	return manifest, nil
+	return manifestfile.Load(projectPath)
 }
 
 func saveSourceManifestFile(projectPath string, manifest sourceManifestFile) error {
-	data, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	path := filepath.Join(projectPath, ".kbcore", "source-manifest.json")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	return writeFileAtomic(path, data)
+	return manifestfile.Save(projectPath, manifest)
 }
 
 func findSourceManifestEntry(manifest sourceManifestFile, sourcePath string) (string, sourceManifestFileEntry, bool) {
@@ -202,19 +184,25 @@ func sourceDeleteAffectedPages(projectPath string, entry sourceManifestFileEntry
 		return nil, err
 	}
 	files := map[string]bool{}
-	for _, file := range entry.Files {
+	for _, file := range manifestfile.OwnedFiles(entry) {
 		files[filepath.ToSlash(file)] = true
 	}
-	raw := filepath.ToSlash(entry.RawPath)
+	rawPaths := sourceEntryRawPaths(entry)
 	var actions []sourceDeletePageAction
 	for _, page := range pages {
-		if !files[page.Path] && !containsPathString(page.Sources, raw) {
+		var matched []string
+		for _, raw := range rawPaths {
+			if containsPathString(page.Sources, raw) {
+				matched = append(matched, raw)
+			}
+		}
+		if !files[page.Path] && len(matched) == 0 {
 			continue
 		}
-		action := sourceDeletePageAction{Path: page.Path}
-		if page.Type == "source-summary" || len(page.Sources) <= 1 || (files[page.Path] && len(page.Sources) == 0 && strings.HasPrefix(page.Path, "wiki/sources/")) {
+		action := sourceDeletePageAction{Path: page.Path, RemoveSources: matched}
+		if page.Type == "source-summary" || len(page.Sources) <= len(matched) || (files[page.Path] && len(page.Sources) == 0 && strings.HasPrefix(page.Path, "wiki/sources/")) {
 			action.Delete = true
-		} else if containsPathString(page.Sources, raw) {
+		} else if len(matched) > 0 {
 			action.UpdateSources = true
 		}
 		if action.Delete || action.UpdateSources {
@@ -223,6 +211,14 @@ func sourceDeleteAffectedPages(projectPath string, entry sourceManifestFileEntry
 	}
 	sort.Slice(actions, func(i, j int) bool { return actions[i].Path < actions[j].Path })
 	return actions, nil
+}
+
+func sourceEntryRawPaths(entry sourceManifestFileEntry) []string {
+	values := []string{entry.RawPath}
+	for _, version := range entry.Versions {
+		values = append(values, version.RawPath)
+	}
+	return mergePathLists(values)
 }
 
 func pagesWithDeletedLinks(projectPath string, deleted []string) ([]string, error) {
@@ -465,25 +461,40 @@ func deleteRawSourceFile(projectPath, raw string) (bool, error) {
 }
 
 func deleteRawSourceArchive(projectPath string, entry sourceManifestFileEntry) (bool, error) {
-	if strings.TrimSpace(entry.ArchivePath) == "" {
-		return deleteRawSourceFile(projectPath, entry.RawPath)
+	deleted, err := deleteOneRawSourceArchive(projectPath, entry.ArchivePath, entry.OriginalRawPath, entry.RawPath)
+	if err != nil {
+		return false, err
 	}
-	archive, err := sourcearchive.Load(projectPath, entry.ArchivePath)
+	for _, version := range entry.Versions {
+		versionDeleted, versionErr := deleteOneRawSourceArchive(projectPath, version.ArchivePath, version.OriginalRawPath, version.RawPath)
+		if versionErr != nil {
+			return deleted, versionErr
+		}
+		deleted = deleted || versionDeleted
+	}
+	return deleted, nil
+}
+
+func deleteOneRawSourceArchive(projectPath, archivePath, originalRawPath, rawPath string) (bool, error) {
+	if strings.TrimSpace(archivePath) == "" {
+		return deleteRawSourceFile(projectPath, rawPath)
+	}
+	archive, err := sourcearchive.Load(projectPath, archivePath)
 	if os.IsNotExist(err) {
 		return false, nil
 	}
 	if err != nil {
 		return false, err
 	}
-	if entry.OriginalRawPath != "" && filepath.ToSlash(entry.OriginalRawPath) != archive.Metadata.OriginalRawPath {
-		return false, fmt.Errorf("source archive original path mismatch: %s", entry.ArchivePath)
+	if originalRawPath != "" && filepath.ToSlash(originalRawPath) != archive.Metadata.OriginalRawPath {
+		return false, fmt.Errorf("source archive original path mismatch: %s", archivePath)
 	}
-	if entry.RawPath != "" && filepath.ToSlash(entry.RawPath) != archive.Metadata.ContentPath {
-		return false, fmt.Errorf("source archive content path mismatch: %s", entry.ArchivePath)
+	if rawPath != "" && filepath.ToSlash(rawPath) != archive.Metadata.ContentPath {
+		return false, fmt.Errorf("source archive content path mismatch: %s", archivePath)
 	}
 	rawRoot := filepath.Join(projectPath, "raw", "sources")
 	if !isPathInside(rawRoot, archive.AbsDir) || filepath.Clean(rawRoot) == filepath.Clean(archive.AbsDir) {
-		return false, fmt.Errorf("source archive escapes raw/sources: %s", entry.ArchivePath)
+		return false, fmt.Errorf("source archive escapes raw/sources: %s", archivePath)
 	}
 	if err := os.RemoveAll(archive.AbsDir); err != nil {
 		return false, err

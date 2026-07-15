@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +11,7 @@ import (
 	"time"
 
 	"github.com/hejw/knowledge-core/internal/core"
+	manifestfile "github.com/hejw/knowledge-core/internal/manifest"
 	"github.com/hejw/knowledge-core/internal/wiki"
 )
 
@@ -330,23 +330,20 @@ func syncSourcesFromManifest(ctx context.Context, opts WikiSyncOptions, prune bo
 	if !ok {
 		return 0, nil
 	}
-	entries, err := loadSourceManifestEntries(opts.ProjectPath, opts.ProjectID)
+	manifest, err := manifestfile.Load(opts.ProjectPath)
 	if err != nil {
 		return 0, err
 	}
-	ids := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		source := core.Source{
-			ID:           core.StableID(opts.ProjectID, "source", entry.RawPath),
-			ProjectID:    opts.ProjectID,
-			Path:         entry.RawPath,
-			Kind:         "source",
-			Title:        entry.Title,
-			SHA256:       entry.SHA256,
-			Immutable:    true,
-			ImportedAt:   entry.UpdatedAt,
-			OriginalPath: entry.OriginalPath,
+	var sources []core.Source
+	for key, entry := range manifest.Sources {
+		originalPath := firstNonEmptyString(entry.OriginalPath, key)
+		sources = append(sources, manifestSource(opts.ProjectID, originalPath, entry.Title, entry.SHA256, entry.RawPath, entry.UpdatedAt))
+		for _, version := range entry.Versions {
+			sources = append(sources, manifestSource(opts.ProjectID, originalPath, entry.Title, version.SHA256, version.RawPath, version.UpdatedAt))
 		}
+	}
+	ids := make([]string, 0, len(sources))
+	for _, source := range sources {
 		if source.ImportedAt.IsZero() {
 			source.ImportedAt = time.Now()
 		}
@@ -362,46 +359,28 @@ func syncSourcesFromManifest(ctx context.Context, opts WikiSyncOptions, prune bo
 			}
 		}
 	}
-	return len(entries), nil
+	return len(sources), nil
 }
 
-type sourceManifestFile struct {
-	Version int                                `json:"version"`
-	Sources map[string]sourceManifestFileEntry `json:"sources"`
+func manifestSource(projectID, originalPath, title, sha, rawPath, updatedAt string) core.Source {
+	importedAt := time.Time{}
+	if strings.TrimSpace(updatedAt) != "" {
+		importedAt, _ = time.Parse(time.RFC3339, updatedAt)
+	}
+	return core.Source{
+		ID: core.StableID(projectID, "source", rawPath), ProjectID: projectID,
+		Path: rawPath, Kind: "source", Title: title, SHA256: sha,
+		Immutable: true, ImportedAt: importedAt, OriginalPath: originalPath,
+	}
 }
 
-type sourceManifestFileEntry struct {
-	OriginalPath    string          `json:"original_path"`
-	PipelineVersion int             `json:"pipeline_version,omitempty"`
-	SHA256          string          `json:"sha256"`
-	RawPath         string          `json:"raw_path"`
-	ArchivePath     string          `json:"archive_path,omitempty"`
-	OriginalRawPath string          `json:"original_raw_path,omitempty"`
-	ContentPath     string          `json:"content_path,omitempty"`
-	OriginalSHA256  string          `json:"original_sha256,omitempty"`
-	ContentSHA256   string          `json:"content_sha256,omitempty"`
-	Title           string          `json:"title"`
-	Files           []string        `json:"files"`
-	ReviewCount     int             `json:"review_count"`
-	UpdatedAt       string          `json:"updated_at"`
-	Extraction      json.RawMessage `json:"extraction,omitempty"`
-}
+type sourceManifestFile = manifestfile.File
+type sourceManifestFileEntry = manifestfile.Entry
 
 func loadSourceManifestEntries(projectPath, projectID string) ([]core.SourceManifestEntry, error) {
-	path := filepath.Join(projectPath, ".kbcore", "source-manifest.json")
-	data, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return nil, nil
-	}
+	manifest, err := manifestfile.Load(projectPath)
 	if err != nil {
 		return nil, err
-	}
-	if strings.TrimSpace(string(data)) == "" {
-		return nil, nil
-	}
-	var manifest sourceManifestFile
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		return nil, fmt.Errorf("read source manifest: %w", err)
 	}
 	keys := make([]string, 0, len(manifest.Sources))
 	for key := range manifest.Sources {
@@ -424,21 +403,25 @@ func loadSourceManifestEntries(projectPath, projectID string) ([]core.SourceMani
 			updatedAt = parsed
 		}
 		entries = append(entries, core.SourceManifestEntry{
-			ID:              core.StableID(projectID, "source-manifest", originalPath),
-			ProjectID:       projectID,
-			OriginalPath:    originalPath,
-			PipelineVersion: entry.PipelineVersion,
-			SHA256:          entry.SHA256,
-			RawPath:         entry.RawPath,
-			ArchivePath:     entry.ArchivePath,
-			OriginalRawPath: entry.OriginalRawPath,
-			ContentPath:     entry.ContentPath,
-			OriginalSHA256:  entry.OriginalSHA256,
-			ContentSHA256:   entry.ContentSHA256,
-			Title:           entry.Title,
-			Files:           append([]string(nil), entry.Files...),
-			ReviewCount:     entry.ReviewCount,
-			UpdatedAt:       updatedAt,
+			ID:                       core.StableID(projectID, "source-manifest", originalPath),
+			ProjectID:                projectID,
+			OriginalPath:             originalPath,
+			PipelineVersion:          entry.PipelineVersion,
+			SHA256:                   entry.SHA256,
+			RawPath:                  entry.RawPath,
+			ArchivePath:              entry.ArchivePath,
+			OriginalRawPath:          entry.OriginalRawPath,
+			ContentPath:              entry.ContentPath,
+			OriginalSHA256:           entry.OriginalSHA256,
+			ContentSHA256:            entry.ContentSHA256,
+			Title:                    entry.Title,
+			Files:                    append([]string(nil), entry.Files...),
+			GenerationContractSHA256: entry.GenerationContractSHA256,
+			NewPageBudget:            entry.NewPageBudget,
+			NewPageCount:             entry.NewPageCount,
+			CreatedPages:             append([]string(nil), entry.CreatedPages...),
+			ReviewCount:              entry.ReviewCount,
+			UpdatedAt:                updatedAt,
 		})
 	}
 	return entries, nil

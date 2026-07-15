@@ -162,14 +162,16 @@ export class ApiClient {
     return this.request("/projects/files/content", { method: "PUT", body: input });
   }
 
-  wikiGraph(projectPath?: string): Promise<WikiGraphResponse> {
-    return this.request("/projects/graph", {
+  async wikiGraph(projectPath?: string): Promise<WikiGraphResponse> {
+    const graph = await this.request<WikiGraphResponse>("/projects/graph", {
       query: { project: projectPath },
     });
+    return normalizeWikiGraphResponse(graph);
   }
 
-  projectGraph(input: ProjectGraphQuery): Promise<WikiGraphResponse> {
-    return this.request("/projects/graph/query", { method: "POST", body: input });
+  async projectGraph(input: ProjectGraphQuery): Promise<WikiGraphResponse> {
+    const graph = await this.request<WikiGraphResponse>("/projects/graph/query", { method: "POST", body: input });
+    return normalizeWikiGraphResponse(graph);
   }
 
   graphNode(projectPath: string | undefined, id: string): Promise<GraphNodeDetailResponse> {
@@ -468,6 +470,14 @@ export function isQueryWritebackResponse(
   value: QueryAnswer | QueryResponseWithWriteback,
 ): value is QueryResponseWithWriteback {
   return "answer" in value && "writeback" in value;
+}
+
+function normalizeWikiGraphResponse(graph: WikiGraphResponse): WikiGraphResponse {
+  return {
+    ...graph,
+    nodes: Array.isArray(graph?.nodes) ? graph.nodes : [],
+    edges: Array.isArray(graph?.edges) ? graph.edges : [],
+  };
 }
 
 function parseSSEChunk(chunk: string): ChatRunEvent | null {

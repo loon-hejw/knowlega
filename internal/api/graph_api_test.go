@@ -43,6 +43,31 @@ func TestProjectGraphQueryReturnsBoundedUnifiedGraph(t *testing.T) {
 	}
 }
 
+func TestProjectGraphQueryReturnsEmptyArraysWhenNoNodesMatch(t *testing.T) {
+	project := filepath.Join(t.TempDir(), "project")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: project, Name: "empty-code-graph"}); err != nil {
+		t.Fatal(err)
+	}
+	server := NewServerWithOptions(ServerOptions{DefaultProjectPath: project})
+	req := httptest.NewRequest(http.MethodPost, "/projects/graph/query", bytes.NewBufferString(`{"domains":["code"],"limit":10}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	server.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rr.Code, rr.Body.String())
+	}
+	var payload struct {
+		Nodes json.RawMessage `json:"nodes"`
+		Edges json.RawMessage `json:"edges"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if string(payload.Nodes) != "[]" || string(payload.Edges) != "[]" {
+		t.Fatalf("empty graph collections must be arrays: %s", rr.Body.String())
+	}
+}
+
 func TestCodeWebhookUsesProviderSignatureInsteadOfAPIToken(t *testing.T) {
 	project := t.TempDir()
 	if err := wiki.InitProject(wiki.ProjectOptions{Path: project, Name: "webhook-api"}); err != nil {

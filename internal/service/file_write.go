@@ -29,6 +29,11 @@ func WriteProjectFileContent(opts WriteProjectFileContentOptions) (WriteProjectF
 	if projectPath == "" {
 		return WriteProjectFileContentResult{}, fmt.Errorf("project path is required")
 	}
+	release, err := acquireServiceProjectLock(projectPath)
+	if err != nil {
+		return WriteProjectFileContentResult{}, err
+	}
+	defer release()
 	if !isWritableProjectFile(rel) {
 		return WriteProjectFileContentResult{}, fmt.Errorf("path must be purpose.md, schema.md, or wiki/...")
 	}
@@ -52,6 +57,9 @@ func WriteProjectFileContent(opts WriteProjectFileContentOptions) (WriteProjectF
 	}
 	if strings.HasPrefix(rel, "wiki/") {
 		if err := wiki.WriteVersionedPage(projectPath, rel, []byte(opts.Content), reason); err != nil {
+			return WriteProjectFileContentResult{}, err
+		}
+		if err := registerPageOwnership(projectPath, rel, "manual"); err != nil {
 			return WriteProjectFileContentResult{}, err
 		}
 		return WriteProjectFileContentResult{Path: rel, Versioned: true, UpdatedAt: time.Now().UTC().Format(time.RFC3339)}, nil

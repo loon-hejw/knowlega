@@ -32,9 +32,44 @@ Ingest follows an analysis-then-generation pipeline:
    `.kbcore/source-manifest.json`.
 8. Incrementally sync written artifacts to PostgreSQL when configured.
 
+Every source commit is a recoverable multi-file transaction. Before changing
+generated pages, index/log/reviews, or the manifest, the compiler writes a
+durable rollback journal under `.kbcore/transactions/`. An in-process error
+rolls every active artifact back; restart recovery rolls back any prepared
+transaction left by a process interruption. Rollback also removes page-version
+archives created by the failed attempt, so aborted writes cannot appear later
+as valid historical evidence. A project-scoped filesystem lock
+prevents a second process from writing the same knowledge base concurrently.
+
 One source can update multiple source, concept, entity, synthesis, index, and
 overview pages. Review blocks are persisted to `wiki/reviews.md`; PostgreSQL
 review rows are derived from that file.
+
+Analysis, generation, validation repair, and persistence share one explicit
+generation contract. The manifest records its hash together with the source's
+new-page budget and creation ledger. A source may create at most three durable
+non-summary pages per contract; impact-driven re-integration updates existing
+pages only. A purpose/schema or policy change invalidates the old contract and
+re-integrates every source. A source that still fails after its configured task
+attempt limit stops bootstrap as a non-retryable failure instead of entering an
+unbounded service retry loop.
+
+The manifest is decoded and written through one shared schema. Re-importing a
+logical source path with different bytes creates a new immutable raw archive;
+the current entry points at the new version while `versions[]` preserves prior
+hashes and raw paths. Shared pages retain version provenance, while the live
+source-summary represents only the current version. `page_owners` distinguishes
+source-managed pages from manual, review, code, and query pages, so convergence
+never treats an unknown human page as disposable. Pages attributed only to a
+retained historical source version remain source-owned; historical summaries
+are still superseded by the single current source-summary.
+
+LLM concurrency is a separately configurable process-wide request ceiling
+shared by compile, impact, query, review, and graph clients. Complete source tasks generate from
+consistent snapshots without holding page locks during LLM work. A stale commit
+requeues only that source; conflict retries with overlapping paths are isolated,
+while disjoint retries continue in parallel. Semantic impact retries use a
+separate bounded allowance and require exact source and post-change evidence.
 
 The durable queue is `.kbcore/ingest-queue.json`. `queue-ingest`,
 `scan-sources`, `run-queue`, and optional service workers reuse the same
@@ -117,10 +152,10 @@ Full wiki sync treats PostgreSQL as replaceable derived state:
 - removed Markdown page rows are pruned;
 - page-version rows mirror `.kbcore/page-versions/`;
 - review rows mirror `wiki/reviews.md`;
-- source/manifest rows mirror `.kbcore/source-manifest.json`.
+- source/manifest rows mirror `.kbcore/source-manifest.json`, including one
+  immutable `sources` row for every retained source version.
 
 Incremental sync only upserts artifacts written by the current operation and
 does not prune unrelated rows. Wiki page and embedding updates use a store
 transaction when supported. Embeddings refresh only when the model or semantic
 embedding-source hash changes.
-

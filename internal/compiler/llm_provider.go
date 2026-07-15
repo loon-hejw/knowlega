@@ -50,9 +50,10 @@ func NewProvider(cfg config.LLMConfig) (Provider, error) {
 		MaxOutputTokens:  cfg.MaxOutputTokens,
 		DisableThinking:  cfg.DisableThinking,
 		RetryOptions: llmretry.Options{
-			Retries:   cfg.Retries,
-			BaseDelay: cfg.RetryBaseDelay.Duration,
-			MaxDelay:  cfg.RetryMaxDelay.Duration,
+			Retries:    cfg.Retries,
+			BaseDelay:  cfg.RetryBaseDelay.Duration,
+			MaxDelay:   cfg.RetryMaxDelay.Duration,
+			MaxElapsed: cfg.OperationTimeout.Duration,
 		},
 	}, nil
 }
@@ -68,9 +69,13 @@ Return a concise markdown analysis with:
 - candidate concepts/themes
 - pages that should be created or updated
 - contradictions, duplicates, missing pages, or review items
-- an explicit Wiki Plan listing every proposed target as a project-relative wiki/*.md path`
+- an explicit Wiki Plan using exactly: - LABEL | wiki/path.md | durability=recurring|central|link-target | evidence=...
+- LABEL must be SOURCE SUMMARY, UPDATE EXISTING, CREATE NEW, or REVIEW ONLY; durability and evidence are required for CREATE NEW
+- never plan more CREATE NEW targets than the hard remaining new-page budget`
 	user := fmt.Sprintf(`Source title: %s
 Source path: %s
+
+%s
 
 Purpose:
 %s
@@ -88,7 +93,7 @@ Existing pages selected for merge:
 %s
 
 Source text:
-%s`, input.SourceTitle, input.SourceRel, input.Purpose, input.Schema, input.Index, input.Overview, input.ExistingPages, input.SourceText)
+%s`, input.SourceTitle, input.SourceRel, generationPolicyText(input.GenerationPolicy), input.Purpose, input.Schema, input.Index, input.Overview, input.ExistingPages, input.SourceText)
 	return p.chat(system, user)
 }
 
@@ -115,14 +120,23 @@ Optional review blocks use:
 body
 
 Rules:
-- All file paths must be under wiki/ and end in .md.
+- Use only these canonical directories: source-summary -> wiki/sources/, entity (including places and objects) -> wiki/entities/, concept -> wiki/concepts/, synthesis -> wiki/syntheses/. All paths end in .md.
+- Never write wiki/index.md, wiki/overview.md, wiki/log.md, wiki/reviews.md, or duplicate index/overview pages under syntheses; the compiler maintains those aggregates separately.
+- Obey the numeric generation budget supplied with the source. Prefer a small number of durable canonical pages over one-off pages for every minor name, object, event, or location.
+- Review type must be exactly one of: contradiction, duplicate, missing-page, stale-claim, source-gap, review-needed.
 - Every file must have YAML frontmatter.
+- Emit every YAML frontmatter key exactly once. Never repeat type, title, sources, aliases, or confidence.
 - Keep source provenance in sources.
+- The sources list must contain the current supplied raw source. Never invent, guess, copy from prose, or synthesize raw/sources paths; the compiler owns provenance unioning.
+- The first ---FILE block MUST be the current source's single source-summary under wiki/sources/. Emit it before every entity, concept, synthesis, or review block so it cannot be lost if output is truncated.
 - When an existing page is supplied, merge the new evidence into it. Preserve prior claims, sections, aliases, and sources unless the new source explicitly supersedes them.
+- Treat each supplied ---EXISTING PAGE: wiki/path.md path as the canonical identity owner. If a proposed title or alias refers to that identity, update that exact path and do not create a competing page.
+- Never return two pages whose titles or aliases identify the same entity or concept; fold their evidence into one canonical page.
 - Existing-page sources must be unioned with the current source; never replace previous provenance.
 - Always include exactly one source-summary page under wiki/sources/ for the current source.
 - Prefer updating durable entity/concept/synthesis pages in addition to the source-summary when the source clearly belongs there.
 - Use aliases in frontmatter when useful for entity names, book chapter titles, or common user wording.
+- Aliases must be genuine alternate names or spellings for that exact page. Never use topical keywords, generic words, related entity names, or broad search terms as aliases.
 - If you use a label, alias, or alternate wording as a [[wikilink]], add that wording to the target page aliases or create/update a target page for it.
 - Do not include prose outside ---FILE or ---REVIEW blocks.`
 	user := fmt.Sprintf(`Analysis:
@@ -130,6 +144,8 @@ Rules:
 
 Source title: %s
 Source path: %s
+
+%s
 
 Purpose:
 %s
@@ -147,13 +163,14 @@ Existing pages that must be merged rather than replaced:
 %s
 
 Source text:
-%s`, analysis, input.SourceTitle, input.SourceRel, input.Purpose, input.Schema, input.Index, input.Overview, input.ExistingPages, input.SourceText)
+%s`, analysis, input.SourceTitle, input.SourceRel, generationPolicyText(input.GenerationPolicy), input.Purpose, input.Schema, input.Index, input.Overview, input.ExistingPages, input.SourceText)
 	return p.chat(system, user)
 }
 
 func (p OpenAICompatibleProvider) SynthesizeOverview(input OverviewInput) (string, error) {
 	system := `You maintain the global overview of a persistent LLM Wiki.
 Return the complete wiki/overview.md as Markdown, without code fences.
+The page may begin with valid YAML frontmatter, but its body must begin with one H1 heading. Never return commentary outside the page.
 This is a current high-level synthesis, not an append-only activity list.
 Include the wiki's purpose, major entities and concepts, important relationships, evolving themes or claims, contradictions/gaps, and concise [[wikilink]] navigation.
 Preserve still-valid insights from the previous overview and incorporate the current page evidence. Do not invent claims unsupported by the supplied pages.`
@@ -170,18 +187,31 @@ Previous overview:
 %s
 
 Current wiki page excerpts:
-%s`, promptbudget.TrimEnd(input.Purpose, 8000), promptbudget.TrimEnd(input.Schema, 8000), promptbudget.TrimMiddle(input.Index, 24000), promptbudget.TrimMiddle(input.CurrentOverview, 16000), promptbudget.TrimMiddle(input.PageExcerpts, 90000))
+%s
+
+Open review evidence (authoritative; never claim there are no contradictions while contradiction or stale-claim items are open):
+%s
+
+Validation repair instruction, if any:
+%s`, promptbudget.TrimEnd(input.Purpose, 4000), promptbudget.TrimEnd(input.Schema, 4000), promptbudget.TrimMiddle(input.Index, 8000), promptbudget.TrimMiddle(input.CurrentOverview, 6000), promptbudget.TrimMiddle(input.PageExcerpts, 40000), promptbudget.TrimMiddle(input.OpenReviews, 12000), input.ValidationError)
 	return p.chat(system, user)
 }
 
 func (p OpenAICompatibleProvider) chat(system, user string) (string, error) {
 	retryOpts := llmretry.Normalize(p.RetryOptions)
-	return llmretry.Do(nil, retryOpts, nil, func(attempt int) (string, bool, error) {
-		return p.chatOnce(system, user)
+	ctx := context.Background()
+	if retryOpts.MaxElapsed > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, retryOpts.MaxElapsed)
+		defer cancel()
+		retryOpts.MaxElapsed = 0
+	}
+	return llmretry.Do(ctx, retryOpts, nil, func(attempt int) (string, bool, error) {
+		return p.chatOnce(ctx, system, user)
 	})
 }
 
-func (p OpenAICompatibleProvider) chatOnce(system, user string) (string, bool, error) {
+func (p OpenAICompatibleProvider) chatOnce(ctx context.Context, system, user string) (string, bool, error) {
 	maxInputChars := p.MaxInputChars
 	if maxInputChars <= 0 {
 		maxInputChars = defaultLLMMaxInputChars
@@ -199,7 +229,7 @@ func (p OpenAICompatibleProvider) chatOnce(system, user string) (string, bool, e
 		UserAgent:        p.UserAgent,
 		AnthropicVersion: p.AnthropicVersion,
 		HTTPClient:       p.Client,
-	}).Chat(context.Background(), llmclient.ChatRequest{
+	}).Chat(ctx, llmclient.ChatRequest{
 		System: system, User: user, MaxTokens: maxOutputTokens,
 		Temperature: 0.2, DisableThinking: p.DisableThinking,
 	})

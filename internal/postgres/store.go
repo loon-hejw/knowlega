@@ -237,9 +237,10 @@ func (s *Store) UpsertSourceManifestEntry(ctx context.Context, entry core.Source
 		entry.UpdatedAt = time.Now()
 	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO source_manifest (id, project_id, original_path, sha256, raw_path, archive_path, original_raw_path, content_path, original_sha256, content_sha256, title, files, review_count, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+INSERT INTO source_manifest (id, project_id, original_path, pipeline_version, sha256, raw_path, archive_path, original_raw_path, content_path, original_sha256, content_sha256, title, files, generation_contract_sha256, new_page_budget, new_page_count, created_pages, review_count, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
 ON CONFLICT (project_id, original_path) DO UPDATE SET
+  pipeline_version = EXCLUDED.pipeline_version,
   sha256 = EXCLUDED.sha256,
   raw_path = EXCLUDED.raw_path,
   archive_path = EXCLUDED.archive_path,
@@ -249,9 +250,13 @@ ON CONFLICT (project_id, original_path) DO UPDATE SET
   content_sha256 = EXCLUDED.content_sha256,
   title = EXCLUDED.title,
   files = EXCLUDED.files,
+  generation_contract_sha256 = EXCLUDED.generation_contract_sha256,
+  new_page_budget = EXCLUDED.new_page_budget,
+  new_page_count = EXCLUDED.new_page_count,
+  created_pages = EXCLUDED.created_pages,
   review_count = EXCLUDED.review_count,
   updated_at = EXCLUDED.updated_at
-`, entry.ID, entry.ProjectID, entry.OriginalPath, entry.SHA256, entry.RawPath, entry.ArchivePath, entry.OriginalRawPath, entry.ContentPath, entry.OriginalSHA256, entry.ContentSHA256, entry.Title, sqlArray(entry.Files), entry.ReviewCount, entry.UpdatedAt)
+`, entry.ID, entry.ProjectID, entry.OriginalPath, entry.PipelineVersion, entry.SHA256, entry.RawPath, entry.ArchivePath, entry.OriginalRawPath, entry.ContentPath, entry.OriginalSHA256, entry.ContentSHA256, entry.Title, sqlArray(entry.Files), entry.GenerationContractSHA256, entry.NewPageBudget, entry.NewPageCount, sqlArray(entry.CreatedPages), entry.ReviewCount, entry.UpdatedAt)
 	return err
 }
 
@@ -308,9 +313,16 @@ func (s *Store) UpsertReviewItem(ctx context.Context, item core.ReviewItem) erro
 	if item.CreatedAt.IsZero() {
 		item.CreatedAt = time.Now()
 	}
-	_, err := s.db.ExecContext(ctx, `
-INSERT INTO review_items (id, project_id, type, title, description, severity, status, affected_pages, created_at, resolved_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	props, err := json.Marshal(map[string]any{
+		"source_path": item.SourcePath, "source_paths": item.SourcePaths,
+		"search_queries": item.SearchQueries, "resolved_action": item.ResolvedAction,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `
+INSERT INTO review_items (id, project_id, type, title, description, severity, status, affected_pages, props, created_at, resolved_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
 ON CONFLICT (id) DO UPDATE SET
   type = EXCLUDED.type,
   title = EXCLUDED.title,
@@ -318,8 +330,9 @@ ON CONFLICT (id) DO UPDATE SET
   severity = EXCLUDED.severity,
   status = EXCLUDED.status,
   affected_pages = EXCLUDED.affected_pages,
+  props = EXCLUDED.props,
   resolved_at = EXCLUDED.resolved_at
-`, item.ID, item.ProjectID, item.Type, item.Title, item.Description, item.Severity, item.Status, sqlArray(item.AffectedPages), item.CreatedAt, item.ResolvedAt)
+`, item.ID, item.ProjectID, item.Type, item.Title, item.Description, item.Severity, item.Status, sqlArray(item.AffectedPages), props, item.CreatedAt, item.ResolvedAt)
 	return err
 }
 

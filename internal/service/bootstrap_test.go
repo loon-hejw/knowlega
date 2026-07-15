@@ -77,6 +77,31 @@ func TestPrepareProjectRejectsExistingIncompleteAndReuseFalse(t *testing.T) {
 	}
 }
 
+func TestPrepareProjectRejectsLegacyPurposeBeforeCompile(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "purpose.md"), []byte("# Demo\n\nDefine the knowledge base goal, scope, questions, and evolving thesis here.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(t.TempDir(), "source.md")
+	if err := os.WriteFile(source, []byte("source"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	compileCalls := 0
+	_, err := PrepareProject(PrepareProjectOptions{
+		ProjectPath: root, SourcePath: source, ReuseExisting: true,
+		Compile: func(_, _ string) (ProjectCompileResult, error) {
+			compileCalls++
+			return ProjectCompileResult{}, nil
+		},
+	})
+	if err == nil || !IsPermanentBootstrapError(err) || !strings.Contains(err.Error(), "purpose.md still contains") || compileCalls != 0 {
+		t.Fatalf("err=%v compile_calls=%d", err, compileCalls)
+	}
+}
+
 func TestPrepareProjectPreservesEvidenceOnCompileFailure(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "kb")
 	source := filepath.Join(t.TempDir(), "source.md")
@@ -150,6 +175,69 @@ func TestPrepareProjectResumesCompleteStalePipelineManifest(t *testing.T) {
 	}
 	if !result.Resumed || result.Reused || compileCalls != 1 {
 		t.Fatalf("result=%+v compileCalls=%d", result, compileCalls)
+	}
+}
+
+func TestValidateBootstrapTaskStateRequiresAllTasksAndImpactsSettled(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".kbcore"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	intentDir := filepath.Join(root, ".kbcore", "bootstrap-intents")
+	if err := os.MkdirAll(intentDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(intentDir, "pending.json"), []byte(`{"source_path":"a.md","paths":[]}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateBootstrapTaskStateSettled(root); err == nil {
+		t.Fatal("expected commit intent to require resume")
+	}
+	if err := os.Remove(filepath.Join(intentDir, "pending.json")); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(root, ".kbcore", "bootstrap-state.json")
+	if err := os.WriteFile(path, []byte(`{"sources":{"a.md":{"status":"processing"}},"pending_impacts":{}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateBootstrapTaskStateSettled(root); err == nil {
+		t.Fatal("expected processing task to require resume")
+	}
+	if err := os.WriteFile(path, []byte(`{"sources":{"a.md":{"status":"settled"}},"pending_impacts":{}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateBootstrapTaskStateSettled(root); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRestoreBootstrapTrackerKeepsInterruptedConflictQueuedWithoutManifestEntry(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "restore-conflict"}); err != nil {
+		t.Fatal(err)
+	}
+	sources := filepath.Join(t.TempDir(), "sources")
+	if err := os.MkdirAll(sources, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(sources, "a.md")
+	if err := os.WriteFile(source, []byte("# A\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveSourceManifestFile(root, sourceManifestFile{Version: 1, Sources: map[string]sourceManifestFileEntry{}}); err != nil {
+		t.Fatal(err)
+	}
+	state := fmt.Sprintf(`{"sources":{%q:{"status":"processing","attempts":2,"conflict_attempts":1,"conflict_paths":["wiki/entities/shared.md"]}}}`, filepath.ToSlash(source))
+	if err := os.WriteFile(filepath.Join(root, ".kbcore", "bootstrap-state.json"), []byte(state), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tracker := NewBootstrapTracker(root, 1)
+	if err := RestoreBootstrapTracker(tracker, root, sources, ""); err != nil {
+		t.Fatal(err)
+	}
+	status := tracker.Snapshot()
+	if status.QueuedConflictSources != 1 || status.CompletedSources != 0 {
+		t.Fatalf("status=%+v", status)
 	}
 }
 

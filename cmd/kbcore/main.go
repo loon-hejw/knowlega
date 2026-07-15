@@ -19,6 +19,7 @@ import (
 	"github.com/hejw/knowledge-core/internal/compiler"
 	"github.com/hejw/knowledge-core/internal/config"
 	"github.com/hejw/knowledge-core/internal/core"
+	"github.com/hejw/knowledge-core/internal/llmclient"
 	"github.com/hejw/knowledge-core/internal/postgres"
 	"github.com/hejw/knowledge-core/internal/service"
 	"github.com/hejw/knowledge-core/internal/wiki"
@@ -51,6 +52,7 @@ func run(args []string) error {
 		if err != nil {
 			return err
 		}
+		llmclient.SetGlobalConcurrency(configuredLLMConcurrency(runtimeConfig))
 	}
 	args = commandArgs
 	switch args[0] {
@@ -60,6 +62,12 @@ func run(args []string) error {
 		return runIngest(args[1:])
 	case "validate-llmwiki":
 		return runValidateLLMWiki(args[1:])
+	case "audit-wiki":
+		return runAuditWiki(args[1:])
+	case "repair-wiki":
+		return runRepairWiki(args[1:])
+	case "refresh-overview":
+		return runRefreshOverview(args[1:])
 	case "queue-ingest":
 		return runQueueIngest(args[1:])
 	case "scan-sources":
@@ -101,6 +109,128 @@ func run(args []string) error {
 	default:
 		return fmt.Errorf("unknown command %q", args[0])
 	}
+}
+
+func configuredLLMConcurrency(cfg config.Config) int {
+	if cfg.LLM.Concurrency > 0 {
+		return cfg.LLM.Concurrency
+	}
+	return cfg.Project.Bootstrap.Concurrency
+}
+
+func runRepairWiki(args []string) error {
+	fs := flag.NewFlagSet("repair-wiki", flag.ContinueOnError)
+	project := fs.String("project", runtimeConfig.Project.Path, "project path")
+	apply := fs.Bool("apply", false, "apply versioned repairs; default is a read-only audit")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if !*apply {
+		audit, err := service.AuditWikiQuality(*project)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("dry_run=true\nready=%t\ninvalid_provenance=%d\nnoncanonical_pages=%d\nunowned_pages=%d\nindex_gaps=%d\nalias_conflicts=%d\ninvalid_reviews=%d\nlint_issues=%d\n",
+			audit.Ready, len(audit.InvalidProvenance), len(audit.NonCanonicalPages), len(audit.UnownedPages), len(audit.IndexMissingPages), len(audit.AliasConflicts), len(audit.InvalidReviewItems), len(audit.LintIssues))
+		return nil
+	}
+	result, err := compiler.ConvergeWikiArtifacts(*project)
+	if err != nil {
+		return err
+	}
+	linkedMentions, err := service.RepairKnownMentionLinks(*project)
+	if err != nil {
+		return err
+	}
+	if err := wiki.RebuildIndex(*project); err != nil {
+		return err
+	}
+	if err := service.RefreshRelationsArtifact(*project); err != nil {
+		return err
+	}
+	fmt.Printf("rewritten_pages=%d\nmoved_pages=%d\nmerged_pages=%d\nremoved_bad_sources=%d\nremoved_ambiguous_aliases=%d\nnormalized_reviews=%d\ndowngraded_links=%d\nlinked_summaries=%d\nlinked_mentions=%d\nquarantined_pages=%d\nunowned_pages=%d\n",
+		result.RewrittenPages, result.MovedPages, result.MergedPages, result.RemovedBadSources,
+		result.RemovedAmbiguousAliases, result.NormalizedReviews, result.DowngradedLinks, result.LinkedSummaries, linkedMentions, result.QuarantinedPages, result.UnownedPages)
+	return nil
+}
+
+func runRefreshOverview(args []string) error {
+	fs := flag.NewFlagSet("refresh-overview", flag.ContinueOnError)
+	project := fs.String("project", runtimeConfig.Project.Path, "project path")
+	agentName := fs.String("agent", runtimeConfig.Server.Agent, "overview agent: llm, mock")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	provider, err := ingestProvider(*agentName)
+	if err != nil {
+		return err
+	}
+	if *agentName == "llm" {
+		if err := wiki.ValidatePurposeReady(*project); err != nil {
+			return err
+		}
+	}
+	if _, err := compiler.ConvergeWikiArtifacts(*project); err != nil {
+		return err
+	}
+	linked, err := service.RepairKnownMentionLinks(*project)
+	if err != nil {
+		return err
+	}
+	if err := wiki.RebuildIndex(*project); err != nil {
+		return err
+	}
+	refreshed, err := compiler.RefreshOverview(provider, *project)
+	if err != nil {
+		return err
+	}
+	if err := service.RefreshRelationsArtifact(*project); err != nil {
+		return err
+	}
+	audit, err := service.ValidateWikiQualityReady(*project)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("overview_refreshed=%t\nlinked_mentions=%d\nready=%t\n", refreshed, linked, audit.Ready)
+	return nil
+}
+
+func runAuditWiki(args []string) error {
+	fs := flag.NewFlagSet("audit-wiki", flag.ContinueOnError)
+	project := fs.String("project", runtimeConfig.Project.Path, "project path")
+	baseline := fs.String("baseline", "", "optional baseline project path")
+	report := fs.String("report", "", "optional Markdown report path")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	current, err := service.AuditWikiQuality(*project)
+	if err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(current, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(data))
+	if strings.TrimSpace(*baseline) == "" {
+		return nil
+	}
+	old, err := service.AuditWikiQuality(*baseline)
+	if err != nil {
+		return err
+	}
+	path := strings.TrimSpace(*report)
+	if path == "" {
+		path = filepath.Join(*project, "COMPARE_REPORT.md")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, []byte(service.AuditComparisonMarkdown(old, current)), 0o644); err != nil {
+		return err
+	}
+	fmt.Printf("report=%s\n", path)
+	return nil
 }
 
 func runWaitReady(args []string) error {
@@ -179,6 +309,7 @@ func runValidateLLMWiki(args []string) error {
 	title := fs.String("title", "", "source title")
 	agentName := fs.String("agent", runtimeConfig.Server.Agent, "ingest agent: llm, mock")
 	skipUnchanged := fs.Bool("skip-unchanged", false, "skip sources whose content hash is unchanged in the source manifest")
+	showProgress := fs.Bool("progress", false, "print per-source task phases, retries, and validation errors")
 	dbDSN := fs.String("db-dsn", runtimeConfig.Database.DSN, "PostgreSQL DSN for wiki sync")
 	projectIDFlag := fs.String("project-id", runtimeConfig.Database.ProjectID, "PostgreSQL project id")
 	if err := fs.Parse(args); err != nil {
@@ -188,17 +319,45 @@ func runValidateLLMWiki(args []string) error {
 	if err != nil {
 		return err
 	}
+	var onProgress func(compiler.ValidateProgress)
+	if *showProgress {
+		onProgress = logBootstrapProgress
+	}
 	result, err := compiler.ValidateLLMWikiPath(compiler.ValidateOptions{
-		ProjectPath:   *project,
-		SourcePath:    *source,
-		Title:         *title,
-		Provider:      provider,
-		SkipUnchanged: *skipUnchanged,
+		ProjectPath:          *project,
+		SourcePath:           *source,
+		Title:                *title,
+		Provider:             provider,
+		SkipUnchanged:        *skipUnchanged,
+		Concurrency:          runtimeConfig.Project.Bootstrap.Concurrency,
+		LLMConcurrency:       configuredLLMConcurrency(runtimeConfig),
+		MaxTaskAttempts:      runtimeConfig.Project.Bootstrap.MaxTaskAttempts,
+		MaxConflictAttempts:  runtimeConfig.Project.Bootstrap.MaxConflictAttempts,
+		MaxImpactAttempts:    runtimeConfig.Project.Bootstrap.MaxImpactAttempts,
+		MaxFilesPerTask:      runtimeConfig.Project.Bootstrap.MaxFilesPerTask,
+		MaxNewPagesPerSource: runtimeConfig.Project.Bootstrap.MaxNewPagesPerSource,
+		ImpactAssessor:       impactAssessorFromProvider(provider),
+		OnProgress:           onProgress,
 	})
 	if err != nil {
 		return err
 	}
+	if _, err := compiler.ConvergeWikiArtifacts(*project); err != nil {
+		return err
+	}
+	if _, err := service.RepairKnownMentionLinks(*project); err != nil {
+		return err
+	}
+	if err := wiki.RebuildIndex(*project); err != nil {
+		return err
+	}
+	if _, err := compiler.RefreshOverview(provider, *project); err != nil {
+		return err
+	}
 	if err := service.RefreshRelationsArtifact(*project); err != nil {
+		return err
+	}
+	if _, err := service.ValidateWikiReady(*project, *source); err != nil {
 		return err
 	}
 	fmt.Printf("sources=%d\nfiles=%d\nreviews=%d\nskipped=%d\n", result.SourceCount, result.FileCount, result.ReviewCount, result.SkippedCount)
@@ -625,6 +784,13 @@ func runServe(args []string) error {
 		return err
 	}
 	tracker := service.NewBootstrapTracker(*project, totalSources)
+	expectedContract := ""
+	if contract, contractErr := compiler.GenerationContractSHA256(*project, effectiveConfig.Project.Bootstrap.MaxFilesPerTask, effectiveConfig.Project.Bootstrap.MaxNewPagesPerSource); contractErr == nil {
+		expectedContract = contract
+	}
+	if restoreErr := service.RestoreBootstrapTracker(tracker, *project, effectiveConfig.Project.Bootstrap.Source, expectedContract); restoreErr != nil {
+		return fmt.Errorf("restore bootstrap progress: %w", restoreErr)
+	}
 	server := &http.Server{
 		Addr: *addr,
 		Handler: api.NewServerWithOptions(api.ServerOptions{
@@ -642,6 +808,7 @@ func runServe(args []string) error {
 				MaxResults: effectiveConfig.Research.MaxResults,
 				Timeout:    effectiveConfig.Research.Timeout.Duration,
 			},
+			QueryRuntime:       queryRuntimeOptions(effectiveConfig.Query),
 			RequestLogger:      log.New(os.Stdout, "http ", log.LstdFlags),
 			APIToken:           effectiveConfig.Server.APIToken,
 			APIRequireToken:    effectiveConfig.Server.APIRequireToken,
@@ -710,11 +877,20 @@ func runServeBootstrap(ctx context.Context, opts serveBootstrapOptions) {
 		opts.Tracker.SetAttempt(attempt)
 		opts.Tracker.SetStage("running", "project_validation")
 		fmt.Printf("bootstrap status=running attempt=%d project=%s\n", attempt, opts.ProjectPath)
+		expectedContract := ""
+		if contract, contractErr := compiler.GenerationContractSHA256(
+			opts.ProjectPath,
+			opts.Config.Project.Bootstrap.MaxFilesPerTask,
+			opts.Config.Project.Bootstrap.MaxNewPagesPerSource,
+		); contractErr == nil {
+			expectedContract = contract
+		}
 		prepared, err := service.PrepareProject(service.PrepareProjectOptions{
-			ProjectPath:   opts.ProjectPath,
-			ProjectName:   opts.Config.Project.Name,
-			SourcePath:    opts.Config.Project.Bootstrap.Source,
-			ReuseExisting: opts.Config.Project.Bootstrap.ReuseExisting,
+			ProjectPath:                opts.ProjectPath,
+			ProjectName:                opts.Config.Project.Name,
+			SourcePath:                 opts.Config.Project.Bootstrap.Source,
+			ReuseExisting:              opts.Config.Project.Bootstrap.ReuseExisting,
+			ExpectedGenerationContract: expectedContract,
 			Compile: func(projectPath, sourcePath string) (service.ProjectCompileResult, error) {
 				var onCommitted func(compiler.ValidateResult) error
 				if opts.DBHandle != nil {
@@ -735,13 +911,30 @@ func runServeBootstrap(ctx context.Context, opts serveBootstrapOptions) {
 				}
 				batch, compileErr := compiler.ValidateLLMWikiPath(compiler.ValidateOptions{
 					ProjectPath: projectPath, SourcePath: sourcePath, Provider: opts.Provider,
-					SkipUnchanged: true,
-					Concurrency:   opts.Config.Project.Bootstrap.Concurrency,
-					OnCommitted:   onCommitted,
+					SkipUnchanged:        true,
+					Concurrency:          opts.Config.Project.Bootstrap.Concurrency,
+					LLMConcurrency:       configuredLLMConcurrency(opts.Config),
+					MaxTaskAttempts:      opts.Config.Project.Bootstrap.MaxTaskAttempts,
+					MaxConflictAttempts:  opts.Config.Project.Bootstrap.MaxConflictAttempts,
+					MaxImpactAttempts:    opts.Config.Project.Bootstrap.MaxImpactAttempts,
+					MaxFilesPerTask:      opts.Config.Project.Bootstrap.MaxFilesPerTask,
+					MaxNewPagesPerSource: opts.Config.Project.Bootstrap.MaxNewPagesPerSource,
+					ImpactAssessor:       impactAssessorFromProvider(opts.Provider),
+					OnCommitted:          onCommitted,
+					OnLLMCall: func(metric compiler.LLMCallMetric) {
+						if metric.Started {
+							opts.Tracker.StartLLMCall(metric.ID, metric.StartedAt)
+						} else {
+							opts.Tracker.FinishLLMCall(metric.ID, metric.Duration, metric.Failed)
+						}
+					},
 					OnProgress: func(progress compiler.ValidateProgress) {
-						opts.Tracker.UpdateProgress(
+						if progress.Phase == "completed" || progress.Phase == "skipped" {
+							opts.Tracker.RecordSourceDuration(progress.SourcePath, progress.Duration)
+						}
+						opts.Tracker.UpdateTaskProgress(
 							progress.Phase, progress.SourcePath, progress.Index, progress.Total,
-							progress.Files, progress.Reviews, progress.Error,
+							progress.Files, progress.Reviews, progress.Attempt, progress.Error,
 						)
 						logBootstrapProgress(progress)
 					},
@@ -755,13 +948,47 @@ func runServeBootstrap(ctx context.Context, opts serveBootstrapOptions) {
 				}, nil
 			},
 		})
-		if err == nil && (!prepared.Reused || prepared.Resumed) {
+		generatedThisAttempt := !prepared.Reused || prepared.Resumed
+		maintenanceChanged := false
+		if err == nil {
+			opts.Tracker.SetStage("running", "converging_wiki")
+			fmt.Printf("bootstrap stage=converging_wiki project=%s\n", opts.ProjectPath)
+			var convergence compiler.WikiConvergenceResult
+			convergence, err = compiler.ConvergeWikiArtifacts(opts.ProjectPath)
+			maintenanceChanged = convergence.RewrittenPages+convergence.MovedPages+convergence.MergedPages+convergence.RemovedBadSources+
+				convergence.RemovedAmbiguousAliases+convergence.NormalizedReviews+convergence.DowngradedLinks+convergence.LinkedSummaries+
+				convergence.QuarantinedPages > 0
+		}
+		if err == nil {
+			opts.Tracker.SetStage("running", "repairing_links")
+			fmt.Printf("bootstrap stage=repairing_links project=%s\n", opts.ProjectPath)
+			var linked int
+			linked, err = service.RepairKnownMentionLinks(opts.ProjectPath)
+			maintenanceChanged = maintenanceChanged || linked > 0
+		}
+		needsAggregateRefresh := generatedThisAttempt || maintenanceChanged
+		if err == nil && !needsAggregateRefresh {
+			current, stateErr := wiki.AggregateStateCurrent(opts.ProjectPath)
+			needsAggregateRefresh = stateErr != nil || !current
+		}
+		if err == nil && needsAggregateRefresh {
+			opts.Tracker.SetStage("running", "rebuilding_index")
+			fmt.Printf("bootstrap stage=rebuilding_index project=%s\n", opts.ProjectPath)
+			err = wiki.RebuildIndex(opts.ProjectPath)
+		}
+		if err == nil && needsAggregateRefresh {
 			opts.Tracker.SetStage("running", "synthesizing_overview")
 			fmt.Printf("bootstrap stage=synthesizing_overview project=%s\n", opts.ProjectPath)
 			_, err = compiler.RefreshOverview(opts.Provider, opts.ProjectPath)
 		}
 		if err == nil {
 			err = service.RefreshRelationsArtifact(opts.ProjectPath)
+		}
+		if err == nil {
+			_, readyErr := service.ValidateWikiReady(opts.ProjectPath, opts.Config.Project.Bootstrap.Source)
+			if readyErr != nil {
+				err = service.PermanentBootstrapError{Err: readyErr}
+			}
 		}
 		if err == nil && opts.DBHandle != nil {
 			opts.Tracker.SetStage("running", "syncing_pg")
@@ -782,6 +1009,9 @@ func runServeBootstrap(ctx context.Context, opts serveBootstrapOptions) {
 				})
 			}
 			return
+		}
+		if err != nil && compiler.IsSourceTaskExhaustedError(err) {
+			err = service.PermanentBootstrapError{Err: err}
 		}
 		if service.IsPermanentBootstrapError(err) {
 			opts.Tracker.Fail(err)
@@ -814,13 +1044,28 @@ func runServeBootstrap(ctx context.Context, opts serveBootstrapOptions) {
 }
 
 func logBootstrapProgress(progress compiler.ValidateProgress) {
-	fmt.Printf("bootstrap source=%d/%d phase=%s path=%s duration=%s files=%d reviews=%d",
-		progress.Index, progress.Total, progress.Phase, progress.SourcePath,
+	fmt.Printf("bootstrap source=%d/%d attempt=%d phase=%s path=%s duration=%s files=%d reviews=%d",
+		progress.Index, progress.Total, progress.Attempt, progress.Phase, progress.SourcePath,
 		progress.Duration.Round(time.Millisecond), progress.Files, progress.Reviews)
 	if progress.Error != "" {
 		fmt.Printf(" error=%s", progress.Error)
 	}
 	fmt.Println()
+}
+
+func impactAssessorFromProvider(provider compiler.Provider) compiler.ImpactAssessor {
+	assessor, _ := provider.(compiler.ImpactAssessor)
+	return assessor
+}
+
+func queryRuntimeOptions(cfg config.QueryConfig) service.QueryRuntimeOptions {
+	return service.QueryRuntimeOptions{
+		InitialActionBudget: cfg.InitialActionBudget,
+		MaxActionBudget:     cfg.MaxActionBudget,
+		VerificationPasses:  cfg.VerificationPasses,
+		StagnationRounds:    cfg.StagnationRounds,
+		TotalTimeout:        cfg.TotalTimeout.Duration,
+	}
 }
 
 func explicitFlags(fs *flag.FlagSet) map[string]bool {
@@ -985,6 +1230,7 @@ func runQuery(args []string) error {
 		QueryLogStore:     queryLogStore,
 		EmbeddingProvider: embeddingProvider,
 		Context:           ctx,
+		Runtime:           queryRuntimeOptions(runtimeConfig.Query),
 	})
 	if err != nil {
 		return err
@@ -993,6 +1239,21 @@ func runQuery(args []string) error {
 		return fmt.Errorf("query answer is not eligible for writeback; use --agent llm for LLM Wiki synthesis")
 	}
 	fmt.Printf("intent=%s\nmode=%s\nwriteback=%t\n", answer.Plan.Intent, answer.Plan.AnswerMode, answer.Plan.CanWriteBack)
+	if answer.Plan.ReasoningMode != "" {
+		fmt.Printf("reasoning_mode=%s\n", answer.Plan.ReasoningMode)
+	}
+	if len(answer.Plan.Requirements) > 0 {
+		fmt.Println("requirements:")
+		for _, requirement := range answer.Plan.Requirements {
+			fmt.Printf("- %s. %s [%s]\n", requirement.ID, requirement.Text, requirement.Kind)
+		}
+	}
+	if len(answer.Plan.Hypotheses) > 0 {
+		fmt.Println("hypotheses:")
+		for _, hypothesis := range answer.Plan.Hypotheses {
+			fmt.Printf("- %s: %s\n", hypothesis.Candidate, hypothesis.Rationale)
+		}
+	}
 	if answer.SuggestedWritebackTitle != "" {
 		fmt.Printf("suggested_writeback_title=%s\n", answer.SuggestedWritebackTitle)
 	}
@@ -1018,8 +1279,23 @@ func runQuery(args []string) error {
 			fmt.Printf("- step=%d action=%s target=%q observation=%s\n", step.Step, action, target, step.Observation)
 		}
 	}
+	if len(answer.Verification) > 0 {
+		fmt.Println("verification:")
+		for _, verification := range answer.Verification {
+			fmt.Printf("- pass=%d kind=%s accepted=%t summary=%s\n", verification.Pass, verification.Kind, verification.Accepted, verification.Summary)
+		}
+	}
+	if answer.IncompleteReason != "" {
+		fmt.Printf("incomplete_reason=%s\n", answer.IncompleteReason)
+	}
 	fmt.Println("\nanswer:")
 	fmt.Println(answer.Answer)
+	if len(answer.Citations) > 0 {
+		fmt.Println("\ncitations:")
+		for _, citation := range answer.Citations {
+			fmt.Printf("- %s [%s] (%s)\n", citation.Title, citation.Kind, citation.Path)
+		}
+	}
 	fmt.Println("\nresults:")
 	for i, result := range answer.Results {
 		fmt.Printf("%d. %s [%s] (%s) score=%d\n%s\n\n", i+1, result.Title, result.Kind, result.Path, result.Score, result.Snippet)
@@ -1297,7 +1573,7 @@ func syncWrittenWikiPages(ctx context.Context, projectPath, dsn, projectID strin
 }
 
 func aggregateWikiPaths(paths ...string) []string {
-	out := []string{"wiki/index.md", "wiki/log.md", "wiki/overview.md"}
+	out := []string{"wiki/index.md", "wiki/log.md", "wiki/overview.md", "wiki/reviews.md"}
 	for _, path := range paths {
 		if strings.TrimSpace(path) != "" {
 			out = append(out, filepath.ToSlash(path))
@@ -1457,7 +1733,10 @@ Global:
 Commands:
   init --path PATH [--name NAME]
   ingest --project PATH --source FILE [--title TITLE] [--kind KIND] [--db-dsn DSN --project-id ID]
-  validate-llmwiki --project PATH --source FILE_OR_DIR [--title TITLE] [--agent llm|mock] [--skip-unchanged] [--db-dsn DSN --project-id ID]
+  validate-llmwiki --project PATH --source FILE_OR_DIR [--title TITLE] [--agent llm|mock] [--skip-unchanged] [--progress] [--db-dsn DSN --project-id ID]
+  audit-wiki --project PATH [--baseline PATH --report FILE]
+  repair-wiki --project PATH [--apply]
+  refresh-overview --project PATH [--agent llm|mock]
   queue-ingest --project PATH --source FILE [--title TITLE]
   scan-sources --project PATH
   source-layout migrate --project PATH [--dry-run|--apply] [--db-dsn DSN --project-id ID --migrate-db]

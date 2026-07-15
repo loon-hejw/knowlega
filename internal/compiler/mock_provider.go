@@ -10,14 +10,22 @@ import (
 )
 
 type AnalysisInput struct {
-	SourceTitle   string
-	SourceRel     string
-	SourceText    string
-	Purpose       string
-	Schema        string
-	Index         string
-	Overview      string
-	ExistingPages string
+	SourceTitle      string
+	SourceRel        string
+	SourceText       string
+	Purpose          string
+	Schema           string
+	Index            string
+	Overview         string
+	ExistingPages    string
+	GenerationPolicy GenerationPolicy
+}
+
+type GenerationPolicy struct {
+	MaxFileBlocks        int
+	MaxNewPagesPerSource int
+	RemainingNewPages    int
+	UpdateOnly           bool
 }
 
 type Provider interface {
@@ -154,6 +162,10 @@ SEARCH: %s
 		entitySlug, entityTitle, input.SourceRel, today, today, entityTitle, entitySummary, evidence, conceptSlug, titleSlug, sourceTitle, titleSlug, sourceTitle,
 		sourceTitle, reviewSearch(sourceTitle),
 	), nil
+}
+
+func (MockProvider) SynthesizeOverview(input OverviewInput) (string, error) {
+	return "# Wiki Overview\n\nThis offline scaffold is navigated through [[Index]] and the generated source, concept, and entity pages.\n", nil
 }
 
 func isOAuthFixture(text string) bool {

@@ -45,6 +45,7 @@ type ChatAppendOptions struct {
 	EmbeddingProvider EmbeddingProvider
 	Context           context.Context
 	Progress          QueryProgressFunc
+	Runtime           QueryRuntimeOptions
 	OnWriteback       func(context.Context, QueryWritebackResult) error
 }
 
@@ -158,6 +159,7 @@ func AppendChatMessage(opts ChatAppendOptions) (ChatAppendResult, error) {
 		EmbeddingProvider:   opts.EmbeddingProvider,
 		Context:             ctx,
 		Progress:            opts.Progress,
+		Runtime:             opts.Runtime,
 	})
 	if err != nil {
 		return ChatAppendResult{}, err

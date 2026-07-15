@@ -9,9 +9,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"time"
 
-	"github.com/hejw/knowledge-core/internal/core"
 	"github.com/hejw/knowledge-core/internal/service"
 	"github.com/hejw/knowledge-core/internal/wiki"
 )
@@ -171,13 +169,9 @@ func (s mcpServer) callTool(call mcpToolCall) (string, error) {
 		if action == "" {
 			action = "mcp"
 		}
-		var resolved []core.ReviewItem
-		for _, id := range ids {
-			item, err := wiki.UpdateReviewItemStatusWithAction(s.projectPath, s.projectID, id, status, action, time.Now().UTC())
-			if err != nil {
-				return "", err
-			}
-			resolved = append(resolved, item)
+		resolved, err := service.UpdateReviewItemsStatus(s.projectPath, s.projectID, ids, status, action)
+		if err != nil {
+			return "", err
 		}
 		return jsonText(resolved), nil
 	case "kbcore_delete_source":

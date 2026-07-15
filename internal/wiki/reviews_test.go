@@ -53,3 +53,41 @@ OAuth ownership conflicts between two source notes.
 		t.Fatalf("id/date missing: %+v", item)
 	}
 }
+
+func TestParseReviewItemsKeepsRepeatedTitleTasksDistinct(t *testing.T) {
+	items := ParseReviewItems("project-1", `# Reviews
+
+## [2026-07-14] review-needed | Durability gate rejected wiki/entities/孙悟空.md
+
+- Source: `+"`raw/sources/chapter-002.txt`"+`
+- Status: resolved
+
+### Affected Pages
+
+- `+"`wiki/entities/孙悟空.md`"+`
+### Detail
+
+Earlier task.
+
+## [2026-07-14] review-needed | Durability gate rejected wiki/entities/孙悟空.md
+
+- Source: `+"`raw/sources/chapter-046.txt`"+`
+- Status: open
+
+### Affected Pages
+
+- `+"`wiki/entities/孙悟空.md`"+`
+### Detail
+
+Later task.
+`)
+	if len(items) != 2 {
+		t.Fatalf("items=%+v", items)
+	}
+	if items[0].ID == items[1].ID {
+		t.Fatalf("distinct Markdown review tasks share id %q", items[0].ID)
+	}
+	if items[0].Status != "resolved" || items[1].Status != "open" {
+		t.Fatalf("statuses=%q,%q", items[0].Status, items[1].Status)
+	}
+}

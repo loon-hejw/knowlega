@@ -198,6 +198,7 @@ func appendChatAssistantFromExistingUser(opts ChatAppendOptions, progress QueryP
 		EmbeddingProvider:   opts.EmbeddingProvider,
 		Context:             ctx,
 		Progress:            progress,
+		Runtime:             opts.Runtime,
 	})
 	if err != nil {
 		return ChatAppendResult{}, err

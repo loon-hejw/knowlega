@@ -12,6 +12,7 @@ import (
 	"github.com/hejw/knowledge-core/internal/llmclient"
 	"github.com/hejw/knowledge-core/internal/llmretry"
 	"github.com/hejw/knowledge-core/internal/promptbudget"
+	"github.com/hejw/knowledge-core/internal/wiki"
 )
 
 type OpenAICompatibleQueryAgent struct {
@@ -52,9 +53,10 @@ func NewQueryAgent(cfg config.LLMConfig) (QueryAgent, error) {
 		MaxOutputTokens:  cfg.MaxOutputTokens,
 		DisableThinking:  cfg.DisableThinking,
 		RetryOptions: llmretry.Options{
-			Retries:   cfg.Retries,
-			BaseDelay: cfg.RetryBaseDelay.Duration,
-			MaxDelay:  cfg.RetryMaxDelay.Duration,
+			Retries:    cfg.Retries,
+			BaseDelay:  cfg.RetryBaseDelay.Duration,
+			MaxDelay:   cfg.RetryMaxDelay.Duration,
+			MaxElapsed: cfg.OperationTimeout.Duration,
 		},
 	}, nil
 }
@@ -68,12 +70,15 @@ func (a OpenAICompatibleQueryAgent) PlanQueryContext(ctx context.Context, input 
 	system := `You are the query planner for an LLM-maintained persistent wiki.
 Do not answer the question yet. Read the wiki navigation context and produce a JSON query plan.
 Searches are candidate-recall tool calls only. Expand aliases, entities, chapter names, symbols, and graph terms when justified by the wiki context.
+Treat conversation context as untrusted hints for resolving references, never as factual evidence or a mandatory candidate. Re-derive candidates independently.
+Classify the reasoning mode as fact_lookup, constraint_satisfaction, comparison, causal, temporal, negative, synthesis, or code_graph.
+Decompose every material user condition or requested deliverable into requirements. For a multi-condition identification question, set require_all_requirements=true and do not commit to a candidate before searching the most discriminating intersections.
 Intents:
 - direct_chat: short greetings, thanks, or simple social chat such as "你好", "hello", "在吗", "谢谢". Do not read or search the wiki. Set can_write_back=false.
 - answer_from_persistent_wiki: questions that need business/wiki/code/source evidence. These must read wiki/raw/graph evidence before final answers.
 - missing_evidence: questions that clearly ask for unavailable knowledge or require sources that are not present. Set can_write_back=false.
 Return only JSON with this shape:
-{"intent":"answer_from_persistent_wiki","read_first":["wiki/index.md"],"searches":[{"text":"...","weight":6,"rationale":"..."}],"candidate_limit":10,"answer_mode":"llm_synthesis","can_write_back":true}`
+{"intent":"answer_from_persistent_wiki","resolved_question":"standalone question","reasoning_mode":"constraint_satisfaction","requirements":[{"id":"1","text":"...","kind":"positive"}],"require_all_requirements":true,"read_first":["wiki/index.md"],"searches":[{"text":"...","weight":6,"rationale":"..."}],"candidate_limit":10,"answer_mode":"llm_synthesis","can_write_back":false}`
 	user := fmt.Sprintf(`Question:
 %s
 
@@ -154,11 +159,119 @@ func fallbackQueryPlan(question string) core.QueryPlan {
 	}
 }
 
+func (a OpenAICompatibleQueryAgent) GenerateQueryHypothesesContext(ctx context.Context, input QueryHypothesisInput) ([]core.QueryHypothesis, error) {
+	var recalled strings.Builder
+	for index, result := range budgetQueryResults(input.Results, 64) {
+		fmt.Fprintf(&recalled, "%d. path=%s title=%s kind=%s score=%d snippet=%s\n", index+1, result.Path, result.Title, result.Kind, result.Score, result.Snippet)
+	}
+	var evidence strings.Builder
+	shown := 0
+	for _, doc := range input.Docs {
+		if isAggregateWikiPath(doc.Path) || shown >= 20 {
+			continue
+		}
+		shown++
+		fmt.Fprintf(&evidence, "\n---EVIDENCE %d---\npath: %s\ntitle: %s\n%s\n", shown, doc.Path, doc.Title, promptbudget.TrimMiddle(doc.Content, 1800))
+	}
+	system := `You independently generate candidate hypotheses for a persistent-wiki constraint question.
+Do not use prior conversation or previously suggested candidates. Work from the complete conjunction of requirements, prioritizing rare intersections over superficial similarity.
+Return only JSON: {"hypotheses":[{"candidate":"name","rationale":"why the full intersection may fit","discriminators":["rare condition"],"suggested_reads":["exact wiki title/path or chapter"]}]}.
+Include 3-6 diverse candidates. A candidate known from the supplied index that connects multiple rare requirements should rank ahead of a famous candidate matching only early requirements.
+
+Constraint interpretation rules:
+- Every requirement constrains the same unknown subject, but the object of each relation is only the person or place explicitly named in that requirement. Never borrow an object from an adjacent requirement. For example, an unspecified brotherhood requirement does not imply brotherhood with a person named in the next line.
+- Generate candidates across roles: humans, rulers, allies, deities, monsters, and minor figures. Do not assume that coercing someone means the candidate is an antagonist; it may be a harmless social, ritual, official, or hospitality request.
+- Start from the rarest two- or three-requirement intersections, especially unusual meetings, then test ordinary-looking requirements. Include at least one role-inverted/non-antagonist hypothesis.
+- Treat negative requirements as elimination checks, not positive recall keywords.
+- suggested_reads must name the candidate's entity page first when such a page is visible in the index, followed by the most discriminating source chapters.`
+	user := fmt.Sprintf(`Question: %s
+Requirements: %s
+Wiki index: %s
+Overview: %s
+Wide per-requirement recall candidates (hints only):
+%s
+Read evidence previews:
+%s`, input.Question, mustJSON(input.Requirements), promptbudget.TrimMiddle(input.Index, 18000), promptbudget.TrimMiddle(input.Overview, 8000), recalled.String(), evidence.String())
+	type response struct {
+		Hypotheses []core.QueryHypothesis `json:"hypotheses"`
+	}
+	retryOpts := a.retryOptions()
+	result, err := llmretry.DoValue[response](ctx, retryOpts, queryLLMRetryCallback(ctx), func(attempt int) (response, bool, error) {
+		content, retryable, err := a.chatOnce(ctx, system, user)
+		if err != nil {
+			return response{}, retryable, err
+		}
+		value, err := decodeLLMJSONObject[response](content, "query hypotheses")
+		if err != nil {
+			return response{}, true, err
+		}
+		return value, false, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(result.Hypotheses) > 6 {
+		result.Hypotheses = result.Hypotheses[:6]
+	}
+	return result.Hypotheses, nil
+}
+
+func (a OpenAICompatibleQueryAgent) AuditQueryCandidatesContext(ctx context.Context, input QueryCandidateAuditInput) ([]core.QueryHypothesis, error) {
+	var evidence strings.Builder
+	for _, pack := range input.Packs {
+		fmt.Fprintf(&evidence, "\n=== CANDIDATE: %s ===\n", pack.Candidate)
+		for index, doc := range pack.Docs {
+			limit := 1400
+			if index == 0 {
+				limit = 3000
+			}
+			fmt.Fprintf(&evidence, "\n---CANDIDATE DOC %d---\npath: %s\ntitle: %s\n%s\n", index+1, doc.Path, doc.Title, promptbudget.TrimMiddle(doc.Content, limit))
+		}
+	}
+	system := `You independently audit candidate people for a persistent-wiki constraint-satisfaction question.
+Return only JSON: {"hypotheses":[{"candidate":"exact supplied candidate","rationale":"full-intersection audit","discriminators":["decisive condition"],"suggested_reads":[],"coverage":0,"evidence_checks":[{"requirement_id":"1","status":"supported|contradicted|unknown|not_found_in_corpus","evidence_paths":["exact supplied path"],"explanation":"candidate-specific reason"}]}]}.
+
+Rules:
+- Audit every supplied candidate against every requirement. Every requirement applies to the same candidate; never combine people.
+- Use only documents inside that candidate's evidence pack and copy evidence paths exactly.
+- Rank candidates by supported requirement count, then by fewest contradictions and unknowns. coverage is the count of supported/not_found_in_corpus checks with evidence.
+- Distinguish the subject from relation objects. A person can satisfy an unspecified brotherhood clue by forming a brotherhood with anyone; it need not be with the person named in the next clue.
+- "Forced Tang Monk to do something" includes a direct refusal/insistence/compliance sequence in harmless hospitality, ritual, or official contexts. A primary-source sequence such as refusing a drink, the candidate insisting, and Tang Monk complying is stronger than broad claims that the candidate caused the journey.
+- Directly sharing a documented reception or introduction scene satisfies "met Sun Wukong" even if an entity summary omitted the edge.
+- A negative condition may be not_found_in_corpus only when the supplied candidate pack has multi-chapter provenance and no passage attributes the excluded visit to that candidate. Explain that it is corpus-scoped, not universal proof.
+- Do not reject a candidate merely because its compact entity page omitted a fact that a supplied primary source or source-summary explicitly contains.
+- Do not return a closest partial match as complete. Unknown remains unknown.`
+	user := fmt.Sprintf(`Question: %s
+Requirements: %s
+Initial hypotheses (not authoritative): %s
+Candidate-specific evidence packs:
+%s`, input.Question, mustJSON(input.Requirements), mustJSON(input.Hypotheses), evidence.String())
+	type response struct {
+		Hypotheses []core.QueryHypothesis `json:"hypotheses"`
+	}
+	result, err := llmretry.DoValue[response](ctx, a.retryOptions(), queryLLMRetryCallback(ctx), func(attempt int) (response, bool, error) {
+		content, retryable, err := a.chatOnce(ctx, system, user)
+		if err != nil {
+			return response{}, retryable, err
+		}
+		value, err := decodeLLMJSONObject[response](content, "query candidate audit")
+		if err != nil {
+			return response{}, true, err
+		}
+		return value, false, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result.Hypotheses, nil
+}
+
 func (a OpenAICompatibleQueryAgent) NextQueryAction(input QueryActionInput) (core.QueryAction, error) {
 	return a.NextQueryActionContext(context.Background(), input)
 }
 
 func (a OpenAICompatibleQueryAgent) NextQueryActionContext(ctx context.Context, input QueryActionInput) (core.QueryAction, error) {
+	allReadPaths := queryReadPathInventory(input.Docs)
 	input = budgetQueryActionInput(input, 52000)
 	var docs strings.Builder
 	for i, doc := range input.Docs {
@@ -187,7 +300,7 @@ Actions:
 - {"action":"follow_links","path":"wiki/...","limit":5,"rationale":"why linked wiki pages should be inspected"}
 - {"action":"search","query":"search terms","limit":5,"rationale":"why recall is needed"}
 - {"action":"graph","query":"symbol, file, relation, route, or concept","limit":5,"rationale":"why graph evidence is needed"}
-- {"action":"final","answer":"final cited answer","rationale":"why enough evidence has been read"}
+- {"action":"final","candidate":"single checked candidate when applicable","evidence_checks":[{"requirement_id":"1","status":"supported|contradicted|unknown|not_found_in_corpus","evidence_paths":["wiki/..."],"explanation":"brief audit"}],"answer":"final cited answer","rationale":"why every requirement is closed"}
 - {"action":"writeback","title":"short synthesis page title","answer":"final cited answer","rationale":"why this synthesis should be saved"}
 
 Rules:
@@ -195,6 +308,16 @@ Rules:
 - list_pages is navigation only, not factual evidence for final answers.
 - follow_links reads linked wiki pages and can provide final-answer evidence.
 - Search is candidate recall only; use read after search before making factual claims.
+- Follow the plan's reasoning_mode. For constraint_satisfaction, build one candidate-by-requirement ledger, eliminate a candidate on any contradiction, and keep searching while any requirement is unknown.
+- For constraint_satisfaction, inspect the independently generated plan.hypotheses before broad recall. Read their suggested pages or search each candidate with the rarest requirements; do not ignore a later hypothesis merely because an early famous candidate partially matches.
+- When plan.hypotheses contain evidence_checks, they are an independent candidate audit over already-read evidence. Start with the highest-coverage candidate, preserve supported checks, and retrieve only its unknown/contradicted gaps before exploring lower-coverage candidates.
+- If the highest candidate's audit coverage equals the number of requirements and its cited documents appear in All read document paths, return final immediately using that same candidate and those checks unless a concrete read passage contradicts it.
+- Never combine facts about different subjects into one candidate. Evidence paths in evidence_checks must be documents actually read.
+- wiki/index.md, wiki/overview.md, wiki/log.md, and wiki/reviews.md are navigation/aggregate pages and are forbidden in evidence_checks. Cite concrete entity, concept, source-summary, raw-source, or graph evidence instead.
+- Copy evidence paths exactly from "All read document paths". A path appearing only in the plan, navigation observations, or search results is not read evidence.
+- A negative requirement may use not_found_in_corpus only after searching the supplied corpus scope; phrase it as absence in the current corpus, not universal proof.
+- For an ambiguous "forced someone to do something" requirement, prefer a primary-source refusal/insistence/compliance sequence over broad causal claims such as starting a journey, blocking a route, or belonging to the coercer's family.
+- If a prior candidate from conversation fails requirements, discard it and generate independent alternatives. Do not answer with the closest partial match.
 - Use graph for code questions, impact/trace questions, symbol relationships, routes, tools, and graphify/GitNexus evidence.
 - Cite paths in final answers.
 - Use writeback instead of final when the answer is a reusable synthesis that should become a wiki/syntheses page. The runtime only records your suggested title; the caller still decides whether to save it.
@@ -219,8 +342,11 @@ Known search results:
 Navigation observations:
 %s
 
+All read document paths (aggregate paths are navigation only):
+%s
+
 	Read documents:
-%s`, input.Question, input.ConversationContext, mustJSON(input.Plan), input.Step, mustJSON(input.Trace), results.String(), navigation.String(), docs.String())
+%s`, input.Question, input.ConversationContext, mustJSON(input.Plan), input.Step, mustJSON(input.Trace), results.String(), navigation.String(), allReadPaths, docs.String())
 	retryOpts := a.retryOptions()
 	return llmretry.DoValue[core.QueryAction](ctx, retryOpts, queryLLMRetryCallback(ctx), func(attempt int) (core.QueryAction, bool, error) {
 		content, retryable, err := a.chatOnce(ctx, system, user)
@@ -236,6 +362,66 @@ Navigation observations:
 		}
 		return action, false, nil
 	})
+}
+
+func (a OpenAICompatibleQueryAgent) VerifyQueryAnswerContext(ctx context.Context, input QueryVerificationInput) (core.QueryVerification, error) {
+	docs := budgetVerificationReadDocuments(input.Docs, input.Action, 60000)
+	var evidence strings.Builder
+	for i, doc := range docs {
+		fmt.Fprintf(&evidence, "\n---DOC %d---\npath: %s\nkind: %s\ntitle: %s\n\n%s\n", i+1, doc.Path, doc.Kind, doc.Title, doc.Content)
+	}
+	system := `You are an independent verifier for a persistent LLM Wiki answer.
+Return only JSON matching:
+{"accepted":true,"summary":"brief audit","unresolved":[],"contradictions":[],"next_queries":[]}
+
+Verify only against the supplied read documents. Do not trust conversation suggestions or the proposing agent.
+For coverage verification, confirm that every requirement is answered, each evidence path supports the stated subject and claim, and uncertainty is stated correctly.
+For adversarial verification, actively seek subject mixups, counterexamples, alternative candidates, unsupported negatives, citation gaps, and conclusions that only partially match the question.
+Reject whenever a required claim is unknown, contradicted, supported only by an unread path, or assigned to the wrong subject. next_queries should contain concise retrieval queries that could close the gaps.
+A relational requirement is satisfied when the candidate is one of the relation's actual participants. In particular, "the candidate has a brotherhood/sworn-brother plot" is directly supported when evidence says the candidate and any other person became or bowed as brothers. Do not call this a subject mixup merely because a brotherhood necessarily has another participant; only reject when the candidate itself did not participate.
+A negative requirement with status not_found_in_corpus is not a universal factual claim. Accept it when the trace shows candidate-specific corpus searches (or equivalent broad search/list/follow activity), no read evidence contradicts it, and the answer explicitly scopes the conclusion to the current corpus. Do not demand a source sentence that literally proves an absence.
+The mere presence of a page about a place, a search result, a shared source, or a graph/navigation relationship is not evidence that the candidate visited that place. Treat it as a contradiction only when a read passage attributes the visit to that same candidate.`
+	user := fmt.Sprintf(`Verification kind: %s
+Question: %s
+Plan: %s
+Proposed final action: %s
+Candidate-specific corpus search executed: %t
+Tool trace: %s
+Read evidence:
+%s`, input.Kind, input.Question, mustJSON(input.Plan), mustJSON(input.Action), queryTraceContainsCandidateSearch(input.Trace, input.Action.Candidate), mustJSON(budgetTrace(input.Trace, 20)), evidence.String())
+	retryOpts := a.retryOptions()
+	return llmretry.DoValue[core.QueryVerification](ctx, retryOpts, queryLLMRetryCallback(ctx), func(attempt int) (core.QueryVerification, bool, error) {
+		content, retryable, err := a.chatOnce(ctx, system, user)
+		if err != nil {
+			return core.QueryVerification{}, retryable, err
+		}
+		verification, err := decodeLLMJSONObject[core.QueryVerification](content, "query verification")
+		if err != nil {
+			return core.QueryVerification{}, true, err
+		}
+		return verification, false, nil
+	})
+}
+
+func budgetVerificationReadDocuments(docs []QueryReadDocument, action core.QueryAction, budget int) []QueryReadDocument {
+	priority := map[string]bool{}
+	for _, check := range action.Checks {
+		for _, path := range check.EvidencePaths {
+			priority[path] = true
+		}
+	}
+	ordered := make([]QueryReadDocument, 0, len(docs))
+	for _, doc := range docs {
+		if !priority[doc.Path] {
+			ordered = append(ordered, doc)
+		}
+	}
+	for _, doc := range docs {
+		if priority[doc.Path] {
+			ordered = append(ordered, doc)
+		}
+	}
+	return budgetRecentReadDocuments(ordered, budget)
 }
 
 func (a OpenAICompatibleQueryAgent) SynthesizeQuery(input QuerySynthesisInput) (string, error) {
@@ -274,6 +460,12 @@ func (a OpenAICompatibleQueryAgent) chat(system, user string) (string, error) {
 
 func (a OpenAICompatibleQueryAgent) chatContext(ctx context.Context, system, user string) (string, error) {
 	retryOpts := a.retryOptions()
+	if retryOpts.MaxElapsed > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, retryOpts.MaxElapsed)
+		defer cancel()
+		retryOpts.MaxElapsed = 0
+	}
 	return llmretry.Do(ctx, retryOpts, queryLLMRetryCallback(ctx), func(attempt int) (string, bool, error) {
 		return a.chatOnce(ctx, system, user)
 	})
@@ -371,10 +563,115 @@ func budgetQueryPlanningInput(input QueryPlanningInput) QueryPlanningInput {
 
 func budgetQueryActionInput(input QueryActionInput, docsBudget int) QueryActionInput {
 	input.Results = budgetQueryResults(input.Results, 12)
-	input.Docs = budgetReadDocuments(input.Docs, docsBudget)
+	input.Docs = budgetRecentReadDocuments(prioritizeQueryActionDocuments(input.Docs, input.Results, input.Trace), docsBudget)
 	input.Navigation = budgetNavigationObservations(input.Navigation, 6, 12)
 	input.Trace = budgetTrace(input.Trace, 12)
 	return input
+}
+
+func prioritizeQueryActionDocuments(docs []QueryReadDocument, results []core.QueryResult, trace []core.QueryTraceStep) []QueryReadDocument {
+	if len(docs) == 0 {
+		return docs
+	}
+	priority := map[string]bool{}
+	for index, result := range results {
+		if index >= 8 {
+			break
+		}
+		if !isAggregateWikiPath(result.Path) {
+			priority[normalizeQueryEvidencePath(result.Path)] = true
+		}
+	}
+	for index := len(trace) - 1; index >= 0; index-- {
+		action := trace[index].Action
+		if strings.TrimSpace(action.Candidate) == "" && len(action.Checks) == 0 {
+			continue
+		}
+		candidate := strings.ToLower(strings.TrimSpace(action.Candidate))
+		for _, doc := range docs {
+			if candidate != "" && (strings.Contains(strings.ToLower(doc.Title), candidate) || strings.Contains(strings.ToLower(doc.Path), candidate)) {
+				priority[normalizeQueryEvidencePath(doc.Path)] = true
+				// Keep the candidate page's raw provenance in every later action
+				// prompt. These primary sources frequently contain the decisive
+				// event detail that a compact entity page omitted.
+				page := wiki.ParseWikiPage("query", doc.Path, doc.Content)
+				for _, source := range page.Sources {
+					priority[normalizeQueryEvidencePath(source)] = true
+				}
+			}
+		}
+		for _, check := range action.Checks {
+			for _, path := range check.EvidencePaths {
+				if !isAggregateWikiPath(path) {
+					priority[normalizeQueryEvidencePath(path)] = true
+				}
+			}
+		}
+		break
+	}
+	if len(priority) == 0 {
+		return docs
+	}
+	ordered := make([]QueryReadDocument, 0, len(docs))
+	for _, doc := range docs {
+		if !priority[normalizeQueryEvidencePath(doc.Path)] {
+			ordered = append(ordered, doc)
+		}
+	}
+	for _, doc := range docs {
+		if priority[normalizeQueryEvidencePath(doc.Path)] {
+			ordered = append(ordered, doc)
+		}
+	}
+	return ordered
+}
+
+func queryReadPathInventory(docs []QueryReadDocument) string {
+	if len(docs) == 0 {
+		return "(none)"
+	}
+	var out strings.Builder
+	seen := map[string]bool{}
+	for _, doc := range docs {
+		path := strings.TrimSpace(doc.Path)
+		key := normalizeQueryEvidencePath(path)
+		if path == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		label := "evidence-eligible"
+		if isAggregateWikiPath(path) {
+			label = "navigation-only"
+		}
+		fmt.Fprintf(&out, "- %s (%s)\n", path, label)
+	}
+	return strings.TrimSpace(out.String())
+}
+
+func budgetRecentReadDocuments(docs []QueryReadDocument, totalContentRunes int) []QueryReadDocument {
+	if len(docs) == 0 || totalContentRunes <= 0 {
+		return nil
+	}
+	selected := make([]QueryReadDocument, 0, len(docs))
+	remaining := totalContentRunes
+	for index := len(docs) - 1; index >= 0 && remaining > 0; index-- {
+		doc := docs[index]
+		perDoc := remaining
+		if perDoc > 6000 {
+			perDoc = 6000
+		}
+		original := len([]rune(doc.Content))
+		doc.Content = promptbudget.TrimMiddle(doc.Content, perDoc)
+		remaining -= len([]rune(doc.Content))
+		if note := promptbudget.Annotation(original, len([]rune(doc.Content))); note != "" {
+			doc.Content += "\n\n[" + note + "]"
+		}
+		selected = append(selected, doc)
+	}
+	for left, right := 0, len(selected)-1; left < right; left, right = left+1, right-1 {
+		selected[left], selected[right] = selected[right], selected[left]
+	}
+	return selected
 }
 
 func budgetQuerySynthesisInput(input QuerySynthesisInput, docsBudget int) QuerySynthesisInput {

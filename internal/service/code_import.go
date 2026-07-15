@@ -43,6 +43,11 @@ type CodeGraphSyncResult struct {
 }
 
 func ImportGraphifyCodeSnapshot(opts CodeImportOptions) (CodeImportResult, error) {
+	release, err := acquireServiceProjectLock(opts.ProjectPath)
+	if err != nil {
+		return CodeImportResult{}, err
+	}
+	defer release()
 	if opts.RepoID == "" {
 		opts.RepoID = core.Slug(filepath.Base(opts.RepoPath))
 	}
@@ -75,6 +80,9 @@ func ImportGraphifyCodeSnapshot(opts CodeImportOptions) (CodeImportResult, error
 		Body: renderCodeOverview(snap),
 	})
 	if err := wiki.WriteVersionedPage(opts.ProjectPath, filepath.ToSlash(overviewRel), []byte(page), "code-import: "+opts.RepoID); err != nil {
+		return CodeImportResult{}, err
+	}
+	if err := registerPageOwnership(opts.ProjectPath, filepath.ToSlash(overviewRel), "code"); err != nil {
 		return CodeImportResult{}, err
 	}
 	_ = appendLog(opts.ProjectPath, "code-import", opts.RepoID, fmt.Sprintf("Imported graphify snapshot with %d nodes and %d edges.", len(snap.Nodes), len(snap.Edges)))

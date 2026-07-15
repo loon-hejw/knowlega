@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -322,6 +323,230 @@ The bed uses [[Compost Blend A]] in spring.
 	}
 	if hasLintIssue(issues, "missing-link", "wiki/concepts/spring.md", "compost b") {
 		t.Fatalf("short alias should not match prefix of another term, got %+v", issues)
+	}
+}
+
+func TestLintSkipsAmbiguousAliasMentions(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"east-king", "west-king"} {
+		mustWrite(t, filepath.Join(root, "wiki", "entities", name+".md"), `---
+type: entity
+title: `+name+`
+aliases:
+  - Dragon King
+---
+
+# `+name+`
+
+Identity page.
+`)
+	}
+	mustWrite(t, filepath.Join(root, "wiki", "concepts", "court.md"), `---
+type: concept
+title: Court
+---
+
+# Court
+
+The Dragon King appears here without enough context to identify which one.
+`)
+	issues, err := LintWiki(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasLintIssue(issues, "missing-link", "wiki/concepts/court.md", "dragon king") {
+		t.Fatalf("ambiguous alias should not select an arbitrary target: %+v", issues)
+	}
+}
+
+func TestLintSkipsHighFrequencyAliasMentions(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(root, "wiki", "entities", "named-demon.md"), `---
+type: entity
+title: Named Demon
+aliases:
+  - demon king
+---
+
+# Named Demon
+
+Identity page.
+`)
+	for index := 0; index < 9; index++ {
+		name := fmt.Sprintf("note-%02d", index)
+		mustWrite(t, filepath.Join(root, "wiki", "concepts", name+".md"), `---
+type: concept
+title: `+name+`
+---
+
+# `+name+`
+
+A demon king appears as a generic role.
+`)
+	}
+	issues, err := LintWiki(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasLintIssue(issues, "missing-link", "wiki/concepts/note-00.md", "demon king") {
+		t.Fatalf("high-frequency alias should not become a mandatory link: %+v", issues)
+	}
+}
+
+func TestRepairKnownMentionLinksIsSafeAndIdempotent(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(root, "wiki", "entities", "north-garden.md"), `---
+type: entity
+title: North Garden
+aliases:
+  - Northern Garden
+---
+
+# North Garden
+
+The garden is durable knowledge.
+`)
+	mustWrite(t, filepath.Join(root, "wiki", "concepts", "route.md"), `---
+type: concept
+title: Route Notes
+---
+
+# Northern Garden route
+
+Travelers cross the Northern Garden before dawn.
+
+The literal command is `+"`visit North Garden`"+` and must remain code.
+`)
+
+	issues, err := LintWiki(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasLintIssue(issues, "missing-link", "wiki/concepts/route.md", "northern garden") {
+		t.Fatalf("expected repairable missing link: %+v", issues)
+	}
+	linked, err := RepairKnownMentionLinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linked != 1 {
+		t.Fatalf("linked=%d", linked)
+	}
+	data, err := os.ReadFile(filepath.Join(root, "wiki", "concepts", "route.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := string(data)
+	if !strings.Contains(content, "[[north-garden|Northern Garden]]") || !strings.Contains(content, "`visit North Garden`") {
+		t.Fatalf("unexpected repaired page:\n%s", content)
+	}
+	if strings.Contains(content, "# [[") {
+		t.Fatalf("heading must not be linked:\n%s", content)
+	}
+	linked, err = RepairKnownMentionLinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linked != 0 {
+		t.Fatalf("second repair linked=%d", linked)
+	}
+	issues, err = LintWiki(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasLintIssue(issues, "missing-link", "wiki/concepts/route.md", "northern garden") {
+		t.Fatalf("missing link survived repair: %+v", issues)
+	}
+}
+
+func TestRepairKnownMentionLinksIgnoresAggregatePagesWhenScoringAliasFrequency(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(root, "wiki", "entities", "drill-head-mountain.md"), `---
+type: entity
+title: 钻头号山
+aliases:
+  - 号山
+---
+
+# 钻头号山
+
+一处山地。
+`)
+	for index := 0; index < 5; index++ {
+		mustWrite(t, filepath.Join(root, "wiki", "concepts", fmt.Sprintf("route-%d.md", index)), fmt.Sprintf(`---
+type: concept
+title: 路线%d
+---
+
+# 路线%d
+
+行者来到号山继续前行。
+`, index, index))
+	}
+	// These four exempt aggregate pages would push the alias above the minimum
+	// frequency threshold if their transient contents were counted.
+	for _, path := range []string{"index.md", "overview.md", "log.md", "reviews.md"} {
+		mustWrite(t, filepath.Join(root, "wiki", path), "# Aggregate\n\n号山 navigation.\n")
+	}
+
+	linked, err := RepairKnownMentionLinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linked != 5 {
+		t.Fatalf("linked=%d, want 5", linked)
+	}
+	issues, err := LintWiki(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index < 5; index++ {
+		path := fmt.Sprintf("wiki/concepts/route-%d.md", index)
+		if hasLintIssue(issues, "missing-link", path, "号山") {
+			t.Fatalf("aggregate pages made alias repair unstable: %+v", issues)
+		}
+	}
+}
+
+func TestLintIgnoresMentionsOnlyInHeadingsAndCode(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, filepath.Join(root, "wiki", "entities", "token-service.md"), `---
+type: entity
+title: Token Service
+---
+
+# Token Service
+`)
+	mustWrite(t, filepath.Join(root, "wiki", "concepts", "commands.md"), `---
+type: concept
+title: Commands
+---
+
+# Token Service commands
+
+Run `+"`Token Service`"+` in a shell.
+`)
+	issues, err := LintWiki(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasLintIssue(issues, "missing-link", "wiki/concepts/commands.md", "token service") {
+		t.Fatalf("protected Markdown mention must not require a link: %+v", issues)
 	}
 }
 

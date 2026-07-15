@@ -79,7 +79,7 @@ func NewLLMGraphSemanticEnricher(cfg config.LLMConfig) (GraphSemanticEnricher, e
 			BaseURL: cfg.BaseURL, APIKey: cfg.APIKey, Model: cfg.Model, Protocol: cfg.Protocol,
 			UserAgent: cfg.UserAgent, AnthropicVersion: cfg.AnthropicVersion, HTTPClient: &http.Client{Timeout: timeout},
 		},
-		retry:         llmretry.Options{Retries: cfg.Retries, BaseDelay: cfg.RetryBaseDelay.Duration, MaxDelay: cfg.RetryMaxDelay.Duration},
+		retry:         llmretry.Options{Retries: cfg.Retries, BaseDelay: cfg.RetryBaseDelay.Duration, MaxDelay: cfg.RetryMaxDelay.Duration, MaxElapsed: cfg.OperationTimeout.Duration},
 		maxInputChars: cfg.MaxInputChars, maxOutputTokens: minPositive(cfg.MaxOutputTokens, 4096),
 		disableThinking: cfg.DisableThinking, model: cfg.Model,
 	}

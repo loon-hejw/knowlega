@@ -55,6 +55,11 @@ func IndexGoCodeSnapshot(opts GoCodeIndexOptions) (GoCodeIndexResult, error) {
 	if strings.TrimSpace(opts.ProjectPath) == "" {
 		return GoCodeIndexResult{}, fmt.Errorf("project path is required")
 	}
+	release, err := acquireServiceProjectLock(opts.ProjectPath)
+	if err != nil {
+		return GoCodeIndexResult{}, err
+	}
+	defer release()
 	snapshot, err := codegraph.IndexGoRepository(codegraph.GoIndexOptions{
 		RepoID: opts.RepoID, RepoPath: opts.RepoPath, Commit: opts.Commit, IncludeTests: opts.IncludeTests,
 	})
@@ -126,6 +131,11 @@ func IndexGoCodeSnapshot(opts GoCodeIndexOptions) (GoCodeIndexResult, error) {
 	}
 	if err := pruneStaleCodeGeneratedPages(opts.ProjectPath, snapshot.RepoID, keepGenerated); err != nil {
 		return GoCodeIndexResult{}, err
+	}
+	for _, rel := range written {
+		if err := registerPageOwnership(opts.ProjectPath, rel, "code"); err != nil {
+			return GoCodeIndexResult{}, err
+		}
 	}
 	_ = appendIndex(opts.ProjectPath, "Code", snapshot.RepoID+" Code Overview", overviewPath)
 	_ = appendLog(opts.ProjectPath, "code-index", snapshot.RepoID, fmt.Sprintf("Indexed Go repository commit `%s` with %d nodes, %d edges, %d communities, and %d processes.", snapshot.Commit, len(snapshot.Nodes), len(snapshot.Edges), len(snapshot.Communities), len(snapshot.Processes)))

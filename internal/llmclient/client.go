@@ -8,10 +8,43 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/hejw/knowledge-core/internal/llmretry"
 )
+
+type concurrencyLimiter struct {
+	slots chan struct{}
+}
+
+var globalConcurrency atomic.Pointer[concurrencyLimiter]
+
+func init() {
+	SetGlobalConcurrency(4)
+}
+
+// SetGlobalConcurrency applies one process-wide limit to compiler, query,
+// review, graph enrichment and every other LLM client using this package.
+func SetGlobalConcurrency(limit int) {
+	if limit < 1 {
+		limit = 1
+	}
+	globalConcurrency.Store(&concurrencyLimiter{slots: make(chan struct{}, limit)})
+}
+
+func acquireGlobal(ctx context.Context) (func(), error) {
+	limiter := globalConcurrency.Load()
+	if limiter == nil {
+		return func() {}, nil
+	}
+	select {
+	case limiter.slots <- struct{}{}:
+		return func() { <-limiter.slots }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
 const (
 	ProtocolOpenAI          = "openai"
@@ -48,6 +81,11 @@ func (c Client) Chat(ctx context.Context, input ChatRequest) (string, bool, erro
 	if input.MaxTokens <= 0 {
 		return "", false, fmt.Errorf("llm max tokens must be positive")
 	}
+	release, err := acquireGlobal(ctx)
+	if err != nil {
+		return "", false, err
+	}
+	defer release()
 	switch normalizeProtocol(c.Protocol) {
 	case ProtocolOpenAI:
 		return c.chatOpenAI(ctx, input)
@@ -92,7 +130,7 @@ func (c Client) chatOpenAI(ctx context.Context, input ChatRequest) (string, bool
 		return "", retryable, err
 	}
 	if status < 200 || status >= 300 {
-		return "", llmretry.RetryableStatus(status), requestStatusError(status, data)
+		return "", retryableStatusResponse(status, data), requestStatusError(status, data)
 	}
 	var parsed openAIResponse
 	if err := json.Unmarshal(data, &parsed); err != nil {
@@ -139,7 +177,7 @@ func (c Client) chatAnthropic(ctx context.Context, input ChatRequest) (string, b
 		return "", retryable, err
 	}
 	if status < 200 || status >= 300 {
-		return "", llmretry.RetryableStatus(status), requestStatusError(status, data)
+		return "", retryableStatusResponse(status, data), requestStatusError(status, data)
 	}
 	var parsed anthropicResponse
 	if err := json.Unmarshal(data, &parsed); err != nil {
@@ -156,6 +194,19 @@ func (c Client) chatAnthropic(ctx context.Context, input ChatRequest) (string, b
 		return "", true, emptyContentError(c.Model, data)
 	}
 	return content, false, nil
+}
+
+func retryableStatusResponse(status int, data []byte) bool {
+	if llmretry.RetryableStatus(status) {
+		return true
+	}
+	// Some compatible gateways multiplex Codex-backed ChatGPT accounts with
+	// ordinary API backends. A routed account can reject a model that another
+	// account in the same gateway serves successfully. Let the provider retry
+	// this specific account-routing response before escalating it to the source
+	// scheduler; ordinary 400 configuration errors remain non-retryable.
+	message := strings.ToLower(string(data))
+	return status == http.StatusBadRequest && strings.Contains(message, "model is not supported when using codex with a chatgpt account")
 }
 
 func (c Client) do(ctx context.Context, endpoint string, body []byte, setHeaders func(*http.Request)) ([]byte, int, bool, error) {
