@@ -19,8 +19,11 @@ PostgreSQL 索引；QM 负责用户、项目、成员、权限、会话和审计
 - `Search`：只做候选召回，不能替代 `Query` 的证据读取流程。
 - `ReadDocument`：只允许读取 `wiki/` 或 `raw/sources/` 下的项目相对路径。
 
-QM 每次调用携带当前 scope；Knowledge Core 将 QM 的项目 scope 绑定为
-`group:project:<qmProjectId>`。`CallerContext.scope_id` 必须和请求 scope 一致，
+QM 每次调用携带当前 scope；当前 QM 项目实现使用
+`group:web-project-<qmProjectId>` 作为项目 scope（以 QM 的
+`projectScopeId` 返回值为准），Knowledge Core 不重写这个外部标识。
+Knowledge Core 单项目命令行模式的默认绑定仍是
+`group:project:<projectID>`。`CallerContext.scope_id` 必须和请求 scope 一致，
 否则返回 `PERMISSION_DENIED`。
 
 ## 配置
