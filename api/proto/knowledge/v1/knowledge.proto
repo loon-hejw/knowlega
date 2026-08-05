@@ -38,6 +38,7 @@ message EnsureScopeRequest {
 
 message GetStatusRequest {
   ScopeRef scope = 1;
+  CallerContext caller = 2;
 }
 
 message ScopeStatus {
@@ -45,7 +46,6 @@ message ScopeStatus {
   string project_id = 2;
   string project_name = 3;
   string status = 4;
-  string root_path = 5;
   int64 wiki_page_count = 6;
   int64 source_count = 7;
   bool ready = 8;

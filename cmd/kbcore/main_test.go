@@ -42,6 +42,7 @@ func TestUsageDocumentsLLMAgentOnly(t *testing.T) {
 		"validate-llmwiki --project PATH --source FILE_OR_DIR",
 		"[--agent llm|mock]",
 		"query --project PATH --q QUERY",
+		"--progress=true|false",
 		"lint --project PATH [--agent structural|llm]",
 		"review-wiki --project PATH",
 		"code-import-graphify",

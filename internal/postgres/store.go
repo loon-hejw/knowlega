@@ -82,6 +82,53 @@ ON CONFLICT (id) DO UPDATE SET
 	return err
 }
 
+func (s *Store) UpsertScopeBinding(ctx context.Context, binding core.ScopeBinding) error {
+	if binding.CreatedAt.IsZero() {
+		binding.CreatedAt = time.Now()
+	}
+	if binding.UpdatedAt.IsZero() {
+		binding.UpdatedAt = time.Now()
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO scope_bindings (provider, external_scope_id, kind, organization_id, project_id, project_name, root_path, status, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+ON CONFLICT (provider, external_scope_id) DO UPDATE SET
+  kind = EXCLUDED.kind,
+  organization_id = EXCLUDED.organization_id,
+  project_id = EXCLUDED.project_id,
+  project_name = EXCLUDED.project_name,
+  root_path = EXCLUDED.root_path,
+  status = EXCLUDED.status,
+  updated_at = EXCLUDED.updated_at
+`, binding.Provider, binding.ExternalScopeID, binding.Kind, binding.OrganizationID, binding.ProjectID,
+		binding.ProjectName, binding.RootPath, binding.Status, binding.CreatedAt, binding.UpdatedAt)
+	return err
+}
+
+func (s *Store) GetScopeBinding(ctx context.Context, provider, externalScopeID string) (core.ScopeBinding, error) {
+	var binding core.ScopeBinding
+	err := s.db.QueryRowContext(ctx, `
+SELECT provider, external_scope_id, kind, organization_id, project_id, project_name, root_path, status, created_at, updated_at
+FROM scope_bindings
+WHERE provider = $1 AND external_scope_id = $2
+`, provider, externalScopeID).Scan(
+		&binding.Provider, &binding.ExternalScopeID, &binding.Kind, &binding.OrganizationID,
+		&binding.ProjectID, &binding.ProjectName, &binding.RootPath, &binding.Status,
+		&binding.CreatedAt, &binding.UpdatedAt,
+	)
+	return binding, err
+}
+
+func (s *Store) CountProjectDocuments(ctx context.Context, projectID string) (pages, sources int64, err error) {
+	if err = s.db.QueryRowContext(ctx, `SELECT count(*) FROM wiki_pages WHERE project_id = $1`, projectID).Scan(&pages); err != nil {
+		return 0, 0, err
+	}
+	if err = s.db.QueryRowContext(ctx, `SELECT count(*) FROM sources WHERE project_id = $1`, projectID).Scan(&sources); err != nil {
+		return 0, 0, err
+	}
+	return pages, sources, nil
+}
+
 func (s *Store) UpsertSource(ctx context.Context, src core.Source) error {
 	_, err := s.db.ExecContext(ctx, `
 INSERT INTO sources (id, project_id, path, kind, title, sha256, immutable, original_path, imported_at)

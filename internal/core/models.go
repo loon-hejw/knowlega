@@ -26,6 +26,22 @@ type Project struct {
 	UpdatedAt time.Time
 }
 
+// ScopeBinding maps an external collaboration scope (for example a QM
+// project) to a Knowledge Core project. The root path is server-owned routing
+// metadata; callers must never be allowed to choose it per request.
+type ScopeBinding struct {
+	Provider        string
+	ExternalScopeID string
+	Kind            string
+	OrganizationID  string
+	ProjectID       string
+	ProjectName     string
+	RootPath        string
+	Status          string
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
 type Source struct {
 	ID           string
 	ProjectID    string
@@ -178,12 +194,11 @@ type ReviewOption struct {
 }
 
 type QueryResult struct {
-	Path                  string   `json:"path"`
-	Title                 string   `json:"title"`
-	Snippet               string   `json:"snippet"`
-	Score                 int      `json:"score"`
-	Kind                  string   `json:"kind"`
-	MatchedRequirementIDs []string `json:"matched_requirement_ids,omitempty"`
+	Path    string `json:"path"`
+	Title   string `json:"title"`
+	Snippet string `json:"snippet"`
+	Score   int    `json:"score"`
+	Kind    string `json:"kind"`
 }
 
 type QuerySearch struct {
@@ -193,10 +208,9 @@ type QuerySearch struct {
 }
 
 type QueryRequirement struct {
-	ID            string   `json:"id"`
-	Text          string   `json:"text"`
-	Kind          string   `json:"kind,omitempty"`
-	SearchQueries []string `json:"search_queries,omitempty"`
+	ID   string `json:"id"`
+	Text string `json:"text"`
+	Kind string `json:"kind,omitempty"`
 }
 
 type QueryHypothesis struct {
@@ -269,6 +283,7 @@ type QueryTurnDecision struct {
 	ResolvedQuestion string             `json:"resolved_question,omitempty"`
 	ReasoningMode    string             `json:"reasoning_mode,omitempty"`
 	Requirements     []QueryRequirement `json:"requirements,omitempty"`
+	Hypotheses       []QueryHypothesis  `json:"hypotheses,omitempty"`
 	RequireAll       bool               `json:"require_all_requirements,omitempty"`
 	CanWriteBack     *bool              `json:"can_write_back,omitempty"`
 	Action           QueryAction        `json:"action"`

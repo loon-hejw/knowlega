@@ -60,6 +60,17 @@ server:
   scan_interval: 30s
   api_token: ""
   api_require_token: false
+  grpc:
+    enabled: false
+    addr: 127.0.0.1:19830
+    auth_token: ""
+    require_auth: false
+    # Required when enabled. New QM scopes are created below this directory.
+    scope_root: ""
+    # Optional TLS/mTLS files for non-loopback deployments.
+    tls_cert_file: ""
+    tls_key_file: ""
+    tls_client_ca_file: ""
 
 research:
   searxng_url: ""
@@ -67,11 +78,15 @@ research:
   timeout: 60s
 
 query:
+  # Hard limit across tool actions and verification turns. The query has no
+  # total wall-clock deadline unless total_timeout is set to a positive value.
+  max_steps: 256
+  total_timeout: 0s
+  # Deprecated adaptive-budget settings retained for older configurations.
   initial_action_budget: 8
   max_action_budget: 32
   verification_passes: 2
   stagnation_rounds: 2
-  total_timeout: 20m
 
 # Optional native Go/Wiki graph indexing. Repositories are an explicit
 # allowlist; credentials are loaded from environment variables and are never

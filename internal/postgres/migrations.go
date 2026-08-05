@@ -11,6 +11,23 @@ CREATE TABLE IF NOT EXISTS projects (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS scope_bindings (
+  provider text NOT NULL,
+  external_scope_id text NOT NULL,
+  kind text NOT NULL,
+  organization_id text NOT NULL DEFAULT '',
+  project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  project_name text NOT NULL DEFAULT '',
+  root_path text NOT NULL,
+  status text NOT NULL DEFAULT 'active',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (provider, external_scope_id),
+  UNIQUE (provider, project_id)
+);
+
+CREATE INDEX IF NOT EXISTS scope_bindings_project_idx ON scope_bindings(project_id);
+
 CREATE TABLE IF NOT EXISTS sources (
   id text PRIMARY KEY,
   project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,

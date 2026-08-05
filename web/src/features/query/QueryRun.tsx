@@ -356,7 +356,7 @@ export function activeRunStage(status: ActiveChatRunState["status"], latestType?
   if (latestType === "routing_started" || latestType === "routing_done") return "routing";
   if (latestType === "general_answer_started" || latestType === "general_answer_done") return "direct_answer";
   if (latestType === "planning_started" || latestType === "planning_done") return "planning";
-  if (latestType === "synthesis_started" || latestType === "action_retry_exhausted") return "synthesis";
+  if (latestType === "synthesis_started") return "synthesis";
   if (latestType === "completed" || latestType === "error" || latestType === "canceled") return "done";
   return "evidence";
 }
@@ -469,8 +469,6 @@ export function eventTypeLabel(type: string): string {
     context_started: "上下文",
     context_ready: "上下文就绪",
     strategy_ready: "策略",
-    constraint_recall_started: "条件召回",
-    constraint_recall_done: "候选交集",
     routing_started: "意图",
     routing_done: "路由",
     planning_started: "规划",
@@ -486,7 +484,17 @@ export function eventTypeLabel(type: string): string {
     general_answer_done: "直答完成",
     heartbeat: "心跳",
     llm_retrying: "重试",
-    action_retry_exhausted: "降级综合",
+    llm_output_normalized: "格式归一",
+    candidate_discovery_started: "候选召回",
+    candidate_discovery_done: "候选完成",
+    candidate_audit_started: "候选核验",
+    candidate_audit_batch_started: "核验批次",
+    candidate_audit_batch_done: "批次完成",
+    candidate_audit_done: "核验完成",
+    candidate_assessed: "候选账本",
+    query_incomplete: "证据未闭合",
+    action_failed: "动作失败",
+    step_limit_reached: "步骤上限",
     writeback_done: "写回",
     completed: "完成",
     error: "失败",

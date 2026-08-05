@@ -21,6 +21,11 @@ answer or write a synthesis back to the wiki.
 
 - [Architecture](docs/architecture.md): source-of-truth rules, ingest, query,
   graph, and PostgreSQL boundaries.
+- [QM integration direction](docs/adr/0001-qm-platform-knowledge-core-plugin.md):
+  QM as the collaboration platform and Knowledge Core as the project/personal
+  knowledge plugin.
+- [QM integration contract](docs/qm-integration.md): experimental gRPC
+  boundary, scope mapping, and the first read-only tool surface.
 - [Configuration](docs/configuration.md): every `config.yaml` section,
   provider setup, paths, security, and precedence.
 - [CLI reference](docs/cli.md): command groups and common workflows.

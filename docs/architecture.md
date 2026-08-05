@@ -1,5 +1,23 @@
 # Architecture
 
+## Platform Direction
+
+The long-term integration direction is to use QM as the collaboration and
+access-control substrate, with Knowledge Core as a project and personal
+knowledge plugin. QM owns users, projects, memberships, permissions, channels,
+tasks, schedules, approvals, and agent runtime. Knowledge Core owns immutable
+source ingestion, durable Markdown Wiki pages, provenance, evidence-backed
+query, citations, lint, review, and knowledge maintenance.
+
+This is a boundary decision, not a second persistence model: QM scope identifiers
+must resolve to a controlled Knowledge Core project/scope, while `raw/`, `wiki/`,
+`.kbcore/`, and optional PostgreSQL state remain owned by Knowledge Core. Personal
+knowledge is private by default; promotion into a project or organization scope
+is explicit and provenance-preserving.
+
+See [ADR-0001](adr/0001-qm-platform-knowledge-core-plugin.md) for the scope
+model, plugin contract, security boundary, deployment shape, and phased roadmap.
+
 ## System Model
 
 Knowledge Core maintains a persistent wiki rather than generating disposable

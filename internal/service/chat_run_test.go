@@ -128,11 +128,11 @@ Token validation calls AuthService.
 			t.Fatal(err)
 		}
 		if file.Run.Status == ChatRunSucceeded {
-			if !chatRunEventsContain(file.Events, "action_retry_exhausted") {
-				t.Fatalf("expected action_retry_exhausted event, got %+v", file.Events)
+			if !chatRunEventsContain(file.Events, "action_failed") {
+				t.Fatalf("expected action_failed event, got %+v", file.Events)
 			}
-			if !chatRunEventsContain(file.Events, "synthesis_started") {
-				t.Fatalf("expected synthesis_started event, got %+v", file.Events)
+			if chatRunEventsContain(file.Events, "synthesis_started") {
+				t.Fatalf("action failure must not trigger synthesis: %+v", file.Events)
 			}
 			updated, err := ReadChatSession(root, session.ID)
 			if err != nil {

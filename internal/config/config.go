@@ -35,6 +35,28 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
+// NonNegativeDuration is used for optional deadlines where zero explicitly
+// disables the deadline. Other configured durations continue to require a
+// positive value through Duration.
+type NonNegativeDuration struct {
+	time.Duration
+}
+
+func (d *NonNegativeDuration) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.ScalarNode || node.Tag != "!!str" {
+		return fmt.Errorf("duration must be a string such as 0s, 30s, or 3m")
+	}
+	parsed, err := time.ParseDuration(strings.TrimSpace(node.Value))
+	if err != nil {
+		return err
+	}
+	if parsed < 0 {
+		return fmt.Errorf("duration must be non-negative")
+	}
+	d.Duration = parsed
+	return nil
+}
+
 type Config struct {
 	Project   ProjectConfig   `yaml:"project"`
 	LLM       LLMConfig       `yaml:"llm"`
@@ -100,12 +122,24 @@ type DatabaseConfig struct {
 }
 
 type ServerConfig struct {
-	Addr            string   `yaml:"addr"`
-	Agent           string   `yaml:"agent"`
-	Worker          bool     `yaml:"worker"`
-	ScanInterval    Duration `yaml:"scan_interval"`
-	APIToken        string   `yaml:"api_token"`
-	APIRequireToken bool     `yaml:"api_require_token"`
+	Addr            string     `yaml:"addr"`
+	Agent           string     `yaml:"agent"`
+	Worker          bool       `yaml:"worker"`
+	ScanInterval    Duration   `yaml:"scan_interval"`
+	APIToken        string     `yaml:"api_token"`
+	APIRequireToken bool       `yaml:"api_require_token"`
+	GRPC            GRPCConfig `yaml:"grpc"`
+}
+
+type GRPCConfig struct {
+	Enabled         bool   `yaml:"enabled"`
+	Addr            string `yaml:"addr"`
+	AuthToken       string `yaml:"auth_token"`
+	RequireAuth     bool   `yaml:"require_auth"`
+	ScopeRoot       string `yaml:"scope_root"`
+	TLSCertFile     string `yaml:"tls_cert_file"`
+	TLSKeyFile      string `yaml:"tls_key_file"`
+	TLSClientCAFile string `yaml:"tls_client_ca_file"`
 }
 
 type ResearchConfig struct {
@@ -115,11 +149,12 @@ type ResearchConfig struct {
 }
 
 type QueryConfig struct {
-	InitialActionBudget int      `yaml:"initial_action_budget"`
-	MaxActionBudget     int      `yaml:"max_action_budget"`
-	VerificationPasses  int      `yaml:"verification_passes"`
-	StagnationRounds    int      `yaml:"stagnation_rounds"`
-	TotalTimeout        Duration `yaml:"total_timeout"`
+	MaxSteps            int                 `yaml:"max_steps"`
+	InitialActionBudget int                 `yaml:"initial_action_budget"`
+	MaxActionBudget     int                 `yaml:"max_action_budget"`
+	VerificationPasses  int                 `yaml:"verification_passes"`
+	StagnationRounds    int                 `yaml:"stagnation_rounds"`
+	TotalTimeout        NonNegativeDuration `yaml:"total_timeout"`
 }
 
 type GraphConfig struct {
@@ -187,17 +222,19 @@ func Defaults() Config {
 			Addr:         "127.0.0.1:19829",
 			Agent:        "llm",
 			ScanInterval: Duration{30 * time.Second},
+			GRPC:         GRPCConfig{Addr: "127.0.0.1:19830"},
 		},
 		Research: ResearchConfig{
 			MaxResults: 10,
 			Timeout:    Duration{60 * time.Second},
 		},
 		Query: QueryConfig{
+			MaxSteps:            256,
 			InitialActionBudget: 8,
 			MaxActionBudget:     32,
 			VerificationPasses:  2,
 			StagnationRounds:    2,
-			TotalTimeout:        Duration{20 * time.Minute},
+			TotalTimeout:        NonNegativeDuration{0},
 		},
 		Graph: GraphConfig{MaxParallelJobs: 2},
 	}
@@ -240,12 +277,19 @@ func Load(path string) (Config, error) {
 		LLM struct {
 			OperationTimeout *Duration `yaml:"operation_timeout"`
 		} `yaml:"llm"`
+		Query struct {
+			MaxSteps        *int `yaml:"max_steps"`
+			MaxActionBudget *int `yaml:"max_action_budget"`
+		} `yaml:"query"`
 	}
 	if err := yaml.NewDecoder(file).Decode(&explicit); err != nil {
 		return Config{}, fmt.Errorf("inspect config %s: %w", absPath, err)
 	}
 	if explicit.LLM.OperationTimeout == nil {
 		cfg.LLM.OperationTimeout = cfg.LLM.Timeout
+	}
+	if explicit.Query.MaxSteps == nil && explicit.Query.MaxActionBudget != nil {
+		cfg.Query.MaxSteps = *explicit.Query.MaxActionBudget
 	}
 	cfg.Path = absPath
 	cfg.normalize()
@@ -303,6 +347,12 @@ func (c *Config) normalize() {
 	c.Server.Addr = strings.TrimSpace(c.Server.Addr)
 	c.Server.Agent = strings.TrimSpace(c.Server.Agent)
 	c.Server.APIToken = strings.TrimSpace(c.Server.APIToken)
+	c.Server.GRPC.Addr = strings.TrimSpace(c.Server.GRPC.Addr)
+	c.Server.GRPC.AuthToken = strings.TrimSpace(c.Server.GRPC.AuthToken)
+	c.Server.GRPC.ScopeRoot = resolvePath(dir, c.Server.GRPC.ScopeRoot)
+	c.Server.GRPC.TLSCertFile = resolvePath(dir, c.Server.GRPC.TLSCertFile)
+	c.Server.GRPC.TLSKeyFile = resolvePath(dir, c.Server.GRPC.TLSKeyFile)
+	c.Server.GRPC.TLSClientCAFile = resolvePath(dir, c.Server.GRPC.TLSClientCAFile)
 	c.Research.SearXNGURL = strings.TrimRight(strings.TrimSpace(c.Research.SearXNGURL), "/")
 	c.Graph.CheckoutRoot = strings.TrimSpace(c.Graph.CheckoutRoot)
 	if c.Graph.CheckoutRoot == "" {
@@ -429,11 +479,31 @@ func (c Config) Validate() error {
 	if c.Server.ScanInterval.Duration <= 0 {
 		return fmt.Errorf("server.scan_interval must be positive")
 	}
+	if c.Server.GRPC.Enabled {
+		if _, _, err := net.SplitHostPort(c.Server.GRPC.Addr); err != nil {
+			return fmt.Errorf("server.grpc.addr must be a host:port value: %w", err)
+		}
+		if c.Server.GRPC.RequireAuth && c.Server.GRPC.AuthToken == "" {
+			return fmt.Errorf("server.grpc.auth_token is required when server.grpc.require_auth is enabled")
+		}
+		if c.Server.GRPC.ScopeRoot == "" {
+			return fmt.Errorf("server.grpc.scope_root is required when server.grpc.enabled is enabled")
+		}
+		if (c.Server.GRPC.TLSCertFile == "") != (c.Server.GRPC.TLSKeyFile == "") {
+			return fmt.Errorf("server.grpc.tls_cert_file and tls_key_file must be configured together")
+		}
+		if c.Server.GRPC.TLSClientCAFile != "" && c.Server.GRPC.TLSCertFile == "" {
+			return fmt.Errorf("server.grpc.tls_client_ca_file requires server.grpc.tls_cert_file and tls_key_file")
+		}
+	}
 	if err := validateHTTPURL("research.searxng_url", c.Research.SearXNGURL, false); err != nil {
 		return err
 	}
 	if c.Research.MaxResults <= 0 || c.Research.Timeout.Duration <= 0 {
 		return fmt.Errorf("research max_results and timeout must be positive")
+	}
+	if c.Query.MaxSteps <= 0 {
+		return fmt.Errorf("query.max_steps must be positive")
 	}
 	if c.Query.InitialActionBudget <= 0 || c.Query.MaxActionBudget < c.Query.InitialActionBudget {
 		return fmt.Errorf("query action budgets must be positive and max_action_budget must be greater than or equal to initial_action_budget")
@@ -441,8 +511,8 @@ func (c Config) Validate() error {
 	if c.Query.VerificationPasses < 0 || c.Query.VerificationPasses > 2 {
 		return fmt.Errorf("query.verification_passes must be between 0 and 2")
 	}
-	if c.Query.StagnationRounds <= 0 || c.Query.TotalTimeout.Duration <= 0 {
-		return fmt.Errorf("query stagnation_rounds and total_timeout must be positive")
+	if c.Query.StagnationRounds <= 0 || c.Query.TotalTimeout.Duration < 0 {
+		return fmt.Errorf("query stagnation_rounds must be positive and total_timeout must be non-negative")
 	}
 	return nil
 }

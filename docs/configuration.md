@@ -109,16 +109,40 @@ remains authoritative.
 Non-loopback access requires a configured token. Keep the default loopback
 binding unless the service is intentionally protected and exposed.
 
+#### `server.grpc`
+
+The experimental QM integration is disabled by default. When enabled, it
+starts a separate gRPC listener in the same `serve` process:
+
+- `enabled`: enable the `knowledge.v1.KnowledgeCore` facade.
+- `addr`: gRPC listen address, default `127.0.0.1:19830`.
+- `auth_token`: service token accepted in gRPC metadata.
+- `require_auth`: reject calls without the token, including loopback calls.
+- `scope_root`: server-owned parent directory for newly provisioned QM
+  project scopes.
+- `tls_cert_file`, `tls_key_file`: optional server certificate and private key.
+- `tls_client_ca_file`: optional CA bundle; when set, client certificates are
+  required and verified (mTLS).
+
+The initial facade is read-only (`EnsureScope`, `GetStatus`, `Query`, `Search`,
+and `ReadDocument`). It never accepts arbitrary filesystem paths. With a
+PostgreSQL database, run `serve --migrate-db` once after enabling the facade so
+the `scope_bindings` table is created.
+
 ### `query`
 
-Controls the adaptive single-agent deep-query loop. `initial_action_budget` is
-the first tool window; unresolved structured requirements may extend it up to
-`max_action_budget`. `verification_passes` adds same-agent stop reviews: the
-answer, tool results, canonical candidate ledger, and runtime feedback stay in
-one context for coverage and adversarial re-checks. `stagnation_rounds` stops
-loops that are no longer finding evidence, and `total_timeout` bounds the
-complete query rather than one LLM request. Defaults are 8, 32, 2, 2, and 20
-minutes respectively.
+Controls the single-agent deep-query loop. `max_steps` is the one hard limit
+shared by model decisions, tool actions, and verification turns; it defaults to
+256. The query has no total wall-clock deadline by default (`total_timeout:
+0s`). A positive `total_timeout` remains available as an explicit operator
+override. Per-request LLM operation timeouts and retries are configured under
+`llm` and continue to apply.
+
+`initial_action_budget`, `max_action_budget`, and `stagnation_rounds` are
+deprecated compatibility keys and no longer divide or stop the action loop. If
+`max_steps` is omitted, an explicitly configured legacy `max_action_budget` is
+treated as `max_steps`. `verification_passes` still controls same-agent
+coverage/adversarial stop reviews, and those turns count toward `max_steps`.
 
 ### `research`
 

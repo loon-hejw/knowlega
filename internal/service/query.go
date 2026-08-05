@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -147,6 +148,7 @@ type QueryCandidateAuditAgent interface {
 }
 
 type QueryRuntimeOptions struct {
+	MaxSteps            int
 	InitialActionBudget int
 	MaxActionBudget     int
 	VerificationPasses  int
@@ -156,11 +158,12 @@ type QueryRuntimeOptions struct {
 
 func DefaultQueryRuntimeOptions() QueryRuntimeOptions {
 	return QueryRuntimeOptions{
+		MaxSteps:            256,
 		InitialActionBudget: 8,
 		MaxActionBudget:     32,
 		VerificationPasses:  2,
 		StagnationRounds:    2,
-		TotalTimeout:        20 * time.Minute,
+		TotalTimeout:        0,
 	}
 }
 
@@ -355,7 +358,7 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 		answerResult := &core.QueryAnswer{
 			Question: q,
 			Plan:     plan,
-			Answer:   degradedNoEvidenceAnswer(q),
+			Answer:   missingEvidenceAnswer(q),
 			Status:   "degraded",
 			Notes: []string{
 				"Planner reported missing evidence before wiki tool execution.",
@@ -388,6 +391,7 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 	var suggestedWritebackTitle string
 	var candidateAssessments []core.QueryCandidateAssessment
 	var finalAction core.QueryAction
+	var stopReason string
 	status := "complete"
 	if actionAgent, ok := agent.(QueryActionAgent); ok {
 		loopResult, loopErr := runQueryActionLoop(ctx, projectPath, opts.ProjectID, q, opts.ConversationContext, plan, results, docs, QueryPlanningInput{}, actionAgent, opts.SearchStore, opts.GraphStore, opts.EmbeddingProvider, runtime, opts.Progress)
@@ -404,6 +408,7 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 		finalAction = loopResult.FinalAction
 		verification = loopResult.Verification
 		status = loopResult.Status
+		stopReason = loopResult.StopReason
 	} else if len(plan.Searches) > 0 {
 		emitQueryProgress(opts.Progress, QueryProgressEvent{Type: "search_started", Message: "正在召回候选页面"})
 		results, err = SearchWikiCandidatesWithStore(ctx, projectPath, opts.ProjectID, opts.SearchStore, opts.EmbeddingProvider, plan, plan.CandidateLimit)
@@ -419,19 +424,26 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 	}
 	answer := finalAnswer
 	incompleteReason := ""
-	if strings.TrimSpace(answer) == "" && plan.RequireAll {
+	if plan.RequireAll && (status != "complete" || strings.TrimSpace(answer) == "") {
 		best := bestCandidateAssessment(candidateAssessments)
 		if best != nil {
 			finalAction.Candidate = best.Candidate
 			finalAction.Checks = best.Checks
 			answer = formatIncompleteCandidateAnswer(plan, *best)
 		}
-		incompleteReason = unresolvedQueryRequirements(plan, finalAction.Checks)
-		if incompleteReason == "" {
-			incompleteReason = " 查询预算内未形成可验证的完整候选。"
-		}
+		incompleteReason = queryIncompleteReason(plan, finalAction.Checks, stopReason)
 		if strings.TrimSpace(answer) == "" {
 			answer = "当前已读证据尚不能同时满足问题的全部要求。" + incompleteReason
+		}
+		status = "incomplete"
+		plan.CanWriteBack = false
+	}
+	if stopReason != "" {
+		if incompleteReason == "" {
+			incompleteReason = queryIncompleteReason(plan, finalAction.Checks, stopReason)
+		}
+		if strings.TrimSpace(answer) == "" {
+			answer = "查询已达到步骤上限，已保留当前证据、候选核验和执行轨迹，但尚未形成完整答案。"
 		}
 		status = "incomplete"
 		plan.CanWriteBack = false
@@ -476,7 +488,7 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 		CandidateAssessments:     candidateAssessments,
 		UnresolvedRequirementIDs: unresolvedRequirementIDs(plan, finalAction.Checks),
 		SuggestedWritebackTitle:  suggestedWritebackTitle,
-		Citations:                queryCitationsForAnswer(docs, finalAction.Checks),
+		Citations:                queryCitationsForOutcome(docs, finalAction.Checks, plan.RequireAll && status != "complete"),
 		Trace:                    trace,
 		Verification:             verification,
 		IncompleteReason:         incompleteReason,
@@ -485,7 +497,7 @@ func QueryLLMWikiWithOptions(opts QueryOptions) (*core.QueryAnswer, error) {
 	if plan.RequireVerification && !queryVerificationsAccepted(verification, runtime.VerificationPasses) {
 		answerResult.Plan.CanWriteBack = false
 	}
-	if !hasAnswerEvidence(docs) && (actionRetryExhausted(trace) || hasNoEvidenceFinalRejection(trace)) {
+	if !hasAnswerEvidence(docs) && (queryActionFailed(trace) || hasNoEvidenceFinalRejection(trace)) {
 		answerResult.Plan.CanWriteBack = false
 	}
 	if err := insertQueryLogIfConfigured(ctx, opts.QueryLogStore, opts.ProjectID, q, plan.AnswerMode, len(results)); err != nil {
@@ -558,20 +570,28 @@ func queryLLMWikiUnified(ctx context.Context, opts QueryOptions, actionAgent Que
 	answer := loopResult.Answer
 	status := loopResult.Status
 	finalAction := loopResult.FinalAction
+	stopReason := loopResult.StopReason
 	incompleteReason := ""
-	if strings.TrimSpace(answer) == "" && plan.RequireAll {
+	if plan.RequireAll && (status != "complete" || strings.TrimSpace(answer) == "") {
 		best := bestCandidateAssessment(loopResult.Assessments)
 		if best != nil {
 			finalAction.Candidate = best.Candidate
 			finalAction.Checks = best.Checks
 			answer = formatIncompleteCandidateAnswer(plan, *best)
 		}
-		incompleteReason = unresolvedQueryRequirements(plan, finalAction.Checks)
-		if incompleteReason == "" {
-			incompleteReason = " 查询预算内未形成可验证的完整候选。"
-		}
+		incompleteReason = queryIncompleteReason(plan, finalAction.Checks, stopReason)
 		if strings.TrimSpace(answer) == "" {
 			answer = "当前已读证据尚不能同时满足问题的全部要求。" + incompleteReason
+		}
+		status = "incomplete"
+		plan.CanWriteBack = false
+	}
+	if stopReason != "" {
+		if incompleteReason == "" {
+			incompleteReason = queryIncompleteReason(plan, finalAction.Checks, stopReason)
+		}
+		if strings.TrimSpace(answer) == "" {
+			answer = "查询已达到步骤上限，已保留当前证据、候选核验和执行轨迹，但尚未形成完整答案。"
 		}
 		status = "incomplete"
 		plan.CanWriteBack = false
@@ -617,7 +637,7 @@ func queryLLMWikiUnified(ctx context.Context, opts QueryOptions, actionAgent Que
 		CandidateAssessments:     loopResult.Assessments,
 		UnresolvedRequirementIDs: unresolvedRequirementIDs(plan, finalAction.Checks),
 		SuggestedWritebackTitle:  loopResult.SuggestedTitle,
-		Citations:                queryCitationsForAnswer(docs, finalAction.Checks),
+		Citations:                queryCitationsForOutcome(docs, finalAction.Checks, plan.RequireAll && status != "complete"),
 		Trace:                    trace,
 		Verification:             loopResult.Verification,
 		IncompleteReason:         incompleteReason,
@@ -626,249 +646,13 @@ func queryLLMWikiUnified(ctx context.Context, opts QueryOptions, actionAgent Que
 	if plan.RequireVerification && !queryVerificationsAccepted(loopResult.Verification, runtime.VerificationPasses) {
 		answerResult.Plan.CanWriteBack = false
 	}
-	if !hasAnswerEvidence(docs) && (actionRetryExhausted(trace) || hasNoEvidenceFinalRejection(trace)) {
+	if !hasAnswerEvidence(docs) && (queryActionFailed(trace) || hasNoEvidenceFinalRejection(trace)) {
 		answerResult.Plan.CanWriteBack = false
 	}
 	if err := insertQueryLogIfConfigured(ctx, opts.QueryLogStore, opts.ProjectID, q, plan.AnswerMode, len(results)); err != nil {
 		return nil, err
 	}
 	return answerResult, nil
-}
-
-func recallRequirementCandidates(ctx context.Context, projectPath, projectID string, plan core.QueryPlan, store SearchEvidenceStore, embeddingProvider EmbeddingProvider) ([]core.QueryResult, error) {
-	type aggregate struct {
-		result       core.QueryResult
-		requirements map[string]bool
-		score        int
-	}
-	attribution, err := buildQueryEntityAttributionIndex(projectPath)
-	if err != nil {
-		return nil, err
-	}
-	byCandidate := map[string]*aggregate{}
-	var evidenceResults []core.QueryResult
-	evidencePositions := map[string]int{}
-	perQueryLimit := plan.CandidateLimit
-	if perQueryLimit < 20 {
-		perQueryLimit = 20
-	}
-	if perQueryLimit > 30 {
-		perQueryLimit = 30
-	}
-	for _, requirement := range plan.Requirements {
-		if strings.EqualFold(requirement.Kind, "negative") {
-			continue
-		}
-		queries := append([]string{requirement.Text}, requirement.SearchQueries...)
-		queries = uniqueQueryStrings(queries, 3)
-		seenCandidatesForRequirement := map[string]bool{}
-		evidenceAddedForRequirement := 0
-		for _, queryText := range queries {
-			searchPlan := core.QueryPlan{
-				Question: queryText,
-				Searches: []core.QuerySearch{{
-					Text: queryText, Weight: 10,
-					Rationale: "independent requirement recall " + requirement.ID,
-				}},
-				CandidateLimit: perQueryLimit,
-			}
-			items, searchErr := SearchWikiCandidatesWithStore(ctx, projectPath, projectID, store, embeddingProvider, searchPlan, perQueryLimit)
-			if searchErr != nil {
-				return nil, searchErr
-			}
-			for rank, item := range items {
-				if isAggregateWikiPath(item.Path) {
-					continue
-				}
-				item.MatchedRequirementIDs = appendUniqueQueryStrings(item.MatchedRequirementIDs, requirement.ID)
-				path := normalizeQueryEvidencePath(item.Path)
-				if existingIndex, exists := evidencePositions[path]; exists {
-					evidenceResults[existingIndex].MatchedRequirementIDs = appendUniqueQueryStrings(evidenceResults[existingIndex].MatchedRequirementIDs, requirement.ID)
-				} else if evidenceAddedForRequirement < 4 {
-					evidenceResults = append(evidenceResults, item)
-					evidencePositions[path] = len(evidenceResults) - 1
-					evidenceAddedForRequirement++
-				}
-				for _, candidate := range attribution.candidatesForResult(item) {
-					entry := byCandidate[candidate.Path]
-					if entry == nil {
-						entry = &aggregate{result: candidate, requirements: map[string]bool{}}
-						byCandidate[candidate.Path] = entry
-					}
-					entry.requirements[requirement.ID] = true
-					if !seenCandidatesForRequirement[candidate.Path] {
-						entry.score += 10_000 / (rank + 1)
-						seenCandidatesForRequirement[candidate.Path] = true
-					}
-				}
-			}
-		}
-	}
-	items := make([]aggregate, 0, len(byCandidate))
-	for _, entry := range byCandidate {
-		entry.result.MatchedRequirementIDs = sortedMapKeys(entry.requirements)
-		entry.result.Score = len(entry.requirements)*100_000 + entry.score
-		entry.result.Snippet = fmt.Sprintf("[requirement-coverage=%d] %s", len(entry.requirements), entry.result.Snippet)
-		items = append(items, *entry)
-	}
-	sort.SliceStable(items, func(i, j int) bool {
-		if len(items[i].requirements) != len(items[j].requirements) {
-			return len(items[i].requirements) > len(items[j].requirements)
-		}
-		if items[i].score != items[j].score {
-			return items[i].score > items[j].score
-		}
-		return items[i].result.Path < items[j].result.Path
-	})
-	limit := plan.CandidateLimit
-	if limit < 64 {
-		limit = 64
-	}
-	out := make([]core.QueryResult, 0, limit)
-	seenOut := map[string]bool{}
-	for _, item := range items {
-		if len(out) >= limit {
-			break
-		}
-		out = append(out, item.result)
-		seenOut[item.result.Path] = true
-	}
-	for _, item := range evidenceResults {
-		if len(out) >= limit {
-			break
-		}
-		if !seenOut[item.Path] {
-			out = append(out, item)
-			seenOut[item.Path] = true
-		}
-	}
-	return out, nil
-}
-
-func sortedMapKeys(values map[string]bool) []string {
-	out := make([]string, 0, len(values))
-	for value := range values {
-		out = append(out, value)
-	}
-	sort.Strings(out)
-	return out
-}
-
-type queryEntityAttributionIndex struct {
-	entitiesByPath     map[string]core.QueryResult
-	entitiesByIdentity map[string]string
-	entitiesByEvidence map[string]map[string]bool
-}
-
-func buildQueryEntityAttributionIndex(projectPath string) (queryEntityAttributionIndex, error) {
-	index := queryEntityAttributionIndex{
-		entitiesByPath:     map[string]core.QueryResult{},
-		entitiesByIdentity: map[string]string{},
-		entitiesByEvidence: map[string]map[string]bool{},
-	}
-	entityRoot := filepath.Join(projectPath, "wiki", "entities")
-	if _, err := os.Stat(entityRoot); err == nil {
-		err = filepath.WalkDir(entityRoot, func(path string, entry os.DirEntry, walkErr error) error {
-			if walkErr != nil || entry.IsDir() || strings.ToLower(filepath.Ext(path)) != ".md" {
-				return walkErr
-			}
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			rel, err := filepath.Rel(projectPath, path)
-			if err != nil {
-				return err
-			}
-			rel = normalizeQueryEvidencePath(filepath.ToSlash(rel))
-			page := wiki.ParseWikiPage("query", rel, string(data))
-			result := core.QueryResult{Path: rel, Title: page.Title, Kind: "entity", Snippet: runeWindow(page.Body, 0, 500)}
-			index.entitiesByPath[rel] = result
-			identities := append([]string{page.Title, strings.TrimSuffix(filepath.Base(rel), filepath.Ext(rel))}, aliasesFromMarkdown(string(data))...)
-			for _, identity := range identities {
-				if key := canonicalWikiLinkID(identity); key != "" {
-					index.entitiesByIdentity[key] = rel
-				}
-			}
-			for _, source := range page.Sources {
-				index.addEvidenceEntity(source, rel)
-			}
-			return nil
-		})
-		if err != nil {
-			return queryEntityAttributionIndex{}, err
-		}
-	}
-	sourceRoot := filepath.Join(projectPath, "wiki", "sources")
-	if _, err := os.Stat(sourceRoot); err == nil {
-		err = filepath.WalkDir(sourceRoot, func(path string, entry os.DirEntry, walkErr error) error {
-			if walkErr != nil || entry.IsDir() || strings.ToLower(filepath.Ext(path)) != ".md" {
-				return walkErr
-			}
-			data, err := os.ReadFile(path)
-			if err != nil {
-				return err
-			}
-			rel, err := filepath.Rel(projectPath, path)
-			if err != nil {
-				return err
-			}
-			rel = normalizeQueryEvidencePath(filepath.ToSlash(rel))
-			page := wiki.ParseWikiPage("query", rel, string(data))
-			var entityPaths []string
-			for _, link := range extractWikiMarkdownLinks(string(data)) {
-				target := strings.Split(link, "|")[0]
-				if entityPath := index.entitiesByIdentity[canonicalWikiLinkID(target)]; entityPath != "" {
-					entityPaths = appendUniqueQueryStrings(entityPaths, entityPath)
-				}
-			}
-			for _, entityPath := range entityPaths {
-				index.addEvidenceEntity(rel, entityPath)
-				for _, source := range page.Sources {
-					index.addEvidenceEntity(source, entityPath)
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			return queryEntityAttributionIndex{}, err
-		}
-	}
-	return index, nil
-}
-
-func (index queryEntityAttributionIndex) addEvidenceEntity(evidencePath, entityPath string) {
-	evidencePath = normalizeQueryEvidencePath(evidencePath)
-	entityPath = normalizeQueryEvidencePath(entityPath)
-	if evidencePath == "" || entityPath == "" {
-		return
-	}
-	if index.entitiesByEvidence[evidencePath] == nil {
-		index.entitiesByEvidence[evidencePath] = map[string]bool{}
-	}
-	index.entitiesByEvidence[evidencePath][entityPath] = true
-}
-
-func (index queryEntityAttributionIndex) candidatesForResult(result core.QueryResult) []core.QueryResult {
-	path := normalizeQueryEvidencePath(result.Path)
-	paths := map[string]bool{}
-	if _, ok := index.entitiesByPath[path]; ok {
-		paths[path] = true
-	}
-	for entityPath := range index.entitiesByEvidence[path] {
-		paths[entityPath] = true
-	}
-	if entityPath := index.entitiesByIdentity[canonicalWikiLinkID(result.Title)]; entityPath != "" {
-		paths[entityPath] = true
-	}
-	ordered := sortedMapKeys(paths)
-	out := make([]core.QueryResult, 0, len(ordered))
-	for _, entityPath := range ordered {
-		if candidate, ok := index.entitiesByPath[entityPath]; ok {
-			out = append(out, candidate)
-		}
-	}
-	return out
 }
 
 func insertQueryLogIfConfigured(ctx context.Context, store QueryLogStore, projectID, q, mode string, resultCount int) error {
@@ -1035,9 +819,9 @@ func queryLogID(projectID, q, mode string) string {
 	return fmt.Sprintf("query-%d-%s", now.UnixNano(), hex.EncodeToString(sum[:])[:12])
 }
 
-func actionRetryExhausted(trace []core.QueryTraceStep) bool {
+func queryActionFailed(trace []core.QueryTraceStep) bool {
 	for _, step := range trace {
-		if strings.Contains(step.Observation, "action_retry_exhausted") {
+		if strings.Contains(step.Observation, "action_failed") {
 			return true
 		}
 	}
@@ -1151,7 +935,6 @@ func fuseQueryResultRankings(lists [][]core.QueryResult, limit int) []core.Query
 				}
 			}
 			entry.score += 1_000_000 / (60 + index + 1)
-			entry.result.MatchedRequirementIDs = appendUniqueQueryStrings(entry.result.MatchedRequirementIDs, result.MatchedRequirementIDs...)
 		}
 	}
 	items := make([]core.QueryResult, 0, len(byPath))
@@ -1172,20 +955,6 @@ func fuseQueryResultRankings(lists [][]core.QueryResult, limit int) []core.Query
 		items = items[:limit]
 	}
 	return items
-}
-
-func appendUniqueQueryStrings(base []string, values ...string) []string {
-	seen := make(map[string]bool, len(base)+len(values))
-	for _, value := range base {
-		seen[value] = true
-	}
-	for _, value := range values {
-		if value = strings.TrimSpace(value); value != "" && !seen[value] {
-			base = append(base, value)
-			seen[value] = true
-		}
-	}
-	return base
 }
 
 func queryTextForEmbedding(plan core.QueryPlan) string {
@@ -1525,6 +1294,13 @@ func queryCitationsForAnswer(docs []QueryReadDocument, checks []core.QueryEviden
 	return queryCitations(filtered)
 }
 
+func queryCitationsForOutcome(docs []QueryReadDocument, checks []core.QueryEvidenceCheck, requireScoped bool) []core.QueryCitation {
+	if requireScoped && len(checks) == 0 {
+		return nil
+	}
+	return queryCitationsForAnswer(docs, checks)
+}
+
 type queryLoopResult struct {
 	Plan           core.QueryPlan
 	Results        []core.QueryResult
@@ -1536,6 +1312,7 @@ type queryLoopResult struct {
 	FinalAction    core.QueryAction
 	Verification   []core.QueryVerification
 	Status         string
+	StopReason     string
 }
 
 func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversation string, plan core.QueryPlan, results []core.QueryResult, docs []QueryReadDocument, initial QueryPlanningInput, agent QueryActionAgent, searchStore SearchEvidenceStore, graphStore GraphEvidenceStore, embeddingProvider EmbeddingProvider, runtime QueryRuntimeOptions, progress QueryProgressFunc) (queryLoopResult, error) {
@@ -1549,56 +1326,16 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 	} else if _, ok := agent.(QueryTurnAgent); ok {
 		unifiedTurnAgent = true
 	}
-	noEvidenceFinalRejections := 0
-	enrichedCandidates := map[string]bool{}
 	pendingReviewPass := 0
 	reviewPasses := 0
 	if !unifiedTurnAgent && plan.RequireVerification {
 		reviewPasses = runtime.VerificationPasses
 	}
-	actionBudget := runtime.InitialActionBudget
-	lastEvidenceCount := len(docs)
-	stagnantWindows := 0
-	enrichCandidate := func(step int, action core.QueryAction) (string, error) {
-		candidateKey := strings.ToLower(strings.TrimSpace(action.Candidate))
-		if !plan.RequireAll || candidateKey == "" || enrichedCandidates[candidateKey] {
-			return "", nil
-		}
-		enrichedCandidates[candidateKey] = true
-		candidateResults, candidateDocs, err := expandCandidateRequirementEvidence(ctx, projectPath, projectID, action.Candidate, plan, docs, searchStore, embeddingProvider)
-		if err != nil {
-			return "", err
-		}
-		before := len(docs)
-		results = appendQueryResults(candidateResults, results)
-		docs = appendQueryDocs(docs, candidateDocs)
-		trace = append(trace, core.QueryTraceStep{
-			Step:        step,
-			Action:      core.QueryAction{Action: "search", Query: action.Candidate + " × all requirements", Rationale: "runtime candidate-specific requirement coverage"},
-			Observation: fmt.Sprintf("candidate-specific requirement search read %d new document(s)", len(docs)-before),
-		})
-		return fmt.Sprintf("; candidate-specific searches covered every requirement and auto-read %d new document(s)", len(docs)-before), nil
-	}
-	// Reserve room for stop-review turns. Whether those turns are required is
-	// decided by the same first model response that classifies the question.
-	hardBudget := runtime.MaxActionBudget + runtime.VerificationPasses
+	// Every model decision, tool action, and stop-review turn shares one hard
+	// step budget. There is no adaptive extension or stagnation-based stop: the
+	// agent may continue until it finishes naturally or consumes MaxSteps.
+	hardBudget := runtime.MaxSteps
 	for step := 1; step <= hardBudget; step++ {
-		if step > actionBudget {
-			if pendingReviewPass == 0 && (!plan.RequireAll || stagnantWindows >= runtime.StagnationRounds) {
-				break
-			}
-			actionBudget += runtime.InitialActionBudget
-			if actionBudget > runtime.MaxActionBudget {
-				actionBudget = runtime.MaxActionBudget
-			}
-			if len(docs) <= lastEvidenceCount {
-				stagnantWindows++
-			} else {
-				stagnantWindows = 0
-				lastEvidenceCount = len(docs)
-			}
-			emitQueryProgress(progress, QueryProgressEvent{Type: "budget_extended", Step: step, Message: "存在未决要求，扩展查询预算", Observation: fmt.Sprintf("action_budget=%d", actionBudget)})
-		}
 		if err := ctx.Err(); err != nil {
 			return queryLoopResult{}, err
 		}
@@ -1627,30 +1364,35 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 				return queryLoopResult{}, ctxErr
 			}
 			action := core.QueryAction{
-				Action:    "synthesize",
+				Action:    "action_failed",
 				Rationale: "llm query action failed after retries",
 			}
+			errorSummary := compactQueryRuntimeError(err)
+			stopReason := "LLM 查询动作在重试后仍失败：" + errorSummary
 			traceStep := core.QueryTraceStep{
 				Step:        step,
 				Action:      action,
-				Observation: "action_retry_exhausted: " + err.Error(),
+				Observation: "action_failed: " + errorSummary,
 			}
 			trace = append(trace, traceStep)
 			emitQueryProgress(progress, QueryProgressEvent{
-				Type:        "action_retry_exhausted",
+				Type:        "action_failed",
 				Step:        step,
 				Action:      &action,
-				Message:     "动作解析失败，保留已读证据并进入综合",
+				Message:     "查询动作失败，停止执行",
 				Observation: traceStep.Observation,
 			})
-			results, docs, err = ensureEvidenceAfterActionFailure(ctx, projectPath, projectID, q, plan, results, docs, searchStore, embeddingProvider)
-			if err != nil {
-				return queryLoopResult{}, err
-			}
-			if !hasAnswerEvidence(docs) {
-				return queryLoopResult{Plan: plan, Results: results, Docs: docs, Trace: trace, Answer: degradedNoEvidenceAnswer(q), Status: "degraded"}, nil
-			}
-			return queryLoopResult{Plan: plan, Results: results, Docs: docs, Trace: trace, Assessments: assessments, Verification: verification, Status: "incomplete"}, nil
+			return queryLoopResult{
+				Plan:         plan,
+				Results:      results,
+				Docs:         docs,
+				Trace:        trace,
+				Answer:       "LLM 查询动作在重试后失败，未生成答案。",
+				Assessments:  assessments,
+				Verification: verification,
+				Status:       "incomplete",
+				StopReason:   stopReason,
+			}, nil
 		}
 		if step == 1 && unifiedTurnAgent {
 			plan = mergeQueryTurnDecision(q, plan, decision, runtime)
@@ -1664,34 +1406,6 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 				Message:     "首轮决策已生成，开始执行工具",
 				Observation: fmt.Sprintf("intent=%s mode=%s requirements=%d action=%s", plan.Intent, plan.ReasoningMode, len(plan.Requirements), decision.Action.Action),
 			})
-			if plan.RequireAll && len(plan.Requirements) > 0 {
-				emitQueryProgress(progress, QueryProgressEvent{Type: "constraint_recall_started", Step: step, Message: "正在按条件交集召回候选"})
-				constraintResults, recallErr := recallRequirementCandidates(ctx, projectPath, projectID, plan, searchStore, embeddingProvider)
-				if recallErr != nil {
-					return queryLoopResult{}, recallErr
-				}
-				results = appendQueryResults(constraintResults, results)
-				candidateReads, evidenceReads := splitConstraintRecallResults(constraintResults, 5, 12)
-				candidateDocs, _, readErr := readSearchResultDocuments(projectPath, candidateReads, len(candidateReads), 6000)
-				if readErr != nil {
-					return queryLoopResult{}, readErr
-				}
-				evidenceDocs, _, readErr := readSearchResultDocuments(projectPath, evidenceReads, len(evidenceReads), 9000)
-				if readErr != nil {
-					return queryLoopResult{}, readErr
-				}
-				docs = appendQueryDocs(docs, candidateDocs)
-				docs = appendQueryDocs(docs, evidenceDocs)
-				observation := formatConstraintRecallObservation(plan, constraintResults, len(candidateDocs), len(evidenceDocs))
-				trace = append(trace, core.QueryTraceStep{
-					Step: step,
-					Action: core.QueryAction{
-						Action: "search", Query: "all positive requirements", Rationale: "runtime-enforced constraint intersection",
-					},
-					Observation: observation,
-				})
-				emitQueryProgress(progress, QueryProgressEvent{Type: "constraint_recall_done", Step: step, Message: "条件交集候选召回完成", Observation: observation})
-			}
 		}
 		action := decision.Action
 		action.Action = strings.ToLower(strings.TrimSpace(action.Action))
@@ -1852,45 +1566,82 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 			}
 			trace = append(trace, traceStep)
 			emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: step, Action: &action, Message: "图谱检索完成", Observation: traceStep.Observation})
-		case "assess", "assess_candidate":
-			enrichmentNote, enrichErr := enrichCandidate(step, action)
-			if enrichErr != nil {
-				return queryLoopResult{}, enrichErr
+		case "discover_candidates":
+			discovery, discoveryErr := discoverConstraintCandidates(
+				ctx,
+				projectPath,
+				projectID,
+				q,
+				plan,
+				initial,
+				agent,
+				searchStore,
+				embeddingProvider,
+				step,
+				progress,
+			)
+			if discoveryErr != nil {
+				return queryLoopResult{}, discoveryErr
 			}
+			results = appendQueryResults(results, discovery.Results)
+			docs = appendQueryDocs(docs, discovery.Docs)
+			assessments = mergeCandidateAssessments(assessments, discovery.Assessments)
+			if len(discovery.Hypotheses) > 0 {
+				plan.Hypotheses = discovery.Hypotheses
+			}
+			traceStep := core.QueryTraceStep{Step: step, Action: action, Observation: discovery.Observation}
+			trace = append(trace, traceStep)
+			emitQueryProgress(progress, QueryProgressEvent{Type: "candidate_discovery_done", Step: step, Action: &action, Message: "候选发现与独立审计完成", Observation: discovery.Observation})
+		case "assess", "assess_candidate":
+			candidateDoc, candidateErr := resolveQueryCandidateDocument(projectPath, action.Candidate)
+			if candidateErr != nil {
+				observation := "candidate rejected: " + candidateErr.Error()
+				trace = append(trace, core.QueryTraceStep{Step: step, Action: action, Observation: observation})
+				emitQueryProgress(progress, QueryProgressEvent{Type: "action_failed", Step: step, Action: &action, Message: "候选不是可读取的实体页，继续查询", Observation: observation})
+				continue
+			}
+			docs = appendQueryDocs(docs, []QueryReadDocument{candidateDoc})
 			assessment := buildCandidateAssessment(plan, action, docs, trace, step)
 			assessments = upsertCandidateAssessment(assessments, assessment)
-			observation := formatCandidateAssessmentObservation(assessment) + enrichmentNote
+			observation := formatCandidateAssessmentObservation(assessment)
 			trace = append(trace, core.QueryTraceStep{Step: step, Action: action, Observation: observation})
 			emitQueryProgress(progress, QueryProgressEvent{Type: "candidate_assessed", Step: step, Action: &action, Message: "候选证据核验完成", Observation: observation})
+		case "finish_incomplete":
+			assessment := candidateAssessmentByName(assessments, action.Candidate)
+			if assessment == nil {
+				assessment = bestCandidateAssessment(assessments)
+			}
+			if assessment != nil {
+				action.Candidate = assessment.Candidate
+				action.Checks = assessment.Checks
+				if strings.TrimSpace(action.Answer) == "" {
+					action.Answer = formatIncompleteCandidateAnswer(plan, *assessment)
+				}
+			}
+			stopReason := strings.TrimSpace(action.Rationale)
+			if stopReason == "" {
+				stopReason = "当前知识库证据无法闭合剩余条件。"
+			}
+			trace = append(trace, core.QueryTraceStep{Step: step, Action: action, Observation: "query finished incomplete with the preserved candidate ledger"})
+			emitQueryProgress(progress, QueryProgressEvent{Type: "query_incomplete", Step: step, Action: &action, Message: "证据未闭合，已保留最佳候选与精确缺口", Observation: stopReason})
+			return queryLoopResult{Plan: plan, Results: results, Docs: docs, Trace: trace, Answer: action.Answer, Assessments: assessments, FinalAction: action, Verification: verification, Status: "incomplete", StopReason: stopReason}, nil
 		case "final", "save", "writeback":
 			action.Answer = scopeNegativeRequirementAnswer(plan, action)
-			enrichmentNote, enrichErr := enrichCandidate(step, action)
-			if enrichErr != nil {
-				return queryLoopResult{}, enrichErr
-			}
 			if plan.RequireAll {
+				candidateDoc, candidateErr := resolveQueryCandidateDocument(projectPath, action.Candidate)
+				if candidateErr != nil {
+					observation := "final rejected: " + candidateErr.Error()
+					trace = append(trace, core.QueryTraceStep{Step: step, Action: action, Observation: observation})
+					emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: step, Action: &action, Message: "最终候选无效，需要继续查询", Observation: observation})
+					continue
+				}
+				docs = appendQueryDocs(docs, []QueryReadDocument{candidateDoc})
 				assessment := buildCandidateAssessment(plan, action, docs, trace, step)
 				assessments = upsertCandidateAssessment(assessments, assessment)
 			}
 			finalAnswer, suggestedTitle, accepted := acceptFinalQueryAction(step, q, plan, action, results, docs, &trace)
-			if enrichmentNote != "" && len(trace) > 0 {
-				trace[len(trace)-1].Observation += enrichmentNote
-			}
 			if !accepted {
 				emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: step, Action: &action, Message: "最终答案被拒绝，需要继续读取证据", Observation: trace[len(trace)-1].Observation})
-				if isNoEvidenceFinalRejection(trace[len(trace)-1].Observation) {
-					noEvidenceFinalRejections++
-				}
-				if noEvidenceFinalRejections >= 2 {
-					results, docs, err = ensureEvidenceAfterActionFailure(ctx, projectPath, projectID, q, plan, results, docs, searchStore, embeddingProvider)
-					if err != nil {
-						return queryLoopResult{}, err
-					}
-					if !hasAnswerEvidence(docs) {
-						return queryLoopResult{Plan: plan, Results: results, Docs: docs, Trace: trace, Answer: degradedNoEvidenceAnswer(q), Assessments: assessments, Status: "degraded"}, nil
-					}
-					return queryLoopResult{Plan: plan, Results: results, Docs: docs, Trace: trace, Assessments: assessments, Status: "incomplete"}, nil
-				}
 				continue
 			}
 			if pendingReviewPass > 0 {
@@ -1921,15 +1672,598 @@ func runQueryActionLoop(ctx context.Context, projectPath, projectID, q, conversa
 		}
 	}
 	trace = append(trace, core.QueryTraceStep{
-		Step: hardBudget + 1,
+		Step: hardBudget,
 		Action: core.QueryAction{
-			Action:    "synthesize",
+			Action:    "step_limit",
 			Rationale: "query action step limit reached",
 		},
-		Observation: "synthesizing with collected evidence",
+		Observation: fmt.Sprintf("max_steps=%d; requirements remain unresolved", hardBudget),
 	})
-	emitQueryProgress(progress, QueryProgressEvent{Type: "action_done", Step: hardBudget + 1, Message: "达到深度查询预算，停止继续检索", Observation: "requirements remain unresolved"})
-	return queryLoopResult{Plan: plan, Results: results, Docs: docs, Trace: trace, Assessments: assessments, Verification: verification, Status: "incomplete"}, nil
+	stopReason := fmt.Sprintf("达到查询步骤上限 %d。", hardBudget)
+	emitQueryProgress(progress, QueryProgressEvent{Type: "step_limit_reached", Step: hardBudget, Message: "达到查询步骤上限，停止继续检索", Observation: fmt.Sprintf("max_steps=%d; requirements remain unresolved", hardBudget)})
+	return queryLoopResult{Plan: plan, Results: results, Docs: docs, Trace: trace, Assessments: assessments, Verification: verification, Status: "incomplete", StopReason: stopReason}, nil
+}
+
+func compactQueryRuntimeError(err error) string {
+	if err == nil {
+		return "unknown query runtime error"
+	}
+	message := strings.TrimSpace(strings.ReplaceAll(err.Error(), "\n", " "))
+	return tailRunes(message, 1200)
+}
+
+type constraintDiscoveryResult struct {
+	Results     []core.QueryResult
+	Docs        []QueryReadDocument
+	Hypotheses  []core.QueryHypothesis
+	Assessments []core.QueryCandidateAssessment
+	Observation string
+}
+
+type constraintRecallCandidate struct {
+	Path              string
+	Title             string
+	RequirementIDs    map[string]bool
+	RequirementScores map[string]int
+	Score             int
+}
+
+type constraintEntityIndex struct {
+	ByIdentity map[string][]string
+	ByEvidence map[string][]string
+	Pages      map[string]core.QueryResult
+	Identities map[string][]string
+}
+
+// recallConstraintCandidates recalls every positive condition independently.
+// Search remains a recall tool: durable wiki titles, aliases, links, and source
+// provenance attribute each hit to entities, then distinct condition coverage
+// controls ranking instead of repeated body terms.
+func recallConstraintCandidates(ctx context.Context, projectPath, projectID string, plan core.QueryPlan, searchStore SearchEvidenceStore, embeddingProvider EmbeddingProvider) ([]core.QueryResult, error) {
+	index, err := buildConstraintEntityIndex(projectPath)
+	if err != nil {
+		return nil, err
+	}
+	candidates := map[string]*constraintRecallCandidate{}
+	evidenceByRequirement := map[string][]core.QueryResult{}
+	var positiveRequirementIDs []string
+	for _, requirement := range plan.Requirements {
+		if strings.EqualFold(strings.TrimSpace(requirement.Kind), "negative") || strings.TrimSpace(requirement.Text) == "" {
+			continue
+		}
+		positiveRequirementIDs = append(positiveRequirementIDs, requirement.ID)
+		searchPlan := core.QueryPlan{
+			Question:       requirement.Text,
+			Searches:       []core.QuerySearch{{Text: requirement.Text, Weight: 10, Rationale: "independent positive-requirement recall"}},
+			CandidateLimit: 20,
+		}
+		items, searchErr := SearchWikiCandidatesWithStore(ctx, projectPath, projectID, searchStore, embeddingProvider, searchPlan, 20)
+		if searchErr != nil {
+			return nil, searchErr
+		}
+		kept := 0
+		for rank, item := range items {
+			if isAggregateWikiPath(item.Path) {
+				continue
+			}
+			if kept < 4 {
+				evidenceByRequirement[requirement.ID] = appendQueryResults(evidenceByRequirement[requirement.ID], []core.QueryResult{item})
+				kept++
+			}
+			for _, entityPath := range attributedConstraintEntities(index, item, requirement.Text) {
+				page, ok := index.Pages[entityPath]
+				if !ok {
+					continue
+				}
+				candidate := candidates[entityPath]
+				if candidate == nil {
+					candidate = &constraintRecallCandidate{Path: entityPath, Title: page.Title, RequirementIDs: map[string]bool{}, RequirementScores: map[string]int{}}
+					candidates[entityPath] = candidate
+				}
+				candidate.RequirementIDs[requirement.ID] = true
+				rankScore := 20 - rank
+				if rankScore > candidate.RequirementScores[requirement.ID] {
+					candidate.RequirementScores[requirement.ID] = rankScore
+				}
+				candidate.Score += rankScore
+			}
+		}
+	}
+
+	ordered := make([]*constraintRecallCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		ordered = append(ordered, candidate)
+	}
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if len(ordered[i].RequirementIDs) != len(ordered[j].RequirementIDs) {
+			return len(ordered[i].RequirementIDs) > len(ordered[j].RequirementIDs)
+		}
+		if ordered[i].Score != ordered[j].Score {
+			return ordered[i].Score > ordered[j].Score
+		}
+		return ordered[i].Path < ordered[j].Path
+	})
+	// Lead with two candidates from each rare requirement before aggregate
+	// coverage ranking. This prevents famous entities that weakly match many
+	// clues from crowding out a less frequent but decisive intersection.
+	requirementCounts := map[string]int{}
+	for _, candidate := range ordered {
+		for id := range candidate.RequirementIDs {
+			requirementCounts[id]++
+		}
+	}
+	var requirementIDs []string
+	for id := range requirementCounts {
+		requirementIDs = append(requirementIDs, id)
+	}
+	sort.SliceStable(requirementIDs, func(i, j int) bool {
+		if requirementCounts[requirementIDs[i]] != requirementCounts[requirementIDs[j]] {
+			return requirementCounts[requirementIDs[i]] < requirementCounts[requirementIDs[j]]
+		}
+		return requirementIDs[i] < requirementIDs[j]
+	})
+	var diversified []*constraintRecallCandidate
+	for _, id := range requirementIDs {
+		perRequirement := append([]*constraintRecallCandidate(nil), ordered...)
+		sort.SliceStable(perRequirement, func(i, j int) bool {
+			if perRequirement[i].RequirementScores[id] != perRequirement[j].RequirementScores[id] {
+				return perRequirement[i].RequirementScores[id] > perRequirement[j].RequirementScores[id]
+			}
+			return perRequirement[i].Score > perRequirement[j].Score
+		})
+		added := 0
+		for _, candidate := range perRequirement {
+			if candidate.RequirementScores[id] <= 0 || added >= 4 {
+				break
+			}
+			before := len(diversified)
+			diversified = appendUniqueRecallCandidate(diversified, candidate)
+			if len(diversified) > before {
+				added++
+			}
+		}
+	}
+	for _, candidate := range ordered {
+		diversified = appendUniqueRecallCandidate(diversified, candidate)
+	}
+
+	var evidence []core.QueryResult
+	for rank := 0; rank < 4; rank++ {
+		for _, id := range positiveRequirementIDs {
+			items := evidenceByRequirement[id]
+			if rank < len(items) {
+				evidence = appendQueryResults(evidence, []core.QueryResult{items[rank]})
+			}
+		}
+	}
+	results := make([]core.QueryResult, 0, minInt(len(diversified), 24)+len(evidence))
+	for _, candidate := range diversified {
+		if len(results) >= 24 {
+			break
+		}
+		requirementIDs := make([]string, 0, len(candidate.RequirementIDs))
+		for id := range candidate.RequirementIDs {
+			requirementIDs = append(requirementIDs, id)
+		}
+		sort.Strings(requirementIDs)
+		results = append(results, core.QueryResult{
+			Path:    candidate.Path,
+			Title:   candidate.Title,
+			Kind:    "entity",
+			Score:   len(requirementIDs)*10000 + candidate.Score,
+			Snippet: fmt.Sprintf("[recall-coverage=%d ids=%s] candidate mention attributed through wiki metadata; requires semantic audit", len(requirementIDs), strings.Join(requirementIDs, ",")),
+		})
+	}
+	return appendQueryResults(results, evidence), nil
+}
+
+func appendUniqueRecallCandidate(items []*constraintRecallCandidate, candidate *constraintRecallCandidate) []*constraintRecallCandidate {
+	for _, existing := range items {
+		if existing.Path == candidate.Path {
+			return items
+		}
+	}
+	return append(items, candidate)
+}
+
+func buildConstraintEntityIndex(projectPath string) (constraintEntityIndex, error) {
+	index := constraintEntityIndex{ByIdentity: map[string][]string{}, ByEvidence: map[string][]string{}, Pages: map[string]core.QueryResult{}, Identities: map[string][]string{}}
+	entityRoot := filepath.Join(projectPath, "wiki", "entities")
+	if _, err := os.Stat(entityRoot); os.IsNotExist(err) {
+		return index, nil
+	}
+	err := filepath.WalkDir(entityRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() || !strings.EqualFold(filepath.Ext(path), ".md") {
+			return walkErr
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(projectPath, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		page := wiki.ParseWikiPage("query", rel, string(data))
+		title := strings.TrimSpace(page.Title)
+		if title == "" {
+			title = strings.TrimSuffix(filepath.Base(rel), filepath.Ext(rel))
+		}
+		index.Pages[rel] = core.QueryResult{Path: rel, Title: title, Kind: "entity"}
+		identities := append([]string{title, strings.TrimSuffix(filepath.Base(rel), filepath.Ext(rel))}, aliasesFromMarkdown(string(data))...)
+		for _, identity := range identities {
+			index.Identities[rel] = appendUniqueString(index.Identities[rel], identity)
+			for id := range wikiLinkIDVariants(identity) {
+				index.ByIdentity[id] = appendUniqueString(index.ByIdentity[id], rel)
+			}
+		}
+		for _, source := range page.Sources {
+			key := normalizeConstraintEvidencePath(source)
+			if key != "" {
+				index.ByEvidence[key] = appendUniqueString(index.ByEvidence[key], rel)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return constraintEntityIndex{}, err
+	}
+
+	sourceRoot := filepath.Join(projectPath, "wiki", "sources")
+	if _, err := os.Stat(sourceRoot); os.IsNotExist(err) {
+		return index, nil
+	}
+	err = filepath.WalkDir(sourceRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil || entry.IsDir() || !strings.EqualFold(filepath.Ext(path), ".md") {
+			return walkErr
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(projectPath, path)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		var entityPaths []string
+		for _, link := range extractWikiMarkdownLinks(string(data)) {
+			for id := range wikiLinkIDVariants(link) {
+				entityPaths = appendUniqueStrings(entityPaths, index.ByIdentity[id]...)
+			}
+		}
+		if len(entityPaths) == 0 {
+			return nil
+		}
+		key := normalizeConstraintEvidencePath(rel)
+		index.ByEvidence[key] = appendUniqueStrings(index.ByEvidence[key], entityPaths...)
+		page := wiki.ParseWikiPage("query", rel, string(data))
+		for _, source := range page.Sources {
+			key = normalizeConstraintEvidencePath(source)
+			if key != "" {
+				index.ByEvidence[key] = appendUniqueStrings(index.ByEvidence[key], entityPaths...)
+			}
+		}
+		return nil
+	})
+	return index, err
+}
+
+func attributedConstraintEntities(index constraintEntityIndex, result core.QueryResult, requirementText string) []string {
+	var paths []string
+	if _, ok := index.Pages[result.Path]; ok {
+		if !constraintIdentityMentioned(requirementText, index.Identities[result.Path]) {
+			paths = appendUniqueString(paths, result.Path)
+		}
+		return paths
+	}
+	// A source chapter can link dozens of entities. Attribute a search hit only
+	// to entities actually named in the relevant result window, and exclude
+	// names already present in the requirement because those are normally the
+	// relation's object (for example, "met X"), not the unknown subject.
+	haystack := strings.ToLower(result.Title + "\n" + result.Snippet)
+	for _, entityPath := range index.ByEvidence[normalizeConstraintEvidencePath(result.Path)] {
+		identities := index.Identities[entityPath]
+		if constraintIdentityMentioned(requirementText, identities) {
+			continue
+		}
+		for _, identity := range identities {
+			identity = strings.ToLower(strings.TrimSpace(identity))
+			if len([]rune(identity)) >= 2 && strings.Contains(haystack, identity) {
+				paths = appendUniqueString(paths, entityPath)
+				break
+			}
+		}
+	}
+	return paths
+}
+
+func constraintIdentityMentioned(text string, identities []string) bool {
+	text = strings.ToLower(strings.TrimSpace(text))
+	for _, identity := range identities {
+		identity = strings.ToLower(strings.TrimSpace(identity))
+		if len([]rune(identity)) >= 2 && strings.Contains(text, identity) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeConstraintEvidencePath(path string) string {
+	path = strings.TrimSpace(strings.TrimPrefix(path, "./"))
+	path = filepath.ToSlash(filepath.Clean(filepath.FromSlash(path)))
+	if path == "." {
+		return ""
+	}
+	return strings.ToLower(path)
+}
+
+func appendUniqueString(items []string, item string) []string {
+	item = strings.TrimSpace(item)
+	if item == "" {
+		return items
+	}
+	for _, existing := range items {
+		if existing == item {
+			return items
+		}
+	}
+	return append(items, item)
+}
+
+func discoverConstraintCandidates(ctx context.Context, projectPath, projectID, question string, plan core.QueryPlan, initial QueryPlanningInput, agent QueryActionAgent, searchStore SearchEvidenceStore, embeddingProvider EmbeddingProvider, step int, progress QueryProgressFunc) (constraintDiscoveryResult, error) {
+	hypothesisAgent, canGenerate := agent.(QueryHypothesisAgent)
+	auditAgent, canAudit := agent.(QueryCandidateAuditAgent)
+	if !canGenerate || !canAudit {
+		return constraintDiscoveryResult{}, fmt.Errorf("constraint candidate discovery requires hypothesis and audit agent support")
+	}
+	emitQueryProgress(progress, QueryProgressEvent{Type: "candidate_discovery_started", Step: step, Message: "正在按独立条件召回并生成候选"})
+	recalled, err := recallConstraintCandidates(ctx, projectPath, projectID, plan, searchStore, embeddingProvider)
+	if err != nil {
+		return constraintDiscoveryResult{}, err
+	}
+	var recallEvidenceResults []core.QueryResult
+	for _, result := range recalled {
+		path := normalizeQueryEvidencePath(result.Path)
+		if result.Kind == "entity" || strings.HasPrefix(path, "wiki/entities/") || isAggregateWikiPath(path) {
+			continue
+		}
+		recallEvidenceResults = append(recallEvidenceResults, result)
+	}
+	recallDocs, _, err := readSearchResultDocuments(projectPath, recallEvidenceResults, minInt(12, len(recallEvidenceResults)), 3000)
+	if err != nil {
+		return constraintDiscoveryResult{}, err
+	}
+	hypotheses, err := hypothesisAgent.GenerateQueryHypothesesContext(ctx, QueryHypothesisInput{
+		Question:     question,
+		Requirements: plan.Requirements,
+		Index:        initial.Index,
+		Overview:     initial.Overview,
+		Results:      recalled,
+		Docs:         recallDocs,
+	})
+	if err != nil {
+		return constraintDiscoveryResult{}, err
+	}
+	hypotheses = mergeRecallAndModelHypotheses(recalled, hypotheses, 28)
+	if len(hypotheses) == 0 {
+		return constraintDiscoveryResult{}, errors.New("constraint candidate discovery returned no resolvable candidates")
+	}
+	packs, err := buildCandidateEvidencePacks(projectPath, hypotheses, plan.Requirements, 8, 12000)
+	if err != nil {
+		return constraintDiscoveryResult{}, err
+	}
+	if len(packs) == 0 {
+		return constraintDiscoveryResult{}, errors.New("constraint candidate discovery found no readable candidate pages")
+	}
+	emitQueryProgress(progress, QueryProgressEvent{Type: "candidate_audit_started", Step: step, Message: "正在逐候选核验全部条件", Observation: fmt.Sprintf("candidates=%d names=%s", len(packs), strings.Join(candidatePackNames(packs), ","))})
+	type auditBatchResult struct {
+		Index  int
+		Audits []core.QueryHypothesis
+		Err    error
+	}
+	const candidateAuditBatchSize = 2
+	batches := splitCandidateEvidencePacks(packs, candidateAuditBatchSize)
+	batchCount := len(batches)
+	auditCtx, cancelAudit := context.WithCancel(ctx)
+	defer cancelAudit()
+	jobs := make(chan int)
+	batchResults := make(chan auditBatchResult, batchCount)
+	workerCount := minInt(2, batchCount)
+	var workers sync.WaitGroup
+	var auditProgressMu sync.Mutex
+	emitAuditProgress := func(event QueryProgressEvent) {
+		auditProgressMu.Lock()
+		defer auditProgressMu.Unlock()
+		emitQueryProgress(progress, event)
+	}
+	for worker := 0; worker < workerCount; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for batchIndex := range jobs {
+				batch := batches[batchIndex]
+				emitAuditProgress(QueryProgressEvent{Type: "candidate_audit_batch_started", Step: step, Message: "候选审计批次开始", Observation: fmt.Sprintf("batch=%d/%d names=%s", batchIndex+1, batchCount, strings.Join(candidatePackNames(batch), ","))})
+				batchAudits, auditErr := auditAgent.AuditQueryCandidatesContext(auditCtx, QueryCandidateAuditInput{
+					Question:     question,
+					Requirements: plan.Requirements,
+					Hypotheses:   queryHypothesesForPacks(hypotheses, batch),
+					Packs:        batch,
+				})
+				batchResults <- auditBatchResult{Index: batchIndex, Audits: batchAudits, Err: auditErr}
+				if auditErr != nil {
+					cancelAudit()
+					continue
+				}
+				emitAuditProgress(QueryProgressEvent{Type: "candidate_audit_batch_done", Step: step, Message: "候选审计批次完成", Observation: fmt.Sprintf("batch=%d/%d candidates=%d", batchIndex+1, batchCount, len(batchAudits))})
+			}
+		}()
+	}
+	go func() {
+		for index := 0; index < batchCount; index++ {
+			jobs <- index
+		}
+		close(jobs)
+		workers.Wait()
+		close(batchResults)
+	}()
+	auditsByBatch := make([][]core.QueryHypothesis, batchCount)
+	for result := range batchResults {
+		if result.Err != nil {
+			return constraintDiscoveryResult{}, result.Err
+		}
+		auditsByBatch[result.Index] = result.Audits
+	}
+	var audits []core.QueryHypothesis
+	for _, batchAudits := range auditsByBatch {
+		audits = append(audits, batchAudits...)
+	}
+	audits = normalizeCandidateAudits(audits, packs, plan.Requirements)
+	if len(audits) == 0 {
+		return constraintDiscoveryResult{}, errors.New("constraint candidate audit returned no valid candidate ledger")
+	}
+	docs := appendQueryDocs(nil, recallDocs)
+	for _, pack := range packs {
+		docs = appendQueryDocs(docs, pack.Docs)
+	}
+	assessments := candidateAssessmentsFromAudits(audits, plan.Requirements, step)
+	observation := formatDiscoveryAuditObservation(audits, plan.Requirements)
+	emitQueryProgress(progress, QueryProgressEvent{Type: "candidate_audit_done", Step: step, Message: "候选条件账本已建立", Observation: observation})
+	return constraintDiscoveryResult{
+		Results:     recalled,
+		Docs:        docs,
+		Hypotheses:  audits,
+		Assessments: assessments,
+		Observation: observation,
+	}, nil
+}
+
+func splitCandidateEvidencePacks(packs []QueryCandidateEvidencePack, batchSize int) [][]QueryCandidateEvidencePack {
+	if batchSize <= 0 {
+		batchSize = 1
+	}
+	batches := make([][]QueryCandidateEvidencePack, 0, (len(packs)+batchSize-1)/batchSize)
+	for start := 0; start < len(packs); start += batchSize {
+		end := minInt(start+batchSize, len(packs))
+		batches = append(batches, packs[start:end])
+	}
+	return batches
+}
+
+func candidatePackNames(packs []QueryCandidateEvidencePack) []string {
+	names := make([]string, 0, len(packs))
+	for _, pack := range packs {
+		names = append(names, pack.Candidate)
+	}
+	return names
+}
+
+func mergeRecallAndModelHypotheses(recalled []core.QueryResult, model []core.QueryHypothesis, limit int) []core.QueryHypothesis {
+	var merged []core.QueryHypothesis
+	// Preserve up to four independent semantic hypotheses, while reserving the
+	// remaining bounded slots for entities surfaced by diversified recall. This prevents a
+	// plausible but anchored model list from controlling the whole query.
+	modelLimit := minInt(4, limit)
+	merged = append(merged, normalizeQueryHypotheses(model, modelLimit)...)
+	for _, result := range recalled {
+		if result.Kind != "entity" {
+			continue
+		}
+		merged = append(merged, core.QueryHypothesis{
+			Candidate:      result.Title,
+			Rationale:      result.Snippet,
+			Discriminators: []string{"independent requirement coverage recall"},
+			SuggestedReads: []string{result.Path},
+		})
+		merged = normalizeQueryHypotheses(merged, limit)
+		if len(merged) >= limit {
+			break
+		}
+	}
+	return normalizeQueryHypotheses(merged, limit)
+}
+
+func queryHypothesesForPacks(hypotheses []core.QueryHypothesis, packs []QueryCandidateEvidencePack) []core.QueryHypothesis {
+	allowed := map[string]bool{}
+	for _, pack := range packs {
+		allowed[strings.ToLower(strings.TrimSpace(pack.Candidate))] = true
+	}
+	filtered := make([]core.QueryHypothesis, 0, len(packs))
+	for _, hypothesis := range hypotheses {
+		if allowed[strings.ToLower(strings.TrimSpace(hypothesis.Candidate))] {
+			filtered = append(filtered, hypothesis)
+		}
+	}
+	return filtered
+}
+
+func candidateAssessmentsFromAudits(audits []core.QueryHypothesis, requirements []core.QueryRequirement, step int) []core.QueryCandidateAssessment {
+	out := make([]core.QueryCandidateAssessment, 0, len(audits))
+	for _, audit := range audits {
+		assessment := core.QueryCandidateAssessment{
+			Candidate: audit.Candidate,
+			Checks:    audit.Checks,
+			Reason:    audit.Rationale,
+			Step:      step,
+		}
+		byID := make(map[string]core.QueryEvidenceCheck, len(audit.Checks))
+		for _, check := range audit.Checks {
+			byID[strings.TrimSpace(check.RequirementID)] = check
+		}
+		for _, requirement := range requirements {
+			check, ok := byID[requirement.ID]
+			if !ok {
+				assessment.UnresolvedRequirementIDs = append(assessment.UnresolvedRequirementIDs, requirement.ID)
+				continue
+			}
+			status := strings.ToLower(strings.TrimSpace(check.Status))
+			accepted := status == "supported" || (strings.EqualFold(requirement.Kind, "negative") && status == "not_found_in_corpus")
+			if !accepted {
+				assessment.UnresolvedRequirementIDs = append(assessment.UnresolvedRequirementIDs, requirement.ID)
+			}
+			if status == "contradicted" {
+				assessment.ContradictedRequirementIDs = append(assessment.ContradictedRequirementIDs, requirement.ID)
+			}
+		}
+		switch {
+		case len(assessment.ContradictedRequirementIDs) > 0:
+			assessment.Disposition = "rejected"
+		case len(assessment.UnresolvedRequirementIDs) > 0:
+			assessment.Disposition = "partial"
+		default:
+			assessment.Disposition = "accepted"
+		}
+		out = append(out, assessment)
+	}
+	return out
+}
+
+func mergeCandidateAssessments(base, extra []core.QueryCandidateAssessment) []core.QueryCandidateAssessment {
+	for _, assessment := range extra {
+		base = upsertCandidateAssessment(base, assessment)
+	}
+	return base
+}
+
+func formatDiscoveryAuditObservation(audits []core.QueryHypothesis, requirements []core.QueryRequirement) string {
+	kinds := map[string]string{}
+	for _, requirement := range requirements {
+		kinds[requirement.ID] = strings.ToLower(strings.TrimSpace(requirement.Kind))
+	}
+	parts := make([]string, 0, len(audits))
+	for _, audit := range audits {
+		var unresolved []string
+		for _, check := range audit.Checks {
+			status := strings.ToLower(strings.TrimSpace(check.Status))
+			accepted := status == "supported" || (kinds[check.RequirementID] == "negative" && status == "not_found_in_corpus")
+			if !accepted {
+				unresolved = append(unresolved, check.RequirementID)
+			}
+		}
+		parts = append(parts, fmt.Sprintf("%s coverage=%d unresolved=%s", audit.Candidate, audit.Coverage, strings.Join(unresolved, ",")))
+	}
+	return strings.Join(parts, "; ")
 }
 
 func expandVerificationNextQueries(ctx context.Context, projectPath, projectID string, queries []string, searchStore SearchEvidenceStore, embeddingProvider EmbeddingProvider) ([]core.QueryResult, []QueryReadDocument, error) {
@@ -2068,60 +2402,6 @@ func findNamedEntityCooccurrenceSources(projectPath, query string, limit, maxRun
 	return results, docs, nil
 }
 
-func expandCandidateRequirementEvidence(ctx context.Context, projectPath, projectID, candidate string, plan core.QueryPlan, docs []QueryReadDocument, searchStore SearchEvidenceStore, embeddingProvider EmbeddingProvider) ([]core.QueryResult, []QueryReadDocument, error) {
-	var expandedDocs []QueryReadDocument
-	for _, doc := range docs {
-		if !strings.EqualFold(strings.TrimSpace(doc.Title), strings.TrimSpace(candidate)) && !strings.EqualFold(strings.TrimSuffix(filepath.Base(doc.Path), filepath.Ext(doc.Path)), strings.TrimSpace(candidate)) {
-			continue
-		}
-		provenanceDocs, err := readDocumentProvenance(projectPath, doc, 8, 12000)
-		if err != nil {
-			return nil, nil, err
-		}
-		expandedDocs = appendQueryDocs(expandedDocs, provenanceDocs)
-		break
-	}
-
-	var expandedResults []core.QueryResult
-	for _, requirement := range plan.Requirements {
-		query := strings.TrimSpace(candidate + " " + requirement.Text)
-		// A candidate-specific requirement often names the other participant in
-		// a relationship (for example, "唐太宗见过孙悟空"). Search durable
-		// source summaries for both named entity titles before lexical recall so
-		// a missing edge on either entity page does not hide the shared scene.
-		cooccurrenceResults, cooccurrenceDocs, err := findNamedEntityCooccurrenceSources(projectPath, query, 5, 12000)
-		if err != nil {
-			return nil, nil, err
-		}
-		expandedResults = appendQueryResults(expandedResults, cooccurrenceResults)
-		expandedDocs = appendQueryDocs(expandedDocs, cooccurrenceDocs)
-		searchPlan := core.QueryPlan{
-			Question: query,
-			Searches: []core.QuerySearch{{
-				Text: query, Weight: 10, Rationale: "candidate-specific requirement evidence " + requirement.ID,
-			}},
-			CandidateLimit: 5,
-		}
-		items, err := SearchWikiCandidatesWithStore(ctx, projectPath, projectID, searchStore, embeddingProvider, searchPlan, 5)
-		if err != nil {
-			return nil, nil, err
-		}
-		filtered := make([]core.QueryResult, 0, len(items))
-		for _, item := range items {
-			if !isAggregateWikiPath(item.Path) {
-				filtered = append(filtered, item)
-			}
-		}
-		expandedResults = appendQueryResults(expandedResults, filtered)
-		readDocs, _, err := readSearchResultDocuments(projectPath, filtered, minInt(len(filtered), 5), 12000)
-		if err != nil {
-			return nil, nil, err
-		}
-		expandedDocs = appendQueryDocs(expandedDocs, readDocs)
-	}
-	return expandedResults, expandedDocs, nil
-}
-
 func readDocumentProvenance(projectPath string, doc QueryReadDocument, maxSources, maxRunes int) ([]QueryReadDocument, error) {
 	if maxSources <= 0 || !strings.HasPrefix(normalizeQueryEvidencePath(doc.Path), "wiki/") {
 		return nil, nil
@@ -2149,48 +2429,6 @@ func readDocumentProvenance(projectPath string, doc QueryReadDocument, maxSource
 	return provenanceDocs, nil
 }
 
-func ensureEvidenceAfterActionFailure(ctx context.Context, projectPath, projectID, q string, plan core.QueryPlan, results []core.QueryResult, docs []QueryReadDocument, searchStore SearchEvidenceStore, embeddingProvider EmbeddingProvider) ([]core.QueryResult, []QueryReadDocument, error) {
-	if hasAnswerEvidence(docs) {
-		return results, docs, nil
-	}
-	limit := plan.CandidateLimit
-	if limit <= 0 {
-		limit = 5
-	}
-	searchText := strings.TrimSpace(q)
-	if searchText == "" {
-		return results, docs, nil
-	}
-	searchPlan := core.QueryPlan{
-		Question: q,
-		Searches: []core.QuerySearch{{
-			Text:      searchText,
-			Weight:    6,
-			Rationale: "fallback recall after LLM action failure",
-		}},
-		CandidateLimit: limit,
-	}
-	searchResults, err := SearchWikiCandidatesWithStore(ctx, projectPath, projectID, searchStore, embeddingProvider, searchPlan, limit)
-	if err != nil {
-		return nil, nil, err
-	}
-	results = appendQueryResults(results, searchResults)
-	searchDocs, _, err := readSearchResultDocuments(projectPath, searchResults, minInt(limit, 5), 6000)
-	if err != nil {
-		return nil, nil, err
-	}
-	docs = appendQueryDocs(docs, searchDocs)
-	return results, docs, nil
-}
-
-func degradedNoEvidenceAnswer(q string) string {
-	question := strings.TrimSpace(q)
-	if question == "" {
-		question = "当前问题"
-	}
-	return fmt.Sprintf("这次查询没有生成可靠答案：LLM 工具动作连续返回无法解析的 JSON，系统已重试并保留当前查询结果，但没有读取到可用于回答 `%s` 的非导航证据。请重试，或先导入/同步相关知识库内容后再查询。", question)
-}
-
 func missingEvidenceAnswer(q string) string {
 	question := strings.TrimSpace(q)
 	if question == "" {
@@ -2207,6 +2445,15 @@ func emitQueryProgress(progress QueryProgressFunc, event QueryProgressEvent) {
 
 func normalizeQueryRuntimeOptions(opts QueryRuntimeOptions) QueryRuntimeOptions {
 	defaults := DefaultQueryRuntimeOptions()
+	if opts.MaxSteps <= 0 {
+		// MaxActionBudget is retained as a compatibility alias for callers that
+		// still construct QueryRuntimeOptions directly.
+		if opts.MaxActionBudget > 0 {
+			opts.MaxSteps = opts.MaxActionBudget
+		} else {
+			opts.MaxSteps = defaults.MaxSteps
+		}
+	}
 	if opts.InitialActionBudget <= 0 {
 		opts.InitialActionBudget = defaults.InitialActionBudget
 	}
@@ -2227,8 +2474,8 @@ func normalizeQueryRuntimeOptions(opts QueryRuntimeOptions) QueryRuntimeOptions 
 	if opts.StagnationRounds <= 0 {
 		opts.StagnationRounds = defaults.StagnationRounds
 	}
-	if opts.TotalTimeout <= 0 {
-		opts.TotalTimeout = defaults.TotalTimeout
+	if opts.TotalTimeout < 0 {
+		opts.TotalTimeout = 0
 	}
 	return opts
 }
@@ -2247,9 +2494,7 @@ func enrichQueryPlan(question string, plan core.QueryPlan) core.QueryPlan {
 		}
 		for index := range extracted {
 			if prior, ok := planned[extracted[index].ID]; ok {
-				extracted[index].SearchQueries = uniqueQueryStrings(append([]string{extracted[index].Text}, prior.SearchQueries...), 3)
-			} else {
-				extracted[index].SearchQueries = []string{extracted[index].Text}
+				extracted[index].Kind = prior.Kind
 			}
 		}
 		plan.Requirements = extracted
@@ -2283,15 +2528,7 @@ func extractNumberedQueryRequirements(question string) []core.QueryRequirement {
 		if text == "" {
 			continue
 		}
-		kind := "positive"
-		trimmed := strings.TrimLeft(text, "，。！？、 ")
-		for _, prefix := range []string{"不曾", "从未", "没有", "未曾", "不", "无"} {
-			if strings.HasPrefix(trimmed, prefix) {
-				kind = "negative"
-				break
-			}
-		}
-		requirements = append(requirements, core.QueryRequirement{ID: match[1], Text: text, Kind: kind})
+		requirements = append(requirements, core.QueryRequirement{ID: match[1], Text: text})
 		seen[match[1]] = true
 	}
 	return requirements
@@ -2401,6 +2638,20 @@ func bestCandidateAssessment(items []core.QueryCandidateAssessment) *core.QueryC
 	return &best
 }
 
+func candidateAssessmentByName(items []core.QueryCandidateAssessment, candidate string) *core.QueryCandidateAssessment {
+	key := strings.ToLower(strings.TrimSpace(candidate))
+	if key == "" {
+		return nil
+	}
+	for index := len(items) - 1; index >= 0; index-- {
+		if strings.ToLower(strings.TrimSpace(items[index].Candidate)) == key {
+			item := items[index]
+			return &item
+		}
+	}
+	return nil
+}
+
 func formatCandidateAssessmentObservation(assessment core.QueryCandidateAssessment) string {
 	observation := fmt.Sprintf("candidate=%s disposition=%s", assessment.Candidate, assessment.Disposition)
 	if len(assessment.UnresolvedRequirementIDs) > 0 {
@@ -2475,6 +2726,22 @@ func unresolvedQueryRequirements(plan core.QueryPlan, checks []core.QueryEvidenc
 	return " 未完成核验：" + strings.Join(ids, "；")
 }
 
+func queryIncompleteReason(plan core.QueryPlan, checks []core.QueryEvidenceCheck, stopReason string) string {
+	unresolved := strings.TrimSpace(unresolvedQueryRequirements(plan, checks))
+	stopReason = strings.TrimSpace(stopReason)
+	parts := make([]string, 0, 2)
+	if unresolved != "" {
+		parts = append(parts, unresolved)
+	}
+	if stopReason != "" {
+		parts = append(parts, stopReason)
+	}
+	if len(parts) == 0 {
+		return " 查询步骤内未形成可验证的完整候选。"
+	}
+	return " " + strings.Join(parts, " ")
+}
+
 func queryVerificationsAccepted(items []core.QueryVerification, required int) bool {
 	if required <= 0 {
 		return true
@@ -2536,6 +2803,9 @@ func mergeQueryTurnDecision(question string, plan core.QueryPlan, decision core.
 	if len(decision.Requirements) > 0 {
 		plan.Requirements = normalizeQueryRequirements(decision.Requirements)
 	}
+	if len(decision.Hypotheses) > 0 {
+		plan.Hypotheses = normalizeQueryHypotheses(decision.Hypotheses, 6)
+	}
 	if decision.RequireAll {
 		plan.RequireAll = true
 	}
@@ -2563,6 +2833,43 @@ func mergeQueryTurnDecision(question string, plan core.QueryPlan, decision core.
 	return plan
 }
 
+func normalizeQueryHypotheses(hypotheses []core.QueryHypothesis, limit int) []core.QueryHypothesis {
+	seen := map[string]bool{}
+	out := make([]core.QueryHypothesis, 0, len(hypotheses))
+	for _, hypothesis := range hypotheses {
+		hypothesis.Candidate = strings.TrimSpace(hypothesis.Candidate)
+		key := strings.ToLower(hypothesis.Candidate)
+		if key == "" || seen[key] {
+			continue
+		}
+		hypothesis.SuggestedReads = stableUniqueQueryTargets(hypothesis.SuggestedReads, 4)
+		out = append(out, hypothesis)
+		seen[key] = true
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
+func stableUniqueQueryTargets(values []string, limit int) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		key := strings.ToLower(value)
+		if value == "" || seen[key] {
+			continue
+		}
+		out = append(out, value)
+		seen[key] = true
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out
+}
+
 func normalizeQueryRequirements(requirements []core.QueryRequirement) []core.QueryRequirement {
 	out := make([]core.QueryRequirement, 0, len(requirements))
 	seen := map[string]bool{}
@@ -2581,29 +2888,8 @@ func normalizeQueryRequirements(requirements []core.QueryRequirement) []core.Que
 		requirement.ID = id
 		requirement.Text = strings.TrimSpace(requirement.Text)
 		requirement.Kind = kind
-		queries := []string{requirement.Text}
-		queries = append(queries, requirement.SearchQueries...)
-		requirement.SearchQueries = uniqueQueryStrings(queries, 3)
 		out = append(out, requirement)
 		seen[id] = true
-	}
-	return out
-}
-
-func uniqueQueryStrings(values []string, limit int) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		key := strings.ToLower(value)
-		if value == "" || seen[key] {
-			continue
-		}
-		seen[key] = true
-		out = append(out, value)
-		if limit > 0 && len(out) >= limit {
-			break
-		}
 	}
 	return out
 }
@@ -3344,6 +3630,51 @@ func readToolDocument(projectPath, rel string, maxRunes int) (QueryReadDocument,
 	}, nil
 }
 
+// ReadProjectDocument is the narrow read-only document primitive used by
+// external integrations such as QM. It reuses the same safe path resolver as
+// the LLM query action loop.
+func ReadProjectDocument(projectPath, rel string) (QueryReadDocument, error) {
+	return readToolDocument(projectPath, rel, 120000)
+}
+
+// SearchProjectDocuments exposes candidate recall without making it the
+// controlling answer workflow. Callers that need an answer should use
+// QueryLLMWikiWithOptions so evidence reads and citations remain enforced.
+func SearchProjectDocuments(ctx context.Context, projectPath, projectID, query string, limit int, store SearchEvidenceStore, embeddingProvider EmbeddingProvider) ([]core.QueryResult, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, fmt.Errorf("search query is required")
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	plan := core.QueryPlan{
+		Question:       query,
+		Searches:       []core.QuerySearch{{Text: query, Weight: 1}},
+		CandidateLimit: limit,
+	}
+	return SearchWikiCandidatesWithStore(ctx, projectPath, projectID, store, embeddingProvider, plan, limit)
+}
+
+func resolveQueryCandidateDocument(projectPath, candidate string) (QueryReadDocument, error) {
+	candidate = strings.TrimSpace(candidate)
+	switch strings.ToLower(candidate) {
+	case "", "none", "null", "unknown", "n/a", "无", "未知":
+		return QueryReadDocument{}, fmt.Errorf("candidate %q is not a real wiki entity", candidate)
+	}
+	doc, err := readToolDocument(projectPath, candidate, 6000)
+	if err != nil {
+		return QueryReadDocument{}, fmt.Errorf("candidate %q does not resolve to a readable wiki page: %w", candidate, err)
+	}
+	if isAggregateWikiPath(doc.Path) || !strings.HasPrefix(normalizeQueryEvidencePath(doc.Path), "wiki/") {
+		return QueryReadDocument{}, fmt.Errorf("candidate %q resolved to non-entity evidence %s", candidate, doc.Path)
+	}
+	if strings.HasPrefix(normalizeQueryEvidencePath(doc.Path), "wiki/sources/") {
+		return QueryReadDocument{}, fmt.Errorf("candidate %q resolved to a source summary rather than a candidate page", candidate)
+	}
+	return doc, nil
+}
+
 func resolveReadToolPath(projectPath, target string) (string, error) {
 	target = strings.TrimSpace(target)
 	if target == "" {
@@ -3584,7 +3915,6 @@ func appendQueryResults(base, extra []core.QueryResult) []core.QueryResult {
 	for _, result := range extra {
 		key := normalizeQueryEvidencePath(result.Path)
 		if index, exists := positions[key]; exists {
-			base[index].MatchedRequirementIDs = appendUniqueQueryStrings(base[index].MatchedRequirementIDs, result.MatchedRequirementIDs...)
 			if result.Score > base[index].Score {
 				base[index].Score = result.Score
 			}
@@ -3594,65 +3924,6 @@ func appendQueryResults(base, extra []core.QueryResult) []core.QueryResult {
 		positions[key] = len(base) - 1
 	}
 	return base
-}
-
-func splitConstraintRecallResults(results []core.QueryResult, candidateLimit, evidenceLimit int) ([]core.QueryResult, []core.QueryResult) {
-	var candidates []core.QueryResult
-	var evidencePool []core.QueryResult
-	for _, result := range results {
-		if strings.HasPrefix(normalizeQueryEvidencePath(result.Path), "wiki/entities/") {
-			if len(candidates) < candidateLimit {
-				candidates = append(candidates, result)
-			}
-			continue
-		}
-		evidencePool = append(evidencePool, result)
-	}
-	var evidence []core.QueryResult
-	selectedPaths := map[string]bool{}
-	coveredRequirements := map[string]bool{}
-	for _, result := range evidencePool {
-		addsCoverage := false
-		for _, id := range result.MatchedRequirementIDs {
-			if !coveredRequirements[id] {
-				addsCoverage = true
-				break
-			}
-		}
-		if !addsCoverage || len(evidence) >= evidenceLimit {
-			continue
-		}
-		evidence = append(evidence, result)
-		selectedPaths[result.Path] = true
-		for _, id := range result.MatchedRequirementIDs {
-			coveredRequirements[id] = true
-		}
-	}
-	for _, result := range evidencePool {
-		if len(evidence) >= evidenceLimit {
-			break
-		}
-		if !selectedPaths[result.Path] {
-			evidence = append(evidence, result)
-			selectedPaths[result.Path] = true
-		}
-	}
-	return candidates, evidence
-}
-
-func formatConstraintRecallObservation(plan core.QueryPlan, results []core.QueryResult, candidateReads, evidenceReads int) string {
-	positive := 0
-	for _, requirement := range plan.Requirements {
-		if !strings.EqualFold(requirement.Kind, "negative") {
-			positive++
-		}
-	}
-	candidates, _ := splitConstraintRecallResults(results, len(results), 0)
-	top := "none"
-	if len(candidates) > 0 {
-		top = fmt.Sprintf("%s coverage=%d/%d", candidates[0].Title, len(candidates[0].MatchedRequirementIDs), positive)
-	}
-	return fmt.Sprintf("positive_requirements=%d candidates=%d top=%s auto_read_candidates=%d auto_read_evidence=%d", positive, len(candidates), top, candidateReads, evidenceReads)
 }
 
 func formatSearchObservation(results []core.QueryResult) string {

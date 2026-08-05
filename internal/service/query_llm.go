@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"reflect"
+	"sort"
 	"strings"
 
 	"github.com/hejw/knowledge-core/internal/config"
@@ -168,16 +171,16 @@ func (a OpenAICompatibleQueryAgent) GenerateQueryHypothesesContext(ctx context.C
 	var evidence strings.Builder
 	shown := 0
 	for _, doc := range input.Docs {
-		if isAggregateWikiPath(doc.Path) || shown >= 20 {
+		if isAggregateWikiPath(doc.Path) || shown >= 12 {
 			continue
 		}
 		shown++
-		fmt.Fprintf(&evidence, "\n---EVIDENCE %d---\npath: %s\ntitle: %s\n%s\n", shown, doc.Path, doc.Title, promptbudget.TrimMiddle(doc.Content, 1800))
+		fmt.Fprintf(&evidence, "\n---EVIDENCE %d---\npath: %s\ntitle: %s\n%s\n", shown, doc.Path, doc.Title, promptbudget.TrimMiddle(doc.Content, 1200))
 	}
 	system := `You independently generate candidate hypotheses for a persistent-wiki constraint question.
 Do not use prior conversation or previously suggested candidates. Work from the complete conjunction of requirements, prioritizing rare intersections over superficial similarity.
 Return only JSON: {"hypotheses":[{"candidate":"name","rationale":"why the full intersection may fit","discriminators":["rare condition"],"suggested_reads":["exact wiki title/path or chapter"]}]}.
-Include 3-6 diverse candidates. A candidate known from the supplied index that connects multiple rare requirements should rank ahead of a famous candidate matching only early requirements.
+Include 3-6 diverse candidates. Keep each rationale to one short sentence, at most 3 discriminators, and at most 3 suggested_reads. Do not audit requirements or speculate beyond the supplied evidence in this stage. A candidate known from the supplied index that connects multiple rare requirements should rank ahead of a famous candidate matching only early requirements.
 
 Constraint interpretation rules:
 - Every requirement constrains the same unknown subject, but the object of each relation is only the person or place explicitly named in that requirement. Never borrow an object from an adjacent requirement. For example, an unspecified brotherhood requirement does not imply brotherhood with a person named in the next line.
@@ -197,14 +200,32 @@ Read evidence previews:
 		Hypotheses []core.QueryHypothesis `json:"hypotheses"`
 	}
 	retryOpts := a.retryOptions()
+	repairInstruction := ""
 	result, err := llmretry.DoValue[response](ctx, retryOpts, queryLLMRetryCallback(ctx), func(attempt int) (response, bool, error) {
-		content, retryable, err := a.chatOnce(ctx, system, user)
+		attemptUser := user
+		if attempt > 0 && repairInstruction != "" {
+			attemptUser += "\n\nHYPOTHESIS FORMAT REPAIR REQUIRED:\n" + repairInstruction + "\nReturn 3-6 candidates in exactly one compact JSON object. Each rationale must be one short sentence; do not include evidence_checks or long chain-of-thought."
+		}
+		content, retryable, err := a.chatOnce(ctx, system, attemptUser)
 		if err != nil {
 			return response{}, retryable, err
 		}
 		value, err := decodeLLMJSONObject[response](content, "query hypotheses")
 		if err != nil {
+			repairInstruction = compactLLMParseFailure(err)
 			return response{}, true, err
+		}
+		if len(value.Hypotheses) < 3 || len(value.Hypotheses) > 6 {
+			err = fmt.Errorf("query hypotheses must contain 3-6 candidates; got %d", len(value.Hypotheses))
+			repairInstruction = compactLLMParseFailure(err)
+			return response{}, true, err
+		}
+		for _, hypothesis := range value.Hypotheses {
+			if strings.TrimSpace(hypothesis.Candidate) == "" {
+				err = errors.New("query hypothesis candidate must not be empty")
+				repairInstruction = compactLLMParseFailure(err)
+				return response{}, true, err
+			}
 		}
 		return value, false, nil
 	})
@@ -222,9 +243,9 @@ func (a OpenAICompatibleQueryAgent) AuditQueryCandidatesContext(ctx context.Cont
 	for _, pack := range input.Packs {
 		fmt.Fprintf(&evidence, "\n=== CANDIDATE: %s ===\n", pack.Candidate)
 		for index, doc := range pack.Docs {
-			limit := 1400
+			limit := 1800
 			if index == 0 {
-				limit = 3000
+				limit = 6000
 			}
 			fmt.Fprintf(&evidence, "\n---CANDIDATE DOC %d---\npath: %s\ntitle: %s\n%s\n", index+1, doc.Path, doc.Title, promptbudget.TrimMiddle(doc.Content, limit))
 		}
@@ -234,10 +255,11 @@ Return only JSON: {"hypotheses":[{"candidate":"exact supplied candidate","ration
 
 Rules:
 - Audit every supplied candidate against every requirement. Every requirement applies to the same candidate; never combine people.
+- Return each supplied candidate exactly once and each requirement exactly once. Keep each explanation to one short sentence and emit exactly one JSON object without repetition.
 - Use only documents inside that candidate's evidence pack and copy evidence paths exactly.
 - Rank candidates by supported requirement count, then by fewest contradictions and unknowns. coverage is the count of supported/not_found_in_corpus checks with evidence.
 - Distinguish the subject from relation objects. A person can satisfy an unspecified brotherhood clue by forming a brotherhood with anyone; it need not be with the person named in the next clue.
-- "Forced Tang Monk to do something" includes a direct refusal/insistence/compliance sequence in harmless hospitality, ritual, or official contexts. A primary-source sequence such as refusing a drink, the candidate insisting, and Tang Monk complying is stronger than broad claims that the candidate caused the journey.
+- For coercion, insistence, refusal, or compliance conditions, require a direct candidate-specific event sequence. Broad causation, route obstruction, family association, or a later solution to a different event is insufficient.
 - Directly sharing a documented reception or introduction scene satisfies "met Sun Wukong" even if an entity summary omitted the edge.
 - A negative condition may be not_found_in_corpus only when the supplied candidate pack has multi-chapter provenance and no passage attributes the excluded visit to that candidate. Explain that it is corpus-scoped, not universal proof.
 - Do not reject a candidate merely because its compact entity page omitted a fact that a supplied primary source or source-summary explicitly contains.
@@ -250,13 +272,23 @@ Candidate-specific evidence packs:
 	type response struct {
 		Hypotheses []core.QueryHypothesis `json:"hypotheses"`
 	}
+	repairInstruction := ""
 	result, err := llmretry.DoValue[response](ctx, a.retryOptions(), queryLLMRetryCallback(ctx), func(attempt int) (response, bool, error) {
-		content, retryable, err := a.chatOnce(ctx, system, user)
+		attemptUser := user
+		if attempt > 0 && repairInstruction != "" {
+			attemptUser += "\n\nAUDIT REPAIR REQUIRED:\n" + repairInstruction + "\nReturn every supplied candidate exactly once and every requirement exactly once for each candidate. Return one JSON object only."
+		}
+		content, retryable, err := a.chatOnce(ctx, system, attemptUser)
 		if err != nil {
 			return response{}, retryable, err
 		}
 		value, err := decodeLLMJSONObject[response](content, "query candidate audit")
 		if err != nil {
+			repairInstruction = compactLLMParseFailure(err)
+			return response{}, true, err
+		}
+		if err := validateQueryCandidateAuditResponse(value.Hypotheses, input.Packs, input.Requirements); err != nil {
+			repairInstruction = compactLLMParseFailure(err)
 			return response{}, true, err
 		}
 		return value, false, nil
@@ -265,6 +297,62 @@ Candidate-specific evidence packs:
 		return nil, err
 	}
 	return result.Hypotheses, nil
+}
+
+func validateQueryCandidateAuditResponse(audits []core.QueryHypothesis, packs []QueryCandidateEvidencePack, requirements []core.QueryRequirement) error {
+	expectedCandidates := map[string]string{}
+	for _, pack := range packs {
+		key := strings.ToLower(strings.TrimSpace(pack.Candidate))
+		if key != "" {
+			expectedCandidates[key] = pack.Candidate
+		}
+	}
+	expectedRequirements := map[string]bool{}
+	for _, requirement := range requirements {
+		expectedRequirements[strings.TrimSpace(requirement.ID)] = true
+	}
+	seenCandidates := map[string]bool{}
+	for _, audit := range audits {
+		key := strings.ToLower(strings.TrimSpace(audit.Candidate))
+		if _, ok := expectedCandidates[key]; !ok {
+			return fmt.Errorf("candidate audit returned unexpected candidate %q", audit.Candidate)
+		}
+		if seenCandidates[key] {
+			return fmt.Errorf("candidate audit returned duplicate candidate %q", audit.Candidate)
+		}
+		seenCandidates[key] = true
+		seenRequirements := map[string]bool{}
+		for _, check := range audit.Checks {
+			id := strings.TrimSpace(check.RequirementID)
+			if !expectedRequirements[id] {
+				return fmt.Errorf("candidate %q returned unexpected requirement %q", audit.Candidate, id)
+			}
+			if seenRequirements[id] {
+				return fmt.Errorf("candidate %q returned duplicate requirement %q", audit.Candidate, id)
+			}
+			seenRequirements[id] = true
+			status := strings.ToLower(strings.TrimSpace(check.Status))
+			switch status {
+			case "supported", "contradicted", "unknown", "not_found_in_corpus":
+			default:
+				return fmt.Errorf("candidate %q requirement %q has invalid status %q", audit.Candidate, id, check.Status)
+			}
+		}
+		if len(seenRequirements) != len(expectedRequirements) {
+			return fmt.Errorf("candidate %q audited %d/%d requirements", audit.Candidate, len(seenRequirements), len(expectedRequirements))
+		}
+	}
+	if len(seenCandidates) != len(expectedCandidates) {
+		missing := make([]string, 0, len(expectedCandidates)-len(seenCandidates))
+		for key, candidate := range expectedCandidates {
+			if !seenCandidates[key] {
+				missing = append(missing, candidate)
+			}
+		}
+		sort.Strings(missing)
+		return fmt.Errorf("candidate audit returned %d/%d candidates; missing: %s", len(seenCandidates), len(expectedCandidates), strings.Join(missing, ", "))
+	}
+	return nil
 }
 
 func (a OpenAICompatibleQueryAgent) NextQueryAction(input QueryActionInput) (core.QueryAction, error) {
@@ -282,14 +370,14 @@ func (a OpenAICompatibleQueryAgent) NextQueryTurn(input QueryActionInput) (core.
 
 func (a OpenAICompatibleQueryAgent) NextQueryTurnContext(ctx context.Context, input QueryActionInput) (core.QueryTurnDecision, error) {
 	allReadPaths := queryReadPathInventory(input.Docs)
-	input = budgetQueryActionInput(input, 52000)
+	input = budgetQueryActionInput(input, 36000)
 	var docs strings.Builder
 	for i, doc := range input.Docs {
 		fmt.Fprintf(&docs, "\n---DOC %d---\npath: %s\nkind: %s\ntitle: %s\n\n%s\n", i+1, doc.Path, doc.Kind, doc.Title, doc.Content)
 	}
 	var results strings.Builder
 	for i, result := range input.Results {
-		fmt.Fprintf(&results, "%d. path=%s kind=%s title=%s score=%d matched_requirements=%s snippet=%s\n", i+1, result.Path, result.Kind, result.Title, result.Score, strings.Join(result.MatchedRequirementIDs, ","), result.Snippet)
+		fmt.Fprintf(&results, "%d. path=%s kind=%s title=%s score=%d snippet=%s\n", i+1, result.Path, result.Kind, result.Title, result.Score, result.Snippet)
 	}
 	var navigation strings.Builder
 	for i, obs := range input.Navigation {
@@ -304,36 +392,42 @@ func (a OpenAICompatibleQueryAgent) NextQueryTurnContext(ctx context.Context, in
 	system := `You are the single continuing agent operating a persistent LLM Wiki through tools.
 On the first turn, classify the request, decompose material conditions, and choose the first real action in the same response. On later turns, continue from the persisted plan, evidence, candidate ledger, and tool trace.
 Return only JSON in this envelope:
-{"intent":"wiki_query|direct_chat|system_faq|general_assistant|missing_evidence|unsupported","resolved_question":"standalone question","reasoning_mode":"constraint_satisfaction|fact_lookup|comparison|causal|temporal|negative|synthesis|code_graph","requirements":[{"id":"1","text":"...","kind":"positive|negative","search_queries":["original wording","1-2 corpus-neutral aliases or event paraphrases"]}],"require_all_requirements":true,"can_write_back":false,"action":{...one action below...}}
+{"intent":"wiki_query|direct_chat|system_faq|general_assistant|missing_evidence|unsupported","resolved_question":"standalone question","reasoning_mode":"constraint_satisfaction|fact_lookup|comparison|causal|temporal|negative|synthesis|code_graph","requirements":[{"id":"1","text":"...","kind":"positive|negative"}],"hypotheses":[{"candidate":"...","rationale":"why it may fit the full conjunction","discriminators":["decisive condition"],"suggested_reads":["exact title/path"]}],"require_all_requirements":true,"can_write_back":false,"action":{...one action below...}}
 Intent and planning fields are required on step 1 and may be omitted later. action is always required.
 
 Actions:
+- {"action":"discover_candidates","rationale":"run independent per-requirement recall, hypothesis generation, and candidate audit"}
 - {"action":"read","path":"wiki/... or raw/sources/... or exact wiki title/link/alias","rationale":"why this evidence is needed"}
 - {"action":"list_pages","query":"optional title/path/type terms","limit":20,"rationale":"why wiki navigation is needed"}
 - {"action":"follow_links","path":"wiki/...","limit":5,"rationale":"why linked wiki pages should be inspected"}
 - {"action":"search","query":"search terms","limit":5,"rationale":"why recall is needed"}
 - {"action":"graph","query":"symbol, file, relation, route, or concept","limit":5,"rationale":"why graph evidence is needed"}
 - {"action":"assess_candidate","candidate":"one candidate","evidence_checks":[{"requirement_id":"1","status":"supported|contradicted|unknown|not_found_in_corpus","evidence_paths":["wiki/..."],"explanation":"candidate-specific finding"}],"rationale":"record the current candidate ledger before switching or filling gaps"}
+- {"action":"finish_incomplete","candidate":"best audited real candidate, if any","evidence_checks":[{"requirement_id":"1","status":"supported|contradicted|unknown|not_found_in_corpus","evidence_paths":["wiki/..."],"explanation":"exact unresolved state"}],"answer":"optional concise partial conclusion","rationale":"why the corpus cannot currently close the remaining exact gaps"}
 - {"action":"final","candidate":"single checked candidate when applicable","evidence_checks":[{"requirement_id":"1","status":"supported|contradicted|unknown|not_found_in_corpus","evidence_paths":["wiki/..."],"explanation":"brief audit"}],"answer":"final cited answer","rationale":"why every requirement is closed"}
 - {"action":"writeback","title":"short synthesis page title","answer":"final cited answer","rationale":"why this synthesis should be saved"}
 
 Rules:
 - Every request receives at least this one model turn. direct_chat, system_faq, general_assistant, and unsupported should return final immediately without pretending to use wiki evidence.
-- On step 1, give every positive requirement 1-3 compact search_queries including its original wording and useful corpus-neutral aliases/event paraphrases. Do not inject a guessed candidate name. Negative requirements are elimination checks and need no discovery query.
+- On step 1, classify every requirement as positive or negative. For constraint_satisfaction, the only valid first action is discover_candidates. Do not guess candidates on this turn; the dedicated discovery stage independently recalls every positive condition, generates diverse hypotheses, and audits them.
+- Hypotheses created by discovery are provisional reasoning state, never evidence. Derive later candidate decisions from the complete conjunction and the canonical candidate assessments. Include role-inverted or non-obvious candidates when the wording permits them; do not assume that pressure, refusal, or compliance implies an antagonist.
+- Never issue a broad query made by concatenating most of the question. After discovery, search only the exact unresolved condition for one active real candidate.
 - wiki_query must use read/search/follow_links/graph evidence before final. missing_evidence must perform a search or read attempt before concluding that evidence is absent.
 - Prefer wiki navigation before broad search: read wiki/index.md, list_pages, follow_links from relevant pages, then search only when navigation is insufficient.
 - list_pages is navigation only, not factual evidence for final answers.
 - follow_links reads linked wiki pages and can provide final-answer evidence.
 - Search is candidate recall only; use read after search before making factual claims.
 - Follow the plan's reasoning_mode. For constraint_satisfaction, you own one continuing candidate-by-requirement ledger across every tool action. Start from the rarest conjunction, not from the first or most famous clue.
-- Use assess_candidate when a candidate remains partial or is contradicted. The runtime will preserve the ledger and tell you its exact gaps. Then retrieve those gaps or switch to a different role/person; do not repeatedly submit an unchanged rejected candidate.
+- Use assess_candidate when a candidate remains partial or is contradicted. The runtime preserves the ledger. Then retrieve at most one or two exact gaps for that active candidate, switch to another audited real candidate, or use finish_incomplete; do not repeatedly submit an unchanged rejected candidate.
 - Treat prior candidate assessments as durable tool state, not as separate agents. Preserve supported checks when new evidence is read, but correct them when a cited passage disproves them.
 - Never combine facts about different subjects into one candidate. Evidence paths in evidence_checks must be documents actually read.
+- For every check, verify that the candidate is the semantic subject or an actual participant in the stated relation. Keep coupled conditions tied to the same event, and distinguish literal events from figures of speech.
 - wiki/index.md, wiki/overview.md, wiki/log.md, and wiki/reviews.md are navigation/aggregate pages and are forbidden in evidence_checks. Cite concrete entity, concept, source-summary, raw-source, or graph evidence instead.
 - Copy evidence paths exactly from "All read document paths". A path appearing only in the plan, navigation observations, or search results is not read evidence.
 - A negative requirement may use not_found_in_corpus only after searching the supplied corpus scope; phrase it as absence in the current corpus, not universal proof.
 - not_found_in_corpus never satisfies a positive requirement. A candidate missing a positive requirement is incomplete and you must keep searching alternatives.
-- For an ambiguous "forced someone to do something" requirement, prefer a primary-source refusal/insistence/compliance sequence over broad causal claims such as starting a journey, blocking a route, or belonging to the coercer's family.
+- A candidate must resolve to an actual readable wiki entity page. Never use placeholders such as "none", "unknown", a rationale sentence, or an answer paragraph as candidate.
+- Use finish_incomplete only after the strongest audited candidates have been checked and the exact remaining gaps cannot be closed. It is preferable to inventing a closest-match answer.
 - If a prior candidate from conversation fails requirements, discard it and generate independent alternatives. Do not answer with the closest partial match.
 - Use graph for code questions, impact/trace questions, symbol relationships, routes, tools, and graphify/GitNexus evidence.
 - Cite paths in final answers.
@@ -384,20 +478,54 @@ All read document paths (aggregate paths are navigation only):
 	Read documents:
 %s`, input.Question, input.ConversationContext, mustJSON(input.Plan), input.Purpose, input.Schema, input.Index, input.Overview, input.LogTail, mustJSON(input.CandidateAssessments), input.Step, mustJSON(input.Trace), results.String(), navigation.String(), allReadPaths, docs.String())
 	retryOpts := a.retryOptions()
+	repairInstruction := ""
 	return llmretry.DoValue[core.QueryTurnDecision](ctx, retryOpts, queryLLMRetryCallback(ctx), func(attempt int) (core.QueryTurnDecision, bool, error) {
-		content, retryable, err := a.chatOnce(ctx, system, user)
+		attemptUser := user
+		if attempt > 0 && repairInstruction != "" {
+			attemptUser += "\n\nFORMAT REPAIR REQUIRED:\n" + repairInstruction + "\nReturn exactly one JSON object and no second object, commentary, or markdown fence."
+		}
+		content, retryable, err := a.chatOnce(ctx, system, attemptUser)
 		if err != nil {
 			return core.QueryTurnDecision{}, retryable, err
 		}
-		decision, err := decodeQueryTurnDecision(content)
+		decision, normalized, err := decodeQueryTurnDecisionWithNormalization(content)
 		if err != nil {
+			repairInstruction = compactLLMParseFailure(err)
 			return core.QueryTurnDecision{}, true, err
 		}
+		if normalized {
+			emitQueryProgressFromContext(ctx, QueryProgressEvent{Type: "llm_output_normalized", Message: "检测到重复的相同 JSON，已按单个动作执行"})
+		}
 		if strings.TrimSpace(decision.Action.Action) == "" {
-			return core.QueryTurnDecision{}, true, fmt.Errorf("llm query turn missing action: %s", content)
+			err = fmt.Errorf("llm query turn missing action")
+			repairInstruction = compactLLMParseFailure(err)
+			return core.QueryTurnDecision{}, true, err
+		}
+		if err := validateQueryTurnDecision(input, decision); err != nil {
+			repairInstruction = compactLLMParseFailure(err)
+			return core.QueryTurnDecision{}, true, err
 		}
 		return decision, false, nil
 	})
+}
+
+func validateQueryTurnDecision(input QueryActionInput, decision core.QueryTurnDecision) error {
+	if input.Step != 1 || !decision.RequireAll || !strings.EqualFold(strings.TrimSpace(decision.ReasoningMode), "constraint_satisfaction") {
+		return nil
+	}
+	if len(decision.Requirements) < 2 {
+		return errors.New("constraint first turn must preserve all material requirements")
+	}
+	for _, requirement := range decision.Requirements {
+		kind := strings.ToLower(strings.TrimSpace(requirement.Kind))
+		if kind != "positive" && kind != "negative" {
+			return fmt.Errorf("requirement %q must be classified as positive or negative", requirement.ID)
+		}
+	}
+	if !strings.EqualFold(strings.TrimSpace(decision.Action.Action), "discover_candidates") {
+		return errors.New("constraint first turn must use discover_candidates before naming or testing candidates")
+	}
+	return nil
 }
 
 func (a OpenAICompatibleQueryAgent) VerifyQueryAnswerContext(ctx context.Context, input QueryVerificationInput) (core.QueryVerification, error) {
@@ -525,6 +653,11 @@ func queryLLMRetryCallback(ctx context.Context) llmretry.OnRetry {
 	}
 }
 
+func emitQueryProgressFromContext(ctx context.Context, event QueryProgressEvent) {
+	progress, _ := ctx.Value(queryProgressContextKey{}).(QueryProgressFunc)
+	emitQueryProgress(progress, event)
+}
+
 func (a OpenAICompatibleQueryAgent) chatOnce(ctx context.Context, system, user string) (string, bool, error) {
 	maxInputChars := a.MaxInputChars
 	if maxInputChars <= 0 {
@@ -563,45 +696,120 @@ type chatMessage struct {
 }
 
 func extractJSONObject(content string) string {
-	content = strings.TrimSpace(content)
-	start := strings.Index(content, "{")
-	end := strings.LastIndex(content, "}")
-	if start >= 0 && end >= start {
-		return content[start : end+1]
+	data, _, err := canonicalJSONObject(content)
+	if err != nil {
+		return strings.TrimSpace(content)
 	}
-	return content
+	return string(data)
 }
 
 func decodeLLMJSONObject[T any](content string, label string) (T, error) {
 	var value T
-	if err := json.Unmarshal([]byte(extractJSONObject(content)), &value); err != nil {
-		return value, fmt.Errorf("parse %s: %w: %s", label, err, content)
+	data, _, err := canonicalJSONObject(content)
+	if err != nil {
+		return value, fmt.Errorf("parse %s: %w", label, err)
+	}
+	if err := json.Unmarshal(data, &value); err != nil {
+		return value, fmt.Errorf("parse %s: %w", label, err)
 	}
 	return value, nil
 }
 
 func decodeQueryTurnDecision(content string) (core.QueryTurnDecision, error) {
-	data := []byte(extractJSONObject(content))
+	decision, _, err := decodeQueryTurnDecisionWithNormalization(content)
+	return decision, err
+}
+
+func decodeQueryTurnDecisionWithNormalization(content string) (core.QueryTurnDecision, bool, error) {
+	data, normalized, err := canonicalJSONObject(content)
+	if err != nil {
+		return core.QueryTurnDecision{}, false, fmt.Errorf("parse llm query action: %w", err)
+	}
 	// Keep the action endpoint backward compatible with providers and tests that
 	// still return the former flat QueryAction shape. Production first turns use
 	// the decision envelope, but a flat action remains a valid later-turn reply.
 	var shape map[string]json.RawMessage
 	if err := json.Unmarshal(data, &shape); err != nil {
-		return core.QueryTurnDecision{}, fmt.Errorf("parse llm query action: %w: %s", err, content)
+		return core.QueryTurnDecision{}, normalized, fmt.Errorf("parse llm query action: %w", err)
 	}
 	actionJSON := bytes.TrimSpace(shape["action"])
 	if len(actionJSON) > 0 && actionJSON[0] == '{' {
 		var decision core.QueryTurnDecision
 		if err := json.Unmarshal(data, &decision); err != nil {
-			return core.QueryTurnDecision{}, fmt.Errorf("parse llm query turn: %w: %s", err, content)
+			return core.QueryTurnDecision{}, normalized, fmt.Errorf("parse llm query turn: %w", err)
 		}
-		return decision, nil
+		return decision, normalized, nil
 	}
 	var action core.QueryAction
 	if err := json.Unmarshal(data, &action); err != nil {
-		return core.QueryTurnDecision{}, fmt.Errorf("parse llm query action: %w: %s", err, content)
+		return core.QueryTurnDecision{}, normalized, fmt.Errorf("parse llm query action: %w", err)
 	}
-	return core.QueryTurnDecision{Action: action}, nil
+	return core.QueryTurnDecision{Action: action}, normalized, nil
+}
+
+func canonicalJSONObject(content string) ([]byte, bool, error) {
+	content = strings.TrimSpace(content)
+	var values []json.RawMessage
+	for {
+		start := strings.Index(content, "{")
+		if start < 0 {
+			break
+		}
+		segment := content[start:]
+		decoder := json.NewDecoder(strings.NewReader(segment))
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			return nil, false, fmt.Errorf("invalid JSON stream: %w; output=%s", err, compactLLMOutput(content))
+		}
+		var shape any
+		if err := json.Unmarshal(raw, &shape); err != nil {
+			return nil, false, fmt.Errorf("invalid JSON value: %w", err)
+		}
+		if _, ok := shape.(map[string]any); !ok {
+			return nil, false, errors.New("top-level JSON value must be an object")
+		}
+		values = append(values, raw)
+		offset := int(decoder.InputOffset())
+		if offset >= len(segment) {
+			break
+		}
+		// Ignore commentary and markdown fences around a single JSON object, but
+		// continue scanning when another object exists so identical duplicates can
+		// be normalized and conflicting actions can still be rejected.
+		content = segment[offset:]
+	}
+	if len(values) == 0 {
+		return nil, false, errors.New("response contains no JSON object")
+	}
+	var first any
+	if err := json.Unmarshal(values[0], &first); err != nil {
+		return nil, false, err
+	}
+	for _, raw := range values[1:] {
+		var next any
+		if err := json.Unmarshal(raw, &next); err != nil {
+			return nil, false, err
+		}
+		if !reflect.DeepEqual(first, next) {
+			return nil, false, fmt.Errorf("response contains %d conflicting JSON objects", len(values))
+		}
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, values[0]); err != nil {
+		return nil, false, err
+	}
+	return compact.Bytes(), len(values) > 1, nil
+}
+
+func compactLLMOutput(content string) string {
+	return strings.ReplaceAll(promptbudget.TrimMiddle(strings.TrimSpace(content), 800), "\n", " ")
+}
+
+func compactLLMParseFailure(err error) string {
+	if err == nil {
+		return "previous response was invalid"
+	}
+	return promptbudget.TrimMiddle(err.Error(), 1000)
 }
 
 func mustJSON(value any) string {
@@ -622,56 +830,53 @@ func budgetQueryPlanningInput(input QueryPlanningInput) QueryPlanningInput {
 }
 
 func budgetQueryActionInput(input QueryActionInput, docsBudget int) QueryActionInput {
-	input.Purpose = promptbudget.TrimEnd(input.Purpose, 6000)
-	input.Schema = promptbudget.TrimEnd(input.Schema, 6000)
-	input.Index = promptbudget.TrimMiddle(input.Index, 30000)
-	input.Overview = promptbudget.TrimMiddle(input.Overview, 16000)
-	input.LogTail = tailRunes(input.LogTail, 4000)
+	if input.Step == 1 && input.Plan.RequireAll {
+		// The first constraint turn only routes and classifies already extracted
+		// requirements. Candidate discovery receives the fuller navigation context
+		// separately, so sending the whole catalog here only increases latency and
+		// the likelihood of upstream gateway failures.
+		input.Purpose = promptbudget.TrimEnd(input.Purpose, 3000)
+		input.Schema = promptbudget.TrimEnd(input.Schema, 3000)
+		input.Index = promptbudget.TrimMiddle(input.Index, 6000)
+		input.Overview = promptbudget.TrimMiddle(input.Overview, 4000)
+		input.LogTail = tailRunes(input.LogTail, 1000)
+	} else {
+		input.Purpose = promptbudget.TrimEnd(input.Purpose, 6000)
+		input.Schema = promptbudget.TrimEnd(input.Schema, 6000)
+		input.Index = promptbudget.TrimMiddle(input.Index, 30000)
+		input.Overview = promptbudget.TrimMiddle(input.Overview, 16000)
+		input.LogTail = tailRunes(input.LogTail, 4000)
+	}
 	input.Results = budgetQueryResults(input.Results, 12)
-	input.Docs = budgetRecentReadDocuments(prioritizeQueryActionDocuments(input.Docs, input.Results, input.Trace), docsBudget)
+	input.Docs = budgetRecentReadDocuments(prioritizeQueryActionDocuments(input.Docs, input.Results, input.Trace, input.CandidateAssessments), docsBudget)
 	input.Navigation = budgetNavigationObservations(input.Navigation, 6, 12)
 	input.Trace = budgetTrace(input.Trace, 12)
 	return input
 }
 
-func prioritizeQueryActionDocuments(docs []QueryReadDocument, results []core.QueryResult, trace []core.QueryTraceStep) []QueryReadDocument {
+func prioritizeQueryActionDocuments(docs []QueryReadDocument, results []core.QueryResult, trace []core.QueryTraceStep, assessments []core.QueryCandidateAssessment) []QueryReadDocument {
 	if len(docs) == 0 {
 		return docs
 	}
 	priority := map[string]bool{}
-	for index, result := range results {
-		if index >= 8 {
-			break
+	if len(assessments) == 0 {
+		for index, result := range results {
+			if index >= 8 {
+				break
+			}
+			if !isAggregateWikiPath(result.Path) {
+				priority[normalizeQueryEvidencePath(result.Path)] = true
+			}
 		}
-		if !isAggregateWikiPath(result.Path) {
-			priority[normalizeQueryEvidencePath(result.Path)] = true
-		}
+	} else if best := bestCandidateAssessment(assessments); best != nil {
+		markCandidateEvidencePriority(priority, docs, best.Candidate, best.Checks)
 	}
 	for index := len(trace) - 1; index >= 0; index-- {
 		action := trace[index].Action
 		if strings.TrimSpace(action.Candidate) == "" && len(action.Checks) == 0 {
 			continue
 		}
-		candidate := strings.ToLower(strings.TrimSpace(action.Candidate))
-		for _, doc := range docs {
-			if candidate != "" && (strings.Contains(strings.ToLower(doc.Title), candidate) || strings.Contains(strings.ToLower(doc.Path), candidate)) {
-				priority[normalizeQueryEvidencePath(doc.Path)] = true
-				// Keep the candidate page's raw provenance in every later action
-				// prompt. These primary sources frequently contain the decisive
-				// event detail that a compact entity page omitted.
-				page := wiki.ParseWikiPage("query", doc.Path, doc.Content)
-				for _, source := range page.Sources {
-					priority[normalizeQueryEvidencePath(source)] = true
-				}
-			}
-		}
-		for _, check := range action.Checks {
-			for _, path := range check.EvidencePaths {
-				if !isAggregateWikiPath(path) {
-					priority[normalizeQueryEvidencePath(path)] = true
-				}
-			}
-		}
+		markCandidateEvidencePriority(priority, docs, action.Candidate, action.Checks)
 		break
 	}
 	if len(priority) == 0 {
@@ -689,6 +894,27 @@ func prioritizeQueryActionDocuments(docs []QueryReadDocument, results []core.Que
 		}
 	}
 	return ordered
+}
+
+func markCandidateEvidencePriority(priority map[string]bool, docs []QueryReadDocument, candidate string, checks []core.QueryEvidenceCheck) {
+	candidate = strings.ToLower(strings.TrimSpace(candidate))
+	for _, doc := range docs {
+		if candidate == "" || (!strings.Contains(strings.ToLower(doc.Title), candidate) && !strings.Contains(strings.ToLower(doc.Path), candidate)) {
+			continue
+		}
+		priority[normalizeQueryEvidencePath(doc.Path)] = true
+		page := wiki.ParseWikiPage("query", doc.Path, doc.Content)
+		for _, source := range page.Sources {
+			priority[normalizeQueryEvidencePath(source)] = true
+		}
+	}
+	for _, check := range checks {
+		for _, path := range check.EvidencePaths {
+			if !isAggregateWikiPath(path) {
+				priority[normalizeQueryEvidencePath(path)] = true
+			}
+		}
+	}
 }
 
 func queryReadPathInventory(docs []QueryReadDocument) string {

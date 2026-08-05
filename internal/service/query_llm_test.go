@@ -346,7 +346,8 @@ func TestDecodeQueryTurnDecisionEnvelope(t *testing.T) {
   "intent":"wiki_query",
   "resolved_question":"谁满足全部条件？",
   "reasoning_mode":"constraint_satisfaction",
-  "requirements":[{"id":"1","text":"见过孙悟空","kind":"positive","search_queries":["见过孙悟空","与孙悟空相见"]}],
+  "requirements":[{"id":"1","text":"见过孙悟空","kind":"positive"}],
+  "hypotheses":[{"candidate":"唐太宗","rationale":"回朝接见","suggested_reads":["wiki/entities/唐太宗.md"]}],
   "require_all_requirements":true,
   "can_write_back":false,
   "action":{"action":"search","query":"见过孙悟空","limit":10}
@@ -357,11 +358,71 @@ func TestDecodeQueryTurnDecisionEnvelope(t *testing.T) {
 	if decision.Intent != QueryIntentWikiQuery || decision.Action.Action != "search" || len(decision.Requirements) != 1 || !decision.RequireAll {
 		t.Fatalf("decision=%+v", decision)
 	}
-	if len(decision.Requirements[0].SearchQueries) != 2 {
-		t.Fatalf("search queries=%+v", decision.Requirements[0].SearchQueries)
+	if len(decision.Hypotheses) != 1 || decision.Hypotheses[0].Candidate != "唐太宗" {
+		t.Fatalf("hypotheses=%+v", decision.Hypotheses)
 	}
 	if decision.CanWriteBack == nil || *decision.CanWriteBack != canWriteBack {
 		t.Fatalf("can_write_back=%v", decision.CanWriteBack)
+	}
+}
+
+func TestDecodeQueryTurnDecisionAcceptsIdenticalDuplicateObjects(t *testing.T) {
+	content := `{"action":"search","query":"candidate gap","limit":5}{"action":"search","query":"candidate gap","limit":5}`
+	decision, normalized, err := decodeQueryTurnDecisionWithNormalization(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !normalized || decision.Action.Action != "search" || decision.Action.Query != "candidate gap" {
+		t.Fatalf("decision=%+v normalized=%t", decision, normalized)
+	}
+}
+
+func TestDecodeQueryTurnDecisionRejectsConflictingDuplicateObjects(t *testing.T) {
+	_, _, err := decodeQueryTurnDecisionWithNormalization(`{"action":"search","query":"one"}{"action":"read","path":"wiki/entities/two.md"}`)
+	if err == nil || !strings.Contains(err.Error(), "conflicting JSON objects") {
+		t.Fatalf("err=%v", err)
+	}
+}
+
+func TestDecodeQueryTurnDecisionAllowsCommentaryAndMarkdownFenceAroundSingleObject(t *testing.T) {
+	decision, normalized, err := decodeQueryTurnDecisionWithNormalization("reasoning before output\n```json\n{\"action\":\"discover_candidates\"}\n```\ntrailing note")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if normalized || decision.Action.Action != "discover_candidates" {
+		t.Fatalf("decision=%+v normalized=%t", decision, normalized)
+	}
+}
+
+func TestValidateQueryCandidateAuditResponseRequiresEveryCandidateAndRequirement(t *testing.T) {
+	packs := []QueryCandidateEvidencePack{{Candidate: "Alpha"}, {Candidate: "Beta"}}
+	requirements := []core.QueryRequirement{{ID: "1"}, {ID: "2"}}
+	checks := []core.QueryEvidenceCheck{{RequirementID: "1", Status: "supported"}, {RequirementID: "2", Status: "unknown"}}
+	if err := validateQueryCandidateAuditResponse([]core.QueryHypothesis{{Candidate: "Alpha", Checks: checks}}, packs, requirements); err == nil || !strings.Contains(err.Error(), "missing: Beta") {
+		t.Fatalf("err=%v", err)
+	}
+	if err := validateQueryCandidateAuditResponse([]core.QueryHypothesis{{Candidate: "Alpha", Checks: checks}, {Candidate: "Beta", Checks: checks}}, packs, requirements); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestValidateConstraintFirstTurnRequiresCandidateDiscovery(t *testing.T) {
+	input := QueryActionInput{Step: 1}
+	decision := core.QueryTurnDecision{
+		ReasoningMode: "constraint_satisfaction",
+		RequireAll:    true,
+		Requirements: []core.QueryRequirement{
+			{ID: "1", Text: "condition one", Kind: "positive"},
+			{ID: "2", Text: "condition two", Kind: "negative"},
+		},
+		Action: core.QueryAction{Action: "search", Query: "premature candidate"},
+	}
+	if err := validateQueryTurnDecision(input, decision); err == nil {
+		t.Fatal("premature first-turn candidate search was accepted")
+	}
+	decision.Action = core.QueryAction{Action: "discover_candidates"}
+	if err := validateQueryTurnDecision(input, decision); err != nil {
+		t.Fatal(err)
 	}
 }
 

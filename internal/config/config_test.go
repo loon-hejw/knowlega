@@ -49,7 +49,7 @@ llm:
 	if cfg.Project.Bootstrap.MaxTaskAttempts != 4 || cfg.Project.Bootstrap.MaxConflictAttempts != 8 || cfg.Project.Bootstrap.MaxImpactAttempts != 2 || cfg.Project.Bootstrap.MaxFilesPerTask != 12 || cfg.Project.Bootstrap.MaxNewPagesPerSource != 3 {
 		t.Fatalf("bootstrap guards not defaulted: %+v", cfg.Project.Bootstrap)
 	}
-	if cfg.Query.InitialActionBudget != 8 || cfg.Query.MaxActionBudget != 32 || cfg.Query.VerificationPasses != 2 || cfg.Query.StagnationRounds != 2 || cfg.Query.TotalTimeout.Duration != 20*time.Minute {
+	if cfg.Query.MaxSteps != 256 || cfg.Query.InitialActionBudget != 8 || cfg.Query.MaxActionBudget != 32 || cfg.Query.VerificationPasses != 2 || cfg.Query.StagnationRounds != 2 || cfg.Query.TotalTimeout.Duration != 0 {
 		t.Fatalf("query defaults not applied: %+v", cfg.Query)
 	}
 	if err := cfg.ValidateServe(); err != nil {
@@ -122,6 +122,8 @@ func TestLoadRejectsMissingUnknownWrongTypeAndExtraDocument(t *testing.T) {
 		{name: "bootstrap new page limit", content: "project:\n  bootstrap:\n    max_new_pages_per_source: -1\n", want: "max_new_pages_per_source must be non-negative"},
 		{name: "output token limit", content: "llm:\n  max_output_tokens: 200000\n", want: "max_output_tokens must not exceed 131072"},
 		{name: "operation timeout", content: "llm:\n  operation_timeout: 0s\n", want: "duration must be positive"},
+		{name: "query max steps", content: "query:\n  max_steps: 0\n", want: "query.max_steps must be positive"},
+		{name: "query negative timeout", content: "query:\n  total_timeout: -1s\n", want: "duration must be non-negative"},
 		{name: "query budget order", content: "query:\n  initial_action_budget: 20\n  max_action_budget: 8\n", want: "query action budgets"},
 		{name: "query verification passes", content: "query:\n  verification_passes: 3\n", want: "verification_passes"},
 		{name: "llm protocol", content: "llm:\n  protocol: cohere\n", want: "llm.protocol must be openai or anthropic"},
@@ -140,6 +142,34 @@ func TestLoadRejectsMissingUnknownWrongTypeAndExtraDocument(t *testing.T) {
 	_, err := Load(filepath.Join(root, "missing.yaml"))
 	if err == nil || !strings.Contains(err.Error(), "config file not found") {
 		t.Fatalf("missing error=%v", err)
+	}
+}
+
+func TestLoadQueryStepLimitAndLegacyCompatibility(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "sources"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	project := "project:\n  name: demo\n  path: ./project\n  bootstrap:\n    source: ./sources\n"
+
+	legacyPath := filepath.Join(root, "legacy.yaml")
+	writeConfig(t, legacyPath, project+"query:\n  max_action_budget: 40\n  total_timeout: 0s\n")
+	legacy, err := Load(legacyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Query.MaxSteps != 40 || legacy.Query.TotalTimeout.Duration != 0 {
+		t.Fatalf("legacy query compatibility not applied: %+v", legacy.Query)
+	}
+
+	explicitPath := filepath.Join(root, "explicit.yaml")
+	writeConfig(t, explicitPath, project+"query:\n  max_steps: 64\n  max_action_budget: 40\n  total_timeout: 3m\n")
+	explicit, err := Load(explicitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explicit.Query.MaxSteps != 64 || explicit.Query.TotalTimeout.Duration != 3*time.Minute {
+		t.Fatalf("explicit max_steps should win: %+v", explicit.Query)
 	}
 }
 

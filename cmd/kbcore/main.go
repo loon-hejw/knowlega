@@ -19,8 +19,10 @@ import (
 	"github.com/hejw/knowledge-core/internal/compiler"
 	"github.com/hejw/knowledge-core/internal/config"
 	"github.com/hejw/knowledge-core/internal/core"
+	"github.com/hejw/knowledge-core/internal/grpcapi"
 	"github.com/hejw/knowledge-core/internal/llmclient"
 	"github.com/hejw/knowledge-core/internal/postgres"
+	"github.com/hejw/knowledge-core/internal/scope"
 	"github.com/hejw/knowledge-core/internal/service"
 	"github.com/hejw/knowledge-core/internal/wiki"
 )
@@ -791,6 +793,66 @@ func runServe(args []string) error {
 	if restoreErr := service.RestoreBootstrapTracker(tracker, *project, effectiveConfig.Project.Bootstrap.Source, expectedContract); restoreErr != nil {
 		return fmt.Errorf("restore bootstrap progress: %w", restoreErr)
 	}
+	var grpcListener net.Listener
+	var grpcErrCh chan error
+	if effectiveConfig.Server.GRPC.Enabled {
+		var bindingStore scope.BindingStore
+		var documentCounter grpcapi.ProjectDocumentCounter
+		if dbHandle != nil {
+			bindingStore = dbHandle.store
+			documentCounter = dbHandle.store
+		}
+		resolver, resolverErr := scope.NewResolver(scope.Options{
+			Provider:  "qm",
+			ScopeRoot: effectiveConfig.Server.GRPC.ScopeRoot,
+			Store:     bindingStore,
+		})
+		if resolverErr != nil {
+			return fmt.Errorf("create QM scope resolver: %w", resolverErr)
+		}
+		defaultScopeID := "group:project:" + projectID
+		if err := resolver.Register(ctx, core.ScopeBinding{
+			Provider:        "qm",
+			ExternalScopeID: defaultScopeID,
+			Kind:            "project",
+			ProjectID:       projectID,
+			ProjectName:     effectiveConfig.Project.Name,
+			RootPath:        *project,
+			Status:          "active",
+		}); err != nil {
+			return fmt.Errorf("bind default QM scope: %w", err)
+		}
+		grpcCreds, credsErr := grpcTransportCredentials(effectiveConfig.Server.GRPC)
+		if credsErr != nil {
+			return credsErr
+		}
+		grpcService, grpcErr := grpcapi.NewServer(grpcapi.ServerOptions{
+			Resolver:          resolver,
+			SearchStore:       searchStore,
+			GraphStore:        graphStore,
+			QueryLogStore:     queryLogStore,
+			QueryAgent:        queryAgent,
+			EmbeddingProvider: embeddingProvider,
+			Runtime:           queryRuntimeOptions(effectiveConfig.Query),
+			Bootstrap:         tracker,
+			DocumentCounter:   documentCounter,
+			AuthToken:         effectiveConfig.Server.GRPC.AuthToken,
+			RequireAuth:       effectiveConfig.Server.GRPC.RequireAuth,
+			TransportCreds:    grpcCreds,
+		})
+		if grpcErr != nil {
+			return fmt.Errorf("create QM gRPC server: %w", grpcErr)
+		}
+		grpcListener, err = net.Listen("tcp", effectiveConfig.Server.GRPC.Addr)
+		if err != nil {
+			return fmt.Errorf("listen gRPC %s: %w", effectiveConfig.Server.GRPC.Addr, err)
+		}
+		grpcErrCh = make(chan error, 1)
+		go func() {
+			grpcErrCh <- grpcService.Serve(ctx, grpcListener)
+		}()
+		fmt.Println("serving grpc", grpcListener.Addr().String())
+	}
 	server := &http.Server{
 		Addr: *addr,
 		Handler: api.NewServerWithOptions(api.ServerOptions{
@@ -833,7 +895,28 @@ func runServe(args []string) error {
 		Provider: ingestLLMProvider, Tracker: tracker, DBHandle: dbHandle,
 		EmbeddingProvider: embeddingProvider, Worker: *worker, ScanInterval: *scanInterval,
 	})
-	return server.Serve(listener)
+	if grpcErrCh == nil {
+		return server.Serve(listener)
+	}
+	httpErrCh := make(chan error, 1)
+	go func() {
+		httpErrCh <- server.Serve(listener)
+	}()
+	select {
+	case serveErr := <-httpErrCh:
+		cancel()
+		if grpcListener != nil {
+			_ = grpcListener.Close()
+		}
+		return serveErr
+	case grpcErr := <-grpcErrCh:
+		cancel()
+		_ = server.Close()
+		if grpcErr == nil {
+			return nil
+		}
+		return fmt.Errorf("gRPC server: %w", grpcErr)
+	}
 }
 
 func runGraphManagerWhenReady(ctx context.Context, tracker *service.BootstrapTracker, manager *service.GraphManager) {
@@ -1060,6 +1143,7 @@ func impactAssessorFromProvider(provider compiler.Provider) compiler.ImpactAsses
 
 func queryRuntimeOptions(cfg config.QueryConfig) service.QueryRuntimeOptions {
 	return service.QueryRuntimeOptions{
+		MaxSteps:            cfg.MaxSteps,
 		InitialActionBudget: cfg.InitialActionBudget,
 		MaxActionBudget:     cfg.MaxActionBudget,
 		VerificationPasses:  cfg.VerificationPasses,
@@ -1172,11 +1256,20 @@ func runQuery(args []string) error {
 	q := fs.String("q", "", "query")
 	limit := fs.Int("limit", 10, "max results")
 	agentName := fs.String("agent", runtimeConfig.Server.Agent, "query agent: llm, mock")
+	showProgress := fs.Bool("progress", true, "print live query progress to stderr")
 	saveTitle := fs.String("save-title", "", "write answer back to wiki/syntheses with this title")
 	dbDSN := fs.String("db-dsn", runtimeConfig.Database.DSN, "PostgreSQL DSN for graph evidence")
 	projectIDFlag := fs.String("project-id", runtimeConfig.Database.ProjectID, "PostgreSQL project id")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	var progressReporter *queryProgressReporter
+	var progress service.QueryProgressFunc
+	if *showProgress {
+		progressReporter = newQueryProgressReporter(os.Stderr, queryProgressHeartbeatInterval)
+		defer progressReporter.Stop()
+		progress = progressReporter.Progress
+		progress(service.QueryProgressEvent{Type: "started", Message: "查询命令已启动"})
 	}
 	var agent service.QueryAgent
 	switch *agentName {
@@ -1230,8 +1323,12 @@ func runQuery(args []string) error {
 		QueryLogStore:     queryLogStore,
 		EmbeddingProvider: embeddingProvider,
 		Context:           ctx,
+		Progress:          progress,
 		Runtime:           queryRuntimeOptions(runtimeConfig.Query),
 	})
+	if progressReporter != nil {
+		progressReporter.Stop()
+	}
 	if err != nil {
 		return err
 	}
@@ -1755,7 +1852,7 @@ Commands:
   source-layout status --project PATH
   run-queue --project PATH [--agent llm] [--max N] [--retry-failed] [--db-dsn DSN --project-id ID]
   maintain --project PATH [--agent llm] [--retry-failed] [--keep-done] [--review] [--sync-pg] [--db-dsn DSN --project-id ID]
-  query --project PATH --q QUERY [--limit N] [--agent llm|mock] [--save-title TITLE] [--db-dsn DSN --project-id ID]
+  query --project PATH --q QUERY [--limit N] [--agent llm|mock] [--progress=true|false] [--save-title TITLE] [--db-dsn DSN --project-id ID]
   sync-wiki-pg --project PATH --db-dsn DSN --project-id ID [--migrate-db] [--embed]
   lint --project PATH [--agent structural|llm]
   review-wiki --project PATH [--agent llm]
