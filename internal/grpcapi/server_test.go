@@ -11,6 +11,7 @@ import (
 	"github.com/hejw/knowledge-core/internal/core"
 	v1 "github.com/hejw/knowledge-core/internal/grpcapi/knowledge/v1"
 	"github.com/hejw/knowledge-core/internal/scope"
+	"github.com/hejw/knowledge-core/internal/service"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -127,6 +128,66 @@ func TestGRPCReadDocumentRoundTrip(t *testing.T) {
 	})
 	if status.Code(err) != codes.Unauthenticated {
 		t.Fatalf("expected unauthenticated call, got %v", err)
+	}
+	cancel()
+	select {
+	case <-serveDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("gRPC server did not stop")
+	}
+}
+
+func TestGRPCQueryRoundTripUsesBoundScope(t *testing.T) {
+	root := t.TempDir()
+	pagePath := filepath.Join(root, "wiki", "sources", "chapter-001.md")
+	if err := os.MkdirAll(filepath.Dir(pagePath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pagePath, []byte("---\ntype: source-summary\ntitle: Chapter One\n---\nThe first chapter establishes the project context."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resolver, err := scope.NewResolver(scope.Options{Provider: "qm", ScopeRoot: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := resolver.Register(context.Background(), core.ScopeBinding{
+		Provider: "qm", ExternalScopeID: "group:project:query", Kind: "project",
+		ProjectID: "query", ProjectName: "Query", RootPath: root, Status: "active",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	service, err := NewServer(ServerOptions{
+		Resolver: resolver, QueryAgent: service.MockQueryAgent{}, AuthToken: "secret", RequireAuth: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener := bufconn.Listen(1024 * 1024)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- service.Serve(ctx, listener) }()
+	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) { return listener.Dial() }), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	client := v1.NewKnowledgeCoreClient(conn)
+	callCtx := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer secret")
+	response, err := client.Query(callCtx, &v1.QueryRequest{
+		Scope:    &v1.ScopeRef{ExternalScopeId: "group:project:query", Kind: "project"},
+		Caller:   &v1.CallerContext{ScopeId: "group:project:query"},
+		Question: "What establishes the project context?",
+		Limit:    5,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.GetStatus() != "complete" || response.GetAnswer() == "" {
+		t.Fatalf("unexpected query response: %+v", response)
+	}
+	if len(response.GetCitations()) != 1 || response.GetCitations()[0].GetPath() != "wiki/sources/chapter-001.md" {
+		t.Fatalf("expected chapter citation, got %+v", response.GetCitations())
 	}
 	cancel()
 	select {
