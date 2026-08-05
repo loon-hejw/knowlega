@@ -296,6 +296,10 @@ func grpcError(err error) error {
 	if errors.Is(err, scope.ErrNotFound) || strings.Contains(err.Error(), scope.ErrNotFound.Error()) {
 		return status.Error(codes.NotFound, err.Error())
 	}
+	lowerMessage := strings.ToLower(err.Error())
+	if strings.Contains(lowerMessage, "not found") || strings.Contains(lowerMessage, "found no content") {
+		return status.Error(codes.NotFound, err.Error())
+	}
 	if errors.Is(err, scope.ErrInvalid) || errors.Is(err, scope.ErrNotConfigured) || strings.Contains(err.Error(), "must be under wiki/") || strings.Contains(err.Error(), "must be under raw/") {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}

@@ -67,6 +67,13 @@ func TestReadDocumentUsesResolvedScopeAndRejectsCrossScopeCaller(t *testing.T) {
 	if status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("expected invalid argument for path traversal, got %v", err)
 	}
+	_, err = server.ReadDocument(context.Background(), &v1.ReadDocumentRequest{
+		Scope: &v1.ScopeRef{ExternalScopeId: "group:project:one", Kind: "project"},
+		Path:  "wiki/concepts/missing.md",
+	})
+	if status.Code(err) != codes.NotFound {
+		t.Fatalf("expected not found for missing document, got %v", err)
+	}
 }
 
 func TestGRPCReadDocumentRoundTrip(t *testing.T) {
