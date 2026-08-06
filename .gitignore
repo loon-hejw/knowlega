@@ -2,6 +2,7 @@
 .env.local
 .env.*.local
 config.yaml
+config.local/
 
 # Go
 *.test
