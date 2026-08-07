@@ -9,12 +9,6 @@ config.local/
 __debug_bin*
 coverage.out
 
-# Frontend
-web/node_modules/
-web/dist/
-web/.vite/
-web/node_modules/.tmp/
-
 # Local knowledge-base artifacts
 .kbcore/
 raw/

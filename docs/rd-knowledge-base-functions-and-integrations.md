@@ -472,7 +472,6 @@ flowchart LR
 
 | 接口 | 适用调用方 | 主要输入 | 主要输出 | 模式 | 当前状态 |
 | --- | --- | --- | --- | --- | --- |
-| Web UI | 研发、架构、测试、运维、管理员 | 问题、文件、操作选项 | 答案、引用、页面、图谱、任务 | 交互式 | 已具备 |
 | REST API | 研发门户、业务系统、自动化平台 | JSON、查询参数、文件上传 | JSON、任务 ID、SSE 事件 | 同步 + 异步 | 已具备 |
 | Git Webhook | GitHub、GitLab、Gitea | 仓库事件、分支、commit | 代码索引任务 | 事件驱动 | 已具备 |
 | MCP stdio | Codex、Claude Code、Cursor 等 Agent | 工具调用参数 | 文件、搜索、图谱、审阅结果 | 对话式工具调用 | 已具备 |
@@ -676,7 +675,7 @@ CI/CD 可以组合这些命令实现：代码合并后的图谱刷新、Wiki 结
 ## 12. 假设与约束
 
 - 本文以研发知识管理为目标，不将 Knowledge Core 描述为通用文档网盘；
-- 当前系统的核心语言为 Go，Web 前端为 React/TypeScript，PostgreSQL 与 pgvector 可选；
+- 当前系统的核心语言为 Go，用户界面由 QM Web UI 提供，PostgreSQL 与 pgvector 可选；
 - 运行配置来自项目根目录 `config.yaml`，真实密钥不得提交到 Git；
 - 原始来源不可被知识编译过程修改；
 - Markdown Wiki 和来源 manifest 是持久事实，PostgreSQL 是可重建派生状态；

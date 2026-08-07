@@ -81,25 +81,6 @@ signature/token, accepts only allowlisted repositories and configured branches,
 and enqueues a restart-safe graph job. Optional semantic enrichment runs after
 exact indexing and cannot replace exact facts.
 
-## Web UI
-
-`web/` is a Vite + React + TypeScript + Ant Design API client. It does not
-duplicate compilation, query, review, or persistence logic.
-
-```bash
-# terminal 1
-go run ./cmd/kbcore --config config.yaml serve
-
-# terminal 2
-cd web
-npm install
-npm run dev
-```
-
-The checked-in VS Code compound task `Full Stack: LLM + Web` starts the backend
-and Vite on `127.0.0.1:5177`. The UI selects the configured active project and
-shows bootstrap progress while the backend becomes ready.
-
 ## MCP
 
 Agent clients can use the same service logic through stdio MCP:
@@ -110,4 +91,3 @@ go run ./cmd/kbcore --config config.yaml mcp --project /tmp/demo-kb
 
 MCP is another transport over the core workflows; it must not introduce a
 separate persistence model.
-

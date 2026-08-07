@@ -30,7 +30,7 @@ answer or write a synthesis back to the wiki.
   provider setup, paths, security, and precedence.
 - [CLI reference](docs/cli.md): command groups and common workflows.
 - [Service API](docs/service-api.md): server lifecycle, authentication, route
-  groups, Web UI, and MCP.
+  groups, and MCP.
 - [Development and validation](docs/development.md): builds, tests, acceptance
   scripts, and repository conventions.
 - [Agent instructions](AGENTS.md): mandatory implementation direction and
@@ -74,17 +74,9 @@ readiness and progress:
 go run ./cmd/kbcore --config config.yaml serve
 ```
 
-In another terminal:
-
-```bash
-cd web
-npm install
-npm run dev
-```
-
-The Vite app uses the backend API and opens the configured active project. For
-PostgreSQL/pgvector setup, authentication, workers, graph webhooks, and
-production behavior, see [Service API](docs/service-api.md) and
+The service is consumed through its HTTP API, CLI, MCP transport, or the QM Web
+UI integration. For PostgreSQL/pgvector setup, authentication, workers, graph
+webhooks, and production behavior, see [Service API](docs/service-api.md) and
 [Configuration](docs/configuration.md).
 
 ## Core Artifact Layout
@@ -126,10 +118,6 @@ graph state. PostgreSQL can be rebuilt from those artifacts.
 
 ```bash
 env GOCACHE=/private/tmp/kbcore-gocache go test ./...
-
-cd web
-npm test -- --run
-npm run build
 ```
 
 Use `scripts/verify-xiyouji.sh` for the deterministic 100-source accumulation

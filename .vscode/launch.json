@@ -15,21 +15,39 @@
       "cwd": "${workspaceFolder}"
     },
     {
-      "name": "Frontend: Vite Web",
+      "name": "Tests: Knowledge Core (Go)",
       "type": "node-terminal",
       "request": "launch",
-      "command": "npm run dev -- --host 127.0.0.1",
-      "cwd": "${workspaceFolder}/web"
+      "command": "env GOCACHE=/private/tmp/kbcore-gocache go test ./...",
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Tests: Go package (debug current)",
+      "type": "go",
+      "request": "launch",
+      "mode": "test",
+      "program": "${fileDirname}",
+      "args": [
+        "-test.v"
+      ],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "name": "Tests: QM Web UI",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npm test",
+      "cwd": "${workspaceFolder}/qm/plugins/web-ui"
     }
   ],
   "compounds": [
     {
-      "name": "Full Stack: LLM + Web",
+      "name": "Tests: Knowledge Core + QM Web UI",
       "configurations": [
-        "Backend: kbcore serve (LLM)",
-        "Frontend: Vite Web"
+        "Tests: Knowledge Core (Go)",
+        "Tests: QM Web UI"
       ],
-      "stopAll": true
+      "stopAll": false
     }
   ]
 }

@@ -5,8 +5,9 @@
 - Primary language: Go.
 - PostgreSQL is derived state; Markdown/raw artifacts remain authoritative.
 - Keep HTTP handlers thin and reuse compiler/service/wiki functions.
-- Keep the Web UI as an API client; do not move knowledge semantics into the
-  browser.
+- Keep client integrations as API clients; do not move knowledge semantics into
+  a browser. The standalone Knowledge Core Web UI has been removed; QM owns the
+  user-facing Web UI.
 - Use versioned wiki writes and safe project-relative generated paths.
 - Prefer standard library and conservative dependencies.
 
@@ -24,19 +25,6 @@ env GOCACHE=/private/tmp/kbcore-gocache go test ./...
 Tests should prove behavior through real temporary project directories where
 practical. Production embedding behavior must use an injected provider; fake
 vectors belong only in tests.
-
-## Web Checks
-
-```bash
-cd web
-npm install
-npm test -- --run
-npm run build
-```
-
-The current build may report Vite chunk-size warnings; treat test or type/build
-failures as blocking, and evaluate chunk splitting separately as a frontend
-performance task.
 
 ## Deterministic Accumulation Validation
 
