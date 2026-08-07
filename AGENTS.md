@@ -58,27 +58,25 @@ Follow the Karpathy LLM Wiki pattern:
   navigation/synthesis entrypoint before drilling into individual pages.
 - Generated pages must use YAML frontmatter and body `[[wikilink]]` references.
 
-The validation command, `kbcore validate-llmwiki`, supports both an offline mock
-and an OpenAI-compatible LLM provider. Treat the mock as a scaffold only; real
-ingest should use an LLM provider whenever credentials are available:
+The internal Knowlega Agent exposes the same validation workflow through Go
+service functions and tests; there is no standalone `kbcore` command. Treat the
+mock as a scaffold only; real ingest should use an LLM provider whenever
+credentials are available:
 
 1. Analysis: source + purpose + schema + index + overview.
 2. Generation: strict `---FILE:` and `---REVIEW:` blocks.
 3. Validation: frontmatter, paths, source provenance, wikilinks.
 4. Merge: update existing pages without destroying prior evidence.
 
-Local runtime settings are read only from the repository-root `config.yaml`, or
-from the path passed with global `--config`. CLI flags override YAML values,
-which override program defaults. Do not read runtime settings from environment
-variables or legacy env files, and do not commit `config.yaml` or real API keys.
+Local runtime settings are read from the QM YAML path passed to
+`cmd/qm-backend --config`; do not commit local config files or real API keys.
 
-For small end-to-end LLM acceptance, use `scripts/verify-llmwiki-llm.sh`. It
-creates three fixed source files, runs `validate-llmwiki --agent llm`, checks
-generated pages, links, `wiki/overview.md`, `wiki/reviews.md`, deterministic
-`lint` returning `ok`, `review-wiki --agent llm`, and `lint --agent llm`. It
-must also require one `wiki/sources/` source-summary page per fixed source. It
-must receive a YAML config with real LLM credentials and fail clearly when that
-configuration is missing.
+For small end-to-end LLM acceptance, exercise `internal/agent/knowlega.Agent`
+from Go tests or through the QM HTTP API with a YAML config containing real LLM
+credentials. It must create generated pages, links, `wiki/overview.md`,
+`wiki/reviews.md`, deterministic lint results, and semantic review when
+configured. It must also require one `wiki/sources/` source-summary page per
+source and fail clearly when the LLM configuration is missing.
 Because the fixture contains a deliberately stale compost-blend claim, both LLM
 review commands must report at least one semantic issue type. Successful runs
 write `VERIFY_REPORT.md` inside the temporary wiki project with source,
@@ -309,13 +307,8 @@ tst/xiyouji-chapters/chapter-100.txt
 Use this corpus to test multi-source wiki accumulation:
 
 ```bash
-env GOCACHE=/private/tmp/kbcore-gocache go run ./cmd/kbcore --config config.yaml init \
-  --path /private/tmp/kbcore-xiyouji-wiki --name xiyouji
-
-env GOCACHE=/private/tmp/kbcore-gocache go run ./cmd/kbcore --config config.yaml validate-llmwiki \
-  --project /private/tmp/kbcore-xiyouji-wiki \
-  --source tst/xiyouji-chapters \
-  --agent mock
+env GOCACHE=/private/tmp/knowlega-gocache \
+  go test ./internal/agent/knowlega/compiler ./internal/agent/knowlega/service ./internal/agent/knowlega
 ```
 
 Expected validation shape:

@@ -13,3 +13,9 @@ coverage.out
 .kbcore/
 raw/
 wiki/
+
+# Local sibling workspaces and fixtures; QM frontend/OpenAgent are not part of
+# the Go backend repository.
+qm/
+openagent/
+kbcore-xiyouji-wiki-v1/

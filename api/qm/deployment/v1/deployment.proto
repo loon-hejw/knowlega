@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package qm.deployment.v1;
+
+option go_package = "github.com/loon-hejw/knowlega/api/qm/deployment/v1;deploymentv1";
+
+service DeploymentLayerService {
+  rpc Get(GetRequest) returns (GetReply);
+  rpc PutIfAbsent(PutIfAbsentRequest) returns (PutIfAbsentReply);
+  rpc CompareAndSet(CompareAndSetRequest) returns (CompareAndSetReply);
+}
+
+message GetRequest {}
+message GetReply { bool found = 1; bytes payload = 2; }
+
+message PutIfAbsentRequest { bytes payload = 1; }
+message PutIfAbsentReply { bytes payload = 1; }
+
+message CompareAndSetRequest {
+  bytes expected_payload = 1;
+  bytes payload = 2;
+}
+message CompareAndSetReply {
+  bool found = 1;
+  bool updated = 2;
+  bytes payload = 3;
+}

@@ -109,25 +109,12 @@ remains authoritative.
 Non-loopback access requires a configured token. Keep the default loopback
 binding unless the service is intentionally protected and exposed.
 
-#### `server.grpc`
+#### Knowledge Agent
 
-The experimental QM integration is disabled by default. When enabled, it
-starts a separate gRPC listener in the same `serve` process:
-
-- `enabled`: enable the `knowledge.v1.KnowledgeCore` facade.
-- `addr`: gRPC listen address, default `127.0.0.1:19830`.
-- `auth_token`: service token accepted in gRPC metadata.
-- `require_auth`: reject calls without the token, including loopback calls.
-- `scope_root`: server-owned parent directory for newly provisioned QM
-  project scopes.
-- `tls_cert_file`, `tls_key_file`: optional server certificate and private key.
-- `tls_client_ca_file`: optional CA bundle; when set, client certificates are
-  required and verified (mTLS).
-
-The initial facade is read-only (`EnsureScope`, `GetStatus`, `Query`, `Search`,
-and `ReadDocument`). It never accepts arbitrary filesystem paths. With a
-PostgreSQL database, run `serve --migrate-db` once after enabling the facade so
-the `scope_bindings` table is created.
+Knowlega has no public Knowledge gRPC configuration. QM creates the internal
+Agent at backend startup and derives each personal/project scope under
+`knowledge.root_dir`. The Agent owns Markdown raw/wiki artifacts, the durable
+ingest queue, page versions, lint/review, and derived PostgreSQL sync.
 
 ### `query`
 
@@ -178,13 +165,10 @@ in remote URLs, logs, snapshots, or API responses.
 ```bash
 docker compose -f docker-compose.local.yml up -d
 
-env GOCACHE=/private/tmp/kbcore-gocache \
-  go run ./cmd/kbcore migrate-sql | \
-  docker exec -i kbcore-postgres-local psql -U kbcore -d kbcore
+env GOCACHE=/private/tmp/knowlega-gocache \
+  go run ./cmd/qm-backend --config qm-backend/configs/config.yaml
 ```
 
-Set `database.dsn` and `database.project_id` in `config.yaml`, then start with:
-
-```bash
-go run ./cmd/kbcore --config config.yaml serve --migrate-db
-```
+Set `database.url` and the QM/Knowledge LLM settings in
+`qm-backend/configs/config.yaml`. `cmd/qm-backend` applies both QM migrations
+and the isolated `knowledge_core` PostgreSQL schema at startup.

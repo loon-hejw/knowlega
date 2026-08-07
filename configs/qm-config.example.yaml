@@ -1,0 +1,31 @@
+server:
+  http_addr: ":8080"
+  grpc_addr: "127.0.0.1:9090"
+
+database:
+  url: "postgres://postgres:postgres@127.0.0.1:5432/qm?sslmode=disable"
+
+qm:
+  org_id: "local"
+  node_core_url: "http://127.0.0.1:8081"
+  route_mode: "go"
+
+knowledge:
+  root_dir: "data/knowledge"
+  worker: true
+  scan_interval_seconds: 30
+  llm:
+    base_url: "https://api.openai.com/v1"
+    api_key: "replace-with-your-key"
+    model: "replace-with-your-model"
+    timeout_seconds: 180
+
+runner:
+  lease_ttl_seconds: 30
+  max_claims: 8
+
+auth:
+  source_signing_secret: "development-only-source-secret"
+  capability_secret: "development-only-capability-secret"
+  grpc_internal_token: "development-only-internal-token"
+  replay_window_seconds: 300

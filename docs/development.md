@@ -26,13 +26,14 @@ Tests should prove behavior through real temporary project directories where
 practical. Production embedding behavior must use an injected provider; fake
 vectors belong only in tests.
 
-## Deterministic Accumulation Validation
+## Deterministic Agent Validation
 
 `tst/xiyouji.txt` is split into 100 chapter files under
-`tst/xiyouji-chapters/`. Run:
+`tst/xiyouji-chapters/`. Run the package tests:
 
 ```bash
-bash scripts/verify-xiyouji.sh
+env GOCACHE=/private/tmp/knowlega-gocache \
+  go test ./internal/agent/knowlega/compiler ./internal/agent/knowlega/service ./internal/agent/knowlega
 ```
 
 The deterministic scaffold validates the accumulation shape:
@@ -49,53 +50,17 @@ semantic LLM reasoning and cannot write syntheses.
 
 ## Real-LLM Acceptance
 
-Run the small credentialed acceptance with:
+Copy `configs/qm-config.example.yaml` to the ignored
+`qm-backend/configs/config.yaml`, add credentials, and run the QM backend; then
+exercise file/memory/conversation writes through the QM HTTP API. The resulting
+raw artifacts and `.kbcore/ingest-queue.json` are the durable handoff to the
+Agent; maintenance consumes the queue and runs semantic review when configured.
 
-```bash
-bash scripts/verify-llmwiki-llm.sh config.yaml
-```
-
-The script creates three fixed sources and verifies:
-
-- analysis/generation and one source-summary page per source;
-- source provenance and wikilinks;
-- `wiki/overview.md` and `wiki/reviews.md` maintenance;
-- deterministic `lint` returning `ok`;
-- semantic findings from both `review-wiki --agent llm` and
-  `lint --agent llm` for the deliberately stale fixture claim.
-
-On success it writes `VERIFY_REPORT.md` inside the temporary wiki project with
-source, generated-page, link, lint, and review evidence. Missing YAML or real
-credentials is a hard failure; the script must not silently fall back to mock.
-
-For the real 100-chapter constraint-query acceptance, reuse a completed
-Xiyouji wiki and run:
-
-```bash
-bash scripts/verify-xiyouji-query-llm.sh config.yaml /private/tmp/kbcore-xiyouji-wiki
-```
-
-This check requires 唐太宗 as the canonical candidate, supported evidence for
-requirements 1–8, and a corpus-scoped `not_found_in_corpus` result for the
-ninth negative requirement.
-
-## Manual Corpus Flow
-
-```bash
-env GOCACHE=/private/tmp/kbcore-gocache \
-  go run ./cmd/kbcore --config config.yaml init \
-  --path /private/tmp/kbcore-xiyouji-wiki --name xiyouji
-
-env GOCACHE=/private/tmp/kbcore-gocache \
-  go run ./cmd/kbcore --config config.yaml validate-llmwiki \
-  --project /private/tmp/kbcore-xiyouji-wiki \
-  --source tst/xiyouji-chapters --agent llm --skip-unchanged
-
-env GOCACHE=/private/tmp/kbcore-gocache \
-  go run ./cmd/kbcore --config config.yaml lint \
-  --project /private/tmp/kbcore-xiyouji-wiki
-```
+The package tests cover the deterministic compiler/query loop. A credentialed
+deployment must additionally verify source summaries, provenance, wikilinks,
+`wiki/overview.md`, `wiki/reviews.md`, structural lint, semantic review, and
+version archives.
 
 Use the real provider for product acceptance. Use deterministic agents only
 when a test explicitly targets orchestration, parsing, validation, or storage
-plumbing.
+plumbing. Keep the QM backend as the only runnable product entrypoint.

@@ -2,25 +2,24 @@
 
 ## Lifecycle and Readiness
 
-Start the service with:
+Start the QM backend with:
 
 ```bash
-go run ./cmd/kbcore --config config.yaml serve
+go run ./cmd/qm-backend --config qm-backend/configs/config.yaml
 ```
 
-The server listens before a configured corpus bootstrap completes. `GET
-/health` reports readiness and `GET /workspace/status` exposes per-source
-analysis, generation, persistence, synchronization, retry, and completion
-progress. Project APIs can return HTTP 503 until the active project is ready.
+`GET /healthz` and `GET /readyz` expose backend readiness. Knowlega workspace
+status, queue progress, lint, review, and maintenance are internal Agent state;
+QM handlers invoke them after successful product writes.
 
 Bootstrap checkpoints each completed source in
 `.kbcore/source-manifest.json`. Restarting resumes from durable state and skips
 unchanged sources. `wait-ready` is available for scripts that must block until
 the complete workspace is ready.
 
-The ingest worker is opt-in through `server.worker` or `serve --worker`; merely
-starting the service does not otherwise scan sources and spend LLM tokens. The
-managed graph worker is independently controlled by `graph.worker`.
+The backend does not expose a standalone Knowledge listener. Queue consumption
+is an explicit QM/Agent maintenance operation so starting the server does not
+unexpectedly spend LLM tokens.
 
 ## Authentication
 
@@ -81,13 +80,8 @@ signature/token, accepts only allowlisted repositories and configured branches,
 and enqueues a restart-safe graph job. Optional semantic enrichment runs after
 exact indexing and cannot replace exact facts.
 
-## MCP
+## Knowledge Agent boundary
 
-Agent clients can use the same service logic through stdio MCP:
-
-```bash
-go run ./cmd/kbcore --config config.yaml mcp --project /tmp/demo-kb
-```
-
-MCP is another transport over the core workflows; it must not introduce a
-separate persistence model.
+Knowlega is an internal Go interface, not a public RPC. Use the QM HTTP API and
+control/runner gRPC for application integration. This keeps query, ingest,
+writeback, version archives, queue state, and cleanup on one implementation.

@@ -2,23 +2,22 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Backend: kbcore serve (LLM)",
+      "name": "Backend: QM + Knowlega Agent",
       "type": "go",
       "request": "launch",
       "mode": "debug",
-      "program": "${workspaceFolder}/cmd/kbcore",
+      "program": "${workspaceFolder}/cmd/qm-backend",
       "args": [
         "--config",
-        "${workspaceFolder}/config.yaml",
-        "serve"
+        "${workspaceFolder}/qm-backend/configs/config.yaml"
       ],
       "cwd": "${workspaceFolder}"
-    },
+    }
     {
-      "name": "Tests: Knowledge Core (Go)",
+      "name": "Tests: QM + Knowlega (Go)",
       "type": "node-terminal",
       "request": "launch",
-      "command": "env GOCACHE=/private/tmp/kbcore-gocache go test ./...",
+      "command": "env GOCACHE=/private/tmp/knowlega-gocache go test ./...",
       "cwd": "${workspaceFolder}"
     },
     {
@@ -32,22 +31,6 @@
       ],
       "cwd": "${workspaceFolder}"
     },
-    {
-      "name": "Tests: QM Web UI",
-      "type": "node-terminal",
-      "request": "launch",
-      "command": "npm test",
-      "cwd": "${workspaceFolder}/qm/plugins/web-ui"
-    }
   ],
-  "compounds": [
-    {
-      "name": "Tests: Knowledge Core + QM Web UI",
-      "configurations": [
-        "Tests: Knowledge Core (Go)",
-        "Tests: QM Web UI"
-      ],
-      "stopAll": false
-    }
-  ]
+  "compounds": []
 }

@@ -2,8 +2,8 @@
 set -euo pipefail
 
 runtime="${CONTAINER_RUNTIME:-docker}"
-name="kbcore-postgres-test-$$"
-password="kbcore-test"
+name="knowlega-postgres-test-$$"
+password="knowlega-test"
 
 cleanup() {
   "$runtime" rm -f "$name" >/dev/null 2>&1 || true
@@ -13,12 +13,12 @@ trap cleanup EXIT
 "$runtime" run --rm -d \
   --name "$name" \
   -e POSTGRES_PASSWORD="$password" \
-  -e POSTGRES_DB=kbcore_test \
+  -e POSTGRES_DB=knowlega_test \
   -p 127.0.0.1::5432 \
   pgvector/pgvector:pg16 >/dev/null
 
 for _ in $(seq 1 60); do
-  if "$runtime" exec "$name" pg_isready -U postgres -d kbcore_test >/dev/null 2>&1; then
+  if "$runtime" exec "$name" pg_isready -U postgres -d knowlega_test >/dev/null 2>&1; then
     break
   fi
   sleep 1
@@ -30,6 +30,7 @@ if [[ -z "$port" ]]; then
   exit 1
 fi
 
-KBCORE_TEST_POSTGRES_DSN="postgres://postgres:${password}@127.0.0.1:${port}/kbcore_test?sslmode=disable" \
-  env GOCACHE="${GOCACHE:-/private/tmp/kbcore-gocache}" \
-  go test -tags=integration ./internal/postgres -count=1
+KBCORE_TEST_POSTGRES_DSN="postgres://postgres:${password}@127.0.0.1:${port}/knowlega_test?sslmode=disable" \
+QM_BACKEND_TEST_DATABASE_URL="postgres://postgres:${password}@127.0.0.1:${port}/knowlega_test?sslmode=disable" \
+  env GOCACHE="${GOCACHE:-/private/tmp/knowlega-gocache}" \
+  go test -tags=integration ./internal/agent/knowlega/postgres ./internal/qm/data -count=1

@@ -1,10 +1,10 @@
-# Knowledge Core
+# Knowlega — QM Knowledge Agent
 
-Knowledge Core is a Go/PostgreSQL/Markdown implementation of a persistent,
-LLM-maintained knowledge base. It compiles immutable source material into an
-evolving Markdown wiki, uses PostgreSQL as rebuildable index and graph state,
-and keeps the resulting knowledge readable by humans, agents, Git, and
-Obsidian.
+Knowlega is the Go backend of QM. The LLM Wiki is no longer a standalone
+service: it is an internal Agent that turns QM personal memory, project files,
+and valuable completed conversations into a durable, evidence-grounded wiki.
+QM remains the product boundary and user-facing UI; Markdown is the knowledge
+source of truth and PostgreSQL is its derived search/graph/operational index.
 
 The design draws from three reference systems:
 
@@ -22,15 +22,11 @@ answer or write a synthesis back to the wiki.
 - [Architecture](docs/architecture.md): source-of-truth rules, ingest, query,
   graph, and PostgreSQL boundaries.
 - [QM integration direction](docs/adr/0001-qm-platform-knowledge-core-plugin.md):
-  QM as the collaboration platform and Knowledge Core as the project/personal
-  knowledge plugin.
-- [QM integration contract](docs/qm-integration.md): experimental gRPC
-  boundary, scope mapping, and the first read-only tool surface.
+  QM as the product host and Knowlega as its internal Agent.
 - [Configuration](docs/configuration.md): every `config.yaml` section,
   provider setup, paths, security, and precedence.
-- [CLI reference](docs/cli.md): command groups and common workflows.
-- [Service API](docs/service-api.md): server lifecycle, authentication, route
-  groups, and MCP.
+- [Service API](docs/service-api.md): QM backend lifecycle, authentication, and
+  route groups.
 - [Development and validation](docs/development.md): builds, tests, acceptance
   scripts, and repository conventions.
 - [Agent instructions](AGENTS.md): mandatory implementation direction and
@@ -38,46 +34,33 @@ answer or write a synthesis back to the wiki.
 
 ## Quick Start
 
-Prerequisites: Go 1.22+, and an OpenAI-compatible or Anthropic-compatible LLM
-for real ingest/query work. PostgreSQL with pgvector is optional.
+Prerequisites: Go 1.25+, PostgreSQL with pgvector, and an OpenAI-compatible or
+Anthropic-compatible LLM for semantic ingest/query work. The Agent falls back
+to deterministic mock behavior for local plumbing tests only.
 
 ```bash
-cp config.example.yaml config.yaml
-$EDITOR config.yaml
+cp configs/qm-config.example.yaml qm-backend/configs/config.yaml
+$EDITOR qm-backend/configs/config.yaml
 
-env GOCACHE=/private/tmp/kbcore-gocache \
-  go run ./cmd/kbcore --config config.yaml init \
-  --path /private/tmp/kbcore-demo --name demo
-
-env GOCACHE=/private/tmp/kbcore-gocache \
-  go run ./cmd/kbcore --config config.yaml validate-llmwiki \
-  --project /private/tmp/kbcore-demo \
-  --source ./README.md --agent llm
-
-env GOCACHE=/private/tmp/kbcore-gocache \
-  go run ./cmd/kbcore --config config.yaml query \
-  --project /private/tmp/kbcore-demo \
-  --q "What does this project build?" --agent llm
+env GOCACHE=/private/tmp/knowlega-gocache \
+  go run ./cmd/qm-backend --config qm-backend/configs/config.yaml
 ```
 
-Runtime settings come only from repository-root `config.yaml`, or the path
-passed with global `--config`. CLI flags override YAML; YAML overrides program
-defaults. The runtime intentionally ignores legacy environment configuration.
-Do not commit `config.yaml` or real credentials.
+Runtime settings come from the QM YAML file passed to `cmd/qm-backend`; local
+configs and credentials remain ignored and must not be committed.
 
 ## Run the Local Application
 
-The backend can initialize/bootstrap its configured project while serving
-readiness and progress:
+The backend owns HTTP and QM gRPC control/runner services. Knowlega has no
+public Knowledge gRPC service or standalone server; it is invoked internally
+after QM writes succeed:
 
 ```bash
-go run ./cmd/kbcore --config config.yaml serve
+go run ./cmd/qm-backend --config qm-backend/configs/config.yaml
 ```
 
-The service is consumed through its HTTP API, CLI, MCP transport, or the QM Web
-UI integration. For PostgreSQL/pgvector setup, authentication, workers, graph
-webhooks, and production behavior, see [Service API](docs/service-api.md) and
-[Configuration](docs/configuration.md).
+The service is consumed through QM's HTTP API and control/runner gRPC. There is
+no separate Knowledge panel or browser-side persistence implementation.
 
 ## Core Artifact Layout
 
@@ -117,10 +100,10 @@ graph state. PostgreSQL can be rebuilt from those artifacts.
 ## Build and Test
 
 ```bash
-env GOCACHE=/private/tmp/kbcore-gocache go test ./...
+env GOCACHE=/private/tmp/knowlega-gocache go test ./...
 ```
 
-Use `scripts/verify-xiyouji.sh` for the deterministic 100-source accumulation
-test. Use `scripts/verify-llmwiki-llm.sh config.yaml` for the small real-LLM
-acceptance path. See [Development and validation](docs/development.md) for the
-expected evidence and test scope.
+The internal Agent acceptance coverage lives in
+`internal/agent/knowlega/agent_test.go` and the package-level LLM Wiki tests.
+See [Development and validation](docs/development.md) for the expected
+evidence and test scope.
