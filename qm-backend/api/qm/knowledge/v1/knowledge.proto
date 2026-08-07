@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package qm.knowledge.v1;
+
+option go_package = "github.com/hejw/qm-backend/api/qm/knowledge/v1;knowledgev1";
+
+service KnowledgeService {
+  rpc GetStatus(GetStatusRequest) returns (StatusReply);
+  rpc Query(QueryRequest) returns (QueryReply);
+  rpc Search(SearchRequest) returns (SearchReply);
+  rpc ReadDocument(ReadDocumentRequest) returns (DocumentReply);
+}
+
+message ScopeContext { string scope_id = 1; string actor_id = 2; string request_id = 3; }
+message GetStatusRequest { ScopeContext context = 1; }
+message StatusReply { string status = 1; int64 source_count = 2; int64 wiki_page_count = 3; }
+message QueryRequest { ScopeContext context = 1; string question = 2; }
+message QueryReply { string answer = 1; repeated Citation citations = 2; }
+message SearchRequest { ScopeContext context = 1; string query = 2; int32 limit = 3; }
+message SearchReply { repeated SearchResult results = 1; }
+message ReadDocumentRequest { ScopeContext context = 1; string path = 2; }
+message DocumentReply { string path = 1; string title = 2; string content = 3; }
+message Citation { string path = 1; string title = 2; string kind = 3; }
+message SearchResult { string path = 1; string title = 2; string snippet = 3; int32 score = 4; string kind = 5; }
