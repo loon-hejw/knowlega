@@ -19,6 +19,10 @@ type File struct {
 }
 
 type Entry struct {
+	QMFileID                 string          `json:"qm_file_id,omitempty"`
+	QMProjectID              string          `json:"qm_project_id,omitempty"`
+	QMScopeID                string          `json:"qm_scope_id,omitempty"`
+	QMSourceSHA256           string          `json:"qm_source_sha256,omitempty"`
 	OriginalPath             string          `json:"original_path"`
 	PipelineVersion          int             `json:"pipeline_version,omitempty"`
 	SHA256                   string          `json:"sha256"`

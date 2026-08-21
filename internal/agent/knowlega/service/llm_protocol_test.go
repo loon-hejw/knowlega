@@ -15,16 +15,16 @@ func TestLLMAgentConstructorsPropagateAnthropicProtocol(t *testing.T) {
 	cfg.UserAgent = "claude-cli/2.1.205 (external, cli)"
 	cfg.AnthropicVersion = "2024-01-01"
 
-	query, err := NewQueryAgent(cfg)
+	maintenance, err := NewMaintenanceSynthesisAgent(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
-	queryAgent, ok := query.(OpenAICompatibleQueryAgent)
+	maintenanceAgent, ok := maintenance.(OpenAICompatibleMaintenanceSynthesisAgent)
 	if !ok {
-		t.Fatalf("query agent type=%T", query)
+		t.Fatalf("maintenance agent type=%T", maintenance)
 	}
-	if queryAgent.Protocol != "anthropic" || queryAgent.AnthropicVersion != "2024-01-01" || queryAgent.UserAgent != cfg.UserAgent || !queryAgent.DisableThinking {
-		t.Fatalf("query protocol config=%+v", queryAgent)
+	if maintenanceAgent.options.Protocol != "anthropic" || maintenanceAgent.options.AnthropicVersion != "2024-01-01" || maintenanceAgent.options.UserAgent != cfg.UserAgent || !maintenanceAgent.options.DisableThinking {
+		t.Fatalf("maintenance protocol config=%+v", maintenanceAgent)
 	}
 
 	review, err := NewWikiReviewAgent(cfg)

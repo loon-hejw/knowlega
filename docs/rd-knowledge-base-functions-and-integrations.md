@@ -490,12 +490,10 @@ flowchart LR
 | --- | --- | --- | --- |
 | 健康与工作区 | `GET /health`、`GET /workspace/status` | 判断服务和知识空间是否就绪 | 服务状态、初始化进度、队列、审阅和配置状态 |
 | 维护任务 | `POST /workspace/maintain`、`GET /workspace/jobs/{id}` | 执行扫描、队列、检查、审阅和同步闭环 | 任务 ID、步骤状态、摘要和错误 |
-| 文件与搜索 | `GET /projects/files`、`GET/PUT /projects/files/content`、`POST /projects/search` | 浏览和维护项目文件，执行基础召回 | 文件列表、内容、搜索候选 |
-| 来源管理 | `GET /projects/sources`、`POST /projects/sources/upload`、`POST /projects/sources/rescan`、`POST /projects/sources/delete` | 上传、扫描、查看和安全删除来源 | 来源 manifest、上传/入队结果、删除影响预览 |
-| 摄取队列 | `POST /sources/queue`、`POST /sources/scan`、`GET /queue/tasks`、`POST /queue/run` | 接入外部资料并异步编译 | 队列任务、状态、重试和生成文件 |
-| Wiki 编译治理 | `POST /wiki/validate`、`POST /wiki/review`、`POST /wiki/sync-pg` | 编译来源、语义审阅和同步派生索引 | 写入页面、审阅问题、同步结果 |
-| 查询与对话 | `POST /query`、`POST /chats/{id}/runs`、`GET /chats/{id}/runs/{run_id}/events` | 证据化问答、多轮会话和进度流 | 查询计划、答案、证据、引用、轨迹和写回路径 |
-| 查询控制 | `POST /chats/{id}/runs/{run_id}/cancel` | 取消长时间运行的查询 | 最终运行状态 |
+| QM 文件管理 | `POST /v1/files/upload`、`POST /v1/projects/{project_id}/files`、`POST /v1/projects/{project_id}/files/{file_id}/retry`、`DELETE /v1/projects/{project_id}/files/{file_id}` | 由 QM 统一管理文件实体、项目关联、权限和删除生命周期 | 文件、项目关联、Knowledge 处理状态和生成页数量 |
+| 项目搜索 | `POST /projects/search` | 对已由 QM 接入并编译的项目知识执行基础召回 | 搜索候选 |
+| Wiki 编译治理 | 内部 Knowledge Agent 维护流程、`POST /wiki/review`、`POST /wiki/sync-pg` | 异步编译 QM 项目文件、语义审阅和同步派生索引 | 写入页面、审阅问题、同步结果 |
+| 项目问答 | QM 常规会话 Turn + 内部单一 `knowledge` 工具 | 外层 Pi 自主导航、读取证据、提交核验，按用户要求显式写回 | 回答、当前轮证据引用、条件核验结果和可选合成页 |
 | 审阅治理 | `GET /reviews`、`POST /reviews/resolve`、`POST /reviews/resolve-bulk`、`POST /reviews/action`、`POST /reviews/sweep` | 处理人工判断与知识维护事项 | 审阅状态、生成页面、研究任务和清理结果 |
 | 深度研究 | `POST /research/jobs`、`GET /research/jobs/{id}` | 对知识缺口发起外部研究 | 研究任务状态和产物路径 |
 | 统一图谱 | `GET /projects/graph`、`POST /projects/graph/query`、`GET /projects/graph/node`、`GET /projects/graph/insights` | 浏览和查询 Wiki、来源、代码关系 | 节点、边、邻居、社区和洞察 |
@@ -676,7 +674,7 @@ CI/CD 可以组合这些命令实现：代码合并后的图谱刷新、Wiki 结
 
 - 本文以研发知识管理为目标，不将 Knowledge Core 描述为通用文档网盘；
 - 当前系统的核心语言为 Go，用户界面由 QM Web UI 提供，PostgreSQL 与 pgvector 可选；
-- 运行配置来自项目根目录 `config.yaml`，真实密钥不得提交到 Git；
+- 运行配置来自传给 `cmd/qm-backend --config` 的 QM YAML（本地默认路径为忽略提交的 `configs/qm-config.yaml`），真实密钥不得提交到 Git；
 - 原始来源不可被知识编译过程修改；
 - Markdown Wiki 和来源 manifest 是持久事实，PostgreSQL 是可重建派生状态；
 - LLM 负责规划、综合和语义审阅，但不能取代来源证据和精确代码事实；

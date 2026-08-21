@@ -26,8 +26,7 @@ type Server struct {
 	graphStore         service.GraphEvidenceStore
 	codeGraphStore     service.CodeGraphStore
 	wikiPageStore      service.WikiPageStore
-	queryLogStore      service.QueryLogStore
-	queryAgent         service.QueryAgent
+	maintenanceAgent   service.MaintenanceSynthesisAgent
 	ingestLLMProvider  compiler.Provider
 	reviewLLMAgent     service.WikiReviewAgent
 	embeddingProvider  service.EmbeddingProvider
@@ -40,7 +39,6 @@ type Server struct {
 	defaultAgent       string
 	bootstrap          *service.BootstrapTracker
 	graphManager       *service.GraphManager
-	queryRuntime       service.QueryRuntimeOptions
 }
 
 type ServerOptions struct {
@@ -48,8 +46,7 @@ type ServerOptions struct {
 	GraphStore         service.GraphEvidenceStore
 	CodeGraphStore     service.CodeGraphStore
 	WikiPageStore      service.WikiPageStore
-	QueryLogStore      service.QueryLogStore
-	QueryAgent         service.QueryAgent
+	MaintenanceAgent   service.MaintenanceSynthesisAgent
 	IngestProvider     compiler.Provider
 	ReviewAgent        service.WikiReviewAgent
 	EmbeddingProvider  service.EmbeddingProvider
@@ -62,7 +59,6 @@ type ServerOptions struct {
 	DefaultAgent       string
 	Bootstrap          *service.BootstrapTracker
 	GraphManager       *service.GraphManager
-	QueryRuntime       service.QueryRuntimeOptions
 }
 
 func NewServer() *Server {
@@ -76,8 +72,7 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 		graphStore:         opts.GraphStore,
 		codeGraphStore:     opts.CodeGraphStore,
 		wikiPageStore:      opts.WikiPageStore,
-		queryLogStore:      opts.QueryLogStore,
-		queryAgent:         opts.QueryAgent,
+		maintenanceAgent:   opts.MaintenanceAgent,
 		ingestLLMProvider:  opts.IngestProvider,
 		reviewLLMAgent:     opts.ReviewAgent,
 		embeddingProvider:  opts.EmbeddingProvider,
@@ -90,7 +85,6 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 		defaultAgent:       opts.DefaultAgent,
 		bootstrap:          opts.Bootstrap,
 		graphManager:       opts.GraphManager,
-		queryRuntime:       opts.QueryRuntime,
 	}
 	s.routes()
 	if s.defaultProjectPath != "" {
@@ -146,13 +140,11 @@ func bootstrapRouteAvailable(r *http.Request) bool {
 		return false
 	}
 	switch r.URL.Path {
-	case "/projects/files", "/projects/files/content", "/projects/graph", "/projects/graph/insights", "/projects/graph/node", "/projects/graph/repos", "/projects/graph/jobs",
-		"/projects/sources", "/queue/tasks", "/reviews", "/research/jobs", "/chats":
+	case "/projects/graph", "/projects/graph/insights", "/projects/graph/node", "/projects/graph/repos", "/projects/graph/jobs", "/reviews", "/research/jobs":
 		return true
 	default:
 		return strings.HasPrefix(r.URL.Path, "/workspace/jobs/") ||
-			strings.HasPrefix(r.URL.Path, "/research/jobs/") ||
-			strings.HasPrefix(r.URL.Path, "/chats/")
+			strings.HasPrefix(r.URL.Path, "/research/jobs/")
 	}
 }
 
@@ -245,9 +237,6 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("POST /workspace/maintain", s.handleWorkspaceMaintain)
 	s.mux.HandleFunc("GET /workspace/jobs", s.handleWorkspaceJobs)
 	s.mux.HandleFunc("GET /workspace/jobs/{id}", s.handleWorkspaceJob)
-	s.mux.HandleFunc("GET /projects/files", s.handleProjectFiles)
-	s.mux.HandleFunc("GET /projects/files/content", s.handleProjectFileContent)
-	s.mux.HandleFunc("PUT /projects/files/content", s.handleWriteProjectFileContent)
 	s.mux.HandleFunc("POST /projects/search", s.handleProjectSearch)
 	s.mux.HandleFunc("GET /projects/graph", s.handleProjectGraph)
 	s.mux.HandleFunc("POST /projects/graph/query", s.handleProjectGraphQuery)
@@ -257,30 +246,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("GET /projects/graph/jobs", s.handleGraphJobs)
 	s.mux.HandleFunc("POST /projects/graph/jobs", s.handleQueueGraphJob)
 	s.mux.HandleFunc("POST /webhooks/code/{registry}", s.handleCodeWebhook)
-	s.mux.HandleFunc("GET /projects/sources", s.handleProjectSources)
-	s.mux.HandleFunc("POST /projects/sources/upload", s.handleUploadSources)
-	s.mux.HandleFunc("POST /projects/sources/rescan", s.handleScanSources)
-	s.mux.HandleFunc("POST /projects/sources/delete", s.handleDeleteSource)
-	s.mux.HandleFunc("GET /projects/sources/layout-migration", s.handleSourceLayoutMigrationStatus)
-	s.mux.HandleFunc("POST /projects/sources/layout-migration", s.handleSourceLayoutMigration)
 	s.mux.HandleFunc("POST /projects/init", s.handleInit)
-	s.mux.HandleFunc("POST /projects/ingest", s.handleIngest)
-	s.mux.HandleFunc("GET /projects/query", s.handleQuery)
 	s.mux.HandleFunc("GET /projects/lint", s.handleLint)
-	s.mux.HandleFunc("POST /sources/queue", s.handleQueueSource)
-	s.mux.HandleFunc("POST /sources/scan", s.handleScanSources)
-	s.mux.HandleFunc("GET /queue/tasks", s.handleQueueTasks)
-	s.mux.HandleFunc("POST /queue/run", s.handleRunQueue)
-	s.mux.HandleFunc("POST /wiki/validate", s.handleValidateWiki)
-	s.mux.HandleFunc("POST /query", s.handleQueryPost)
-	s.mux.HandleFunc("GET /chats", s.handleChats)
-	s.mux.HandleFunc("POST /chats", s.handleCreateChat)
-	s.mux.HandleFunc("GET /chats/{id}", s.handleChat)
-	s.mux.HandleFunc("DELETE /chats/{id}", s.handleDeleteChat)
-	s.mux.HandleFunc("POST /chats/{id}/messages", s.handleAppendChatMessage)
-	s.mux.HandleFunc("POST /chats/{id}/runs", s.handleStartChatRun)
-	s.mux.HandleFunc("GET /chats/{id}/runs/{run_id}/events", s.handleChatRunEvents)
-	s.mux.HandleFunc("POST /chats/{id}/runs/{run_id}/cancel", s.handleCancelChatRun)
 	s.mux.HandleFunc("GET /reviews", s.handleReviews)
 	s.mux.HandleFunc("POST /reviews/resolve", s.handleResolveReview)
 	s.mux.HandleFunc("POST /reviews/resolve-bulk", s.handleResolveReviewsBulk)
@@ -397,10 +364,6 @@ func (s *Server) maintainOptions(req service.WorkspaceMaintainRequest) (service.
 	if req.RunLLMReview {
 		reviewAgent, reviewAgentErr = s.reviewAgent(agentName)
 	}
-	sweepAgent, sweepErr := s.queryAgentFor(agentName)
-	if sweepErr != nil {
-		return service.MaintainWikiOptions{}, sweepErr
-	}
 	return service.MaintainWikiOptions{
 		ProjectPath:       req.ProjectPath,
 		ProjectID:         req.ProjectID,
@@ -411,62 +374,12 @@ func (s *Server) maintainOptions(req service.WorkspaceMaintainRequest) (service.
 		RunLLMReview:      req.RunLLMReview,
 		ReviewAgent:       reviewAgent,
 		ReviewAgentError:  reviewAgentErr,
-		SweepAgent:        sweepAgent,
+		SweepAgent:        s.maintenanceAgent,
 		RunPGSync:         req.RunPGSync,
 		WikiStore:         s.wikiPageStore,
 		EmbeddingProvider: s.embeddingProvider,
 		Context:           context.Background(),
 	}, nil
-}
-
-func (s *Server) handleProjectFiles(w http.ResponseWriter, r *http.Request) {
-	files, err := service.ListProjectFiles(s.projectPath(r.URL.Query().Get("project")))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"files": files, "count": len(files)})
-}
-
-func (s *Server) handleProjectFileContent(w http.ResponseWriter, r *http.Request) {
-	content, err := service.ReadProjectFileContent(s.projectPath(r.URL.Query().Get("project")), r.URL.Query().Get("path"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, content)
-}
-
-type writeProjectFileContentRequest struct {
-	ProjectPath string `json:"project_path"`
-	Path        string `json:"path"`
-	Content     string `json:"content"`
-	Reason      string `json:"reason"`
-}
-
-func (s *Server) handleWriteProjectFileContent(w http.ResponseWriter, r *http.Request) {
-	var req writeProjectFileContentRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	projectPath := s.projectPath(req.ProjectPath)
-	result, err := service.WriteProjectFileContent(service.WriteProjectFileContentOptions{
-		ProjectPath: projectPath,
-		Path:        req.Path,
-		Content:     req.Content,
-		Reason:      req.Reason,
-	})
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if strings.HasPrefix(result.Path, "wiki/") {
-		if err := s.syncWrittenWikiPages(r.Context(), projectPath, firstNonEmpty(s.defaultProjectID, "local"), aggregateWikiPaths(result.Path)); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-	}
-	writeJSON(w, http.StatusOK, result)
 }
 
 type projectSearchRequest struct {
@@ -486,16 +399,7 @@ func (s *Server) handleProjectSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	projectPath := s.projectPath(req.ProjectPath)
 	projectID := firstNonEmpty(req.ProjectID, s.defaultProjectID)
-	plan := core.QueryPlan{
-		Question: req.Query,
-		Searches: []core.QuerySearch{{
-			Text:      req.Query,
-			Weight:    6,
-			Rationale: "agent search",
-		}},
-		CandidateLimit: req.Limit,
-	}
-	results, err := service.SearchWikiCandidatesWithStore(r.Context(), projectPath, projectID, s.searchStore, s.embeddingProvider, plan, req.Limit)
+	results, err := service.SearchProjectDocuments(r.Context(), projectPath, projectID, req.Query, req.Limit, s.searchStore, s.embeddingProvider)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return
@@ -634,84 +538,6 @@ func (s *Server) handleProjectGraphInsights(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, insights)
 }
 
-func (s *Server) handleProjectSources(w http.ResponseWriter, r *http.Request) {
-	sources, err := service.ListSourceManifest(s.projectPath(r.URL.Query().Get("project")))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"sources": sources, "count": len(sources)})
-}
-
-func (s *Server) handleSourceLayoutMigrationStatus(w http.ResponseWriter, r *http.Request) {
-	projectPath := s.projectPath(r.URL.Query().Get("project"))
-	if r.URL.Query().Get("plan") == "true" {
-		result, err := service.PlanSourceLayoutMigration(projectPath)
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-		return
-	}
-	result, err := service.SourceLayoutMigrationStatus(projectPath)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
-}
-
-func (s *Server) handleSourceLayoutMigration(w http.ResponseWriter, r *http.Request) {
-	var req service.SourceLayoutMigrationOptions
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	req.ProjectPath = s.projectPath(req.ProjectPath)
-	result, err := service.MigrateSourceLayout(req)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if req.Apply && s.wikiPageStore != nil {
-		projectID := firstNonEmpty(s.defaultProjectID, "local")
-		if _, err := service.SyncWikiPagesToStore(r.Context(), service.WikiSyncOptions{
-			ProjectPath: req.ProjectPath, ProjectID: projectID, Store: s.wikiPageStore,
-			EmbeddingProvider: s.embeddingProvider,
-		}); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-	}
-	writeJSON(w, http.StatusOK, result)
-}
-
-func (s *Server) handleDeleteSource(w http.ResponseWriter, r *http.Request) {
-	var req service.DeleteSourceOptions
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	req.ProjectPath = s.projectPath(req.ProjectPath)
-	req.ProjectID = firstNonEmpty(req.ProjectID, s.defaultProjectID, "local")
-	result, err := service.DeleteSource(req)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if !req.DryRun && s.wikiPageStore != nil && req.ProjectID != "" {
-		if _, err := service.SyncWikiPagesToStore(r.Context(), service.WikiSyncOptions{
-			ProjectPath:       req.ProjectPath,
-			ProjectID:         req.ProjectID,
-			Store:             s.wikiPageStore,
-			EmbeddingProvider: s.embeddingProvider,
-		}); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-	}
-	writeJSON(w, http.StatusOK, result)
-}
-
 type resolveReviewsBulkRequest struct {
 	ProjectPath string   `json:"project_path"`
 	ProjectID   string   `json:"project_id"`
@@ -765,94 +591,6 @@ func (s *Server) handleInit(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"path": req.Path})
 }
 
-type ingestRequest struct {
-	ProjectPath string `json:"project_path"`
-	ProjectID   string `json:"project_id"`
-	SourcePath  string `json:"source_path"`
-	Title       string `json:"title"`
-	Kind        string `json:"kind"`
-}
-
-func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request) {
-	var req ingestRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	req.ProjectPath = s.projectPath(req.ProjectPath)
-	result, err := service.IngestSource(service.IngestOptions{
-		ProjectPath: req.ProjectPath,
-		SourcePath:  req.SourcePath,
-		Title:       req.Title,
-		Kind:        req.Kind,
-	})
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := s.syncWrittenWikiPages(r.Context(), req.ProjectPath, firstNonEmpty(req.ProjectID, s.defaultProjectID), aggregateWikiPaths(result.WikiPath)); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
-}
-
-func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	agent, err := s.queryAgentFor("")
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	projectID := r.URL.Query().Get("project_id")
-	if projectID == "" {
-		projectID = s.defaultProjectID
-	}
-	projectPath := s.projectPath(r.URL.Query().Get("project"))
-	answer, err := service.QueryLLMWikiWithOptions(service.QueryOptions{
-		ProjectPath:       projectPath,
-		ProjectID:         projectID,
-		Question:          r.URL.Query().Get("q"),
-		Limit:             limit,
-		Agent:             agent,
-		SearchStore:       s.searchStore,
-		GraphStore:        s.graphStore,
-		QueryLogStore:     s.queryLogStore,
-		EmbeddingProvider: s.embeddingProvider,
-		Context:           r.Context(),
-		Runtime:           s.queryRuntime,
-	})
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if saveTitle := r.URL.Query().Get("save_title"); saveTitle != "" {
-		if !answer.Plan.CanWriteBack {
-			writeError(w, http.StatusBadRequest, fmt.Errorf("query answer is not eligible for writeback; configure an LLM query agent"))
-			return
-		}
-		writebackTitle := saveTitle
-		if writebackTitle == "auto" {
-			writebackTitle = answer.SuggestedWritebackTitle
-		}
-		writeback, err := service.WriteQueryAnswer(service.QueryWritebackOptions{
-			ProjectPath: projectPath,
-			Title:       writebackTitle,
-			Answer:      answer,
-		})
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		if err := s.syncWrittenWikiPages(r.Context(), projectPath, projectID, aggregateWikiPaths(writeback.Path)); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{"answer": answer, "writeback": writeback})
-		return
-	}
-	writeJSON(w, http.StatusOK, answer)
-}
-
 func (s *Server) handleLint(w http.ResponseWriter, r *http.Request) {
 	issues, err := service.LintWiki(s.projectPath(r.URL.Query().Get("project")))
 	if err != nil {
@@ -860,507 +598,6 @@ func (s *Server) handleLint(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"issues": issues, "count": len(issues)})
-}
-
-type queueSourceRequest struct {
-	ProjectPath string `json:"project_path"`
-	SourcePath  string `json:"source_path"`
-	Title       string `json:"title"`
-}
-
-func (s *Server) handleQueueSource(w http.ResponseWriter, r *http.Request) {
-	var req queueSourceRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	task, err := service.QueueIngestSource(service.QueueIngestOptions{
-		ProjectPath: s.projectPath(req.ProjectPath),
-		SourcePath:  req.SourcePath,
-		Title:       req.Title,
-	})
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"task": task})
-}
-
-type projectRequest struct {
-	ProjectPath string `json:"project_path"`
-	ProjectID   string `json:"project_id"`
-}
-
-func (s *Server) handleScanSources(w http.ResponseWriter, r *http.Request) {
-	var req projectRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	result, err := service.ScanRawSources(service.QueueIngestOptions{ProjectPath: s.projectPath(req.ProjectPath)})
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
-}
-
-func (s *Server) handleUploadSources(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, core.MaxUploadBytes)
-	if err := r.ParseMultipartForm(32 << 20); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if r.MultipartForm != nil {
-		defer r.MultipartForm.RemoveAll()
-	}
-	projectPath := s.projectPath(r.FormValue("project_path"))
-	queue := true
-	if value := strings.TrimSpace(r.FormValue("queue")); value != "" {
-		queue = !(strings.EqualFold(value, "false") || value == "0")
-	}
-	headers := r.MultipartForm.File["files"]
-	if len(headers) == 0 {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("at least one file is required"))
-		return
-	}
-	inputs := make([]service.UploadSourceInput, 0, len(headers))
-	paths := r.MultipartForm.Value["paths"]
-	var opened []multipartFile
-	defer func() {
-		for _, file := range opened {
-			_ = file.Close()
-		}
-	}()
-	for _, header := range headers {
-		if header.Size > core.MaxSourceBytes {
-			writeError(w, http.StatusRequestEntityTooLarge, fmt.Errorf("source %s exceeds maximum size of %d bytes", header.Filename, core.MaxSourceBytes))
-			return
-		}
-		file, err := header.Open()
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		opened = append(opened, file)
-		relativePath := header.Filename
-		if i := len(inputs); i < len(paths) && strings.TrimSpace(paths[i]) != "" {
-			relativePath = paths[i]
-		}
-		inputs = append(inputs, service.UploadSourceInput{
-			RelativePath: relativePath,
-			Reader:       file,
-		})
-	}
-	result, err := service.UploadSources(service.UploadSourcesOptions{
-		ProjectPath: projectPath,
-		TargetDir:   r.FormValue("target_dir"),
-		Queue:       queue,
-		Files:       inputs,
-	})
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
-}
-
-type multipartFile interface {
-	Close() error
-}
-
-func (s *Server) handleQueueTasks(w http.ResponseWriter, r *http.Request) {
-	queue, err := service.LoadIngestQueue(s.projectPath(r.URL.Query().Get("project")))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, queue)
-}
-
-type runQueueRequest struct {
-	ProjectPath   string `json:"project_path"`
-	ProjectID     string `json:"project_id"`
-	Agent         string `json:"agent"`
-	SkipUnchanged bool   `json:"skip_unchanged"`
-	Max           int    `json:"max"`
-	RetryFailed   bool   `json:"retry_failed"`
-	KeepDone      bool   `json:"keep_done"`
-}
-
-func (s *Server) handleRunQueue(w http.ResponseWriter, r *http.Request) {
-	var req runQueueRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	provider, err := s.ingestProvider(req.Agent)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	projectPath := s.projectPath(req.ProjectPath)
-	result, err := service.RunIngestQueue(service.RunIngestQueueOptions{
-		ProjectPath:   projectPath,
-		Validator:     compilerQueueValidator(provider),
-		SkipUnchanged: req.SkipUnchanged,
-		MaxTasks:      req.Max,
-		RetryFailed:   req.RetryFailed,
-		KeepDone:      req.KeepDone,
-	})
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if _, err := compiler.ConvergeWikiArtifacts(projectPath); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if _, err := service.RepairKnownMentionLinks(projectPath); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := wiki.RebuildIndex(projectPath); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := service.RefreshRelationsArtifact(projectPath); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := s.syncWrittenWikiPages(r.Context(), projectPath, firstNonEmpty(req.ProjectID, s.defaultProjectID), aggregateWikiPaths("wiki/reviews.md")); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
-}
-
-type validateWikiRequest struct {
-	ProjectPath   string `json:"project_path"`
-	ProjectID     string `json:"project_id"`
-	SourcePath    string `json:"source_path"`
-	Title         string `json:"title"`
-	Agent         string `json:"agent"`
-	SkipUnchanged bool   `json:"skip_unchanged"`
-}
-
-func (s *Server) handleValidateWiki(w http.ResponseWriter, r *http.Request) {
-	var req validateWikiRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	provider, err := s.ingestProvider(req.Agent)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	projectPath := s.projectPath(req.ProjectPath)
-	result, err := compiler.ValidateLLMWikiPath(compiler.ValidateOptions{
-		ProjectPath:   projectPath,
-		SourcePath:    req.SourcePath,
-		Title:         req.Title,
-		Provider:      provider,
-		SkipUnchanged: req.SkipUnchanged,
-	})
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := service.RefreshRelationsArtifact(projectPath); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := s.syncWrittenWikiPages(r.Context(), projectPath, firstNonEmpty(req.ProjectID, s.defaultProjectID), batchWrittenWikiPaths(result)); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, result)
-}
-
-type queryRequest struct {
-	ProjectPath string `json:"project_path"`
-	ProjectID   string `json:"project_id"`
-	Question    string `json:"q"`
-	Limit       int    `json:"limit"`
-	Agent       string `json:"agent"`
-	SaveTitle   string `json:"save_title"`
-}
-
-func (s *Server) handleQueryPost(w http.ResponseWriter, r *http.Request) {
-	var req queryRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	agent, err := s.queryAgentFor(req.Agent)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	projectPath := s.projectPath(req.ProjectPath)
-	projectID := firstNonEmpty(req.ProjectID, s.defaultProjectID)
-	answer, err := service.QueryLLMWikiWithOptions(service.QueryOptions{
-		ProjectPath:       projectPath,
-		ProjectID:         projectID,
-		Question:          req.Question,
-		Limit:             req.Limit,
-		Agent:             agent,
-		SearchStore:       s.searchStore,
-		GraphStore:        s.graphStore,
-		QueryLogStore:     s.queryLogStore,
-		EmbeddingProvider: s.embeddingProvider,
-		Context:           r.Context(),
-		Runtime:           s.queryRuntime,
-	})
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if req.SaveTitle == "" {
-		writeJSON(w, http.StatusOK, answer)
-		return
-	}
-	if !answer.Plan.CanWriteBack {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("query answer is not eligible for writeback; configure an LLM query agent"))
-		return
-	}
-	writebackTitle := req.SaveTitle
-	if writebackTitle == "auto" {
-		writebackTitle = answer.SuggestedWritebackTitle
-	}
-	writeback, err := service.WriteQueryAnswer(service.QueryWritebackOptions{
-		ProjectPath: projectPath,
-		Title:       writebackTitle,
-		Answer:      answer,
-	})
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if err := s.syncWrittenWikiPages(r.Context(), projectPath, projectID, aggregateWikiPaths(writeback.Path)); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"answer": answer, "writeback": writeback})
-}
-
-func (s *Server) handleChats(w http.ResponseWriter, r *http.Request) {
-	projectPath := s.projectPath(r.URL.Query().Get("project"))
-	sessions, err := service.ListChatSessions(projectPath)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions, "count": len(sessions)})
-}
-
-type createChatRequest struct {
-	ProjectPath string `json:"project_path"`
-	Title       string `json:"title"`
-}
-
-func (s *Server) handleCreateChat(w http.ResponseWriter, r *http.Request) {
-	var req createChatRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	session, err := service.CreateChatSession(s.projectPath(req.ProjectPath), req.Title)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"session": session})
-}
-
-func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
-	session, err := service.ReadChatSession(s.projectPath(r.URL.Query().Get("project")), r.PathValue("id"))
-	if err != nil {
-		writeError(w, http.StatusNotFound, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"session": session})
-}
-
-func (s *Server) handleDeleteChat(w http.ResponseWriter, r *http.Request) {
-	if err := service.DeleteChatSession(s.projectPath(r.URL.Query().Get("project")), r.PathValue("id")); err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
-}
-
-type appendChatMessageRequest struct {
-	ProjectPath string `json:"project_path"`
-	ProjectID   string `json:"project_id"`
-	Question    string `json:"q"`
-	Limit       int    `json:"limit"`
-	Agent       string `json:"agent"`
-	SaveTitle   string `json:"save_title"`
-}
-
-func (s *Server) handleAppendChatMessage(w http.ResponseWriter, r *http.Request) {
-	var req appendChatMessageRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	agent, err := s.queryAgentFor(req.Agent)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	projectPath := s.projectPath(req.ProjectPath)
-	projectID := firstNonEmpty(req.ProjectID, s.defaultProjectID)
-	result, err := service.AppendChatMessage(service.ChatAppendOptions{
-		ProjectPath:       projectPath,
-		ProjectID:         projectID,
-		SessionID:         r.PathValue("id"),
-		Question:          req.Question,
-		Limit:             req.Limit,
-		Agent:             agent,
-		SaveTitle:         req.SaveTitle,
-		SearchStore:       s.searchStore,
-		GraphStore:        s.graphStore,
-		QueryLogStore:     s.queryLogStore,
-		EmbeddingProvider: s.embeddingProvider,
-		Context:           r.Context(),
-		Runtime:           s.queryRuntime,
-	})
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	if result.Writeback != nil {
-		if err := s.syncWrittenWikiPages(r.Context(), projectPath, projectID, aggregateWikiPaths(result.Writeback.Path)); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-	}
-	writeJSON(w, http.StatusOK, result)
-}
-
-func (s *Server) handleStartChatRun(w http.ResponseWriter, r *http.Request) {
-	var req appendChatMessageRequest
-	if !decodeJSON(w, r, &req) {
-		return
-	}
-	agent, err := s.queryAgentFor(req.Agent)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	projectPath := s.projectPath(req.ProjectPath)
-	projectID := firstNonEmpty(req.ProjectID, s.defaultProjectID)
-	run, session, err := service.StartChatRun(service.ChatAppendOptions{
-		ProjectPath:       projectPath,
-		ProjectID:         projectID,
-		SessionID:         r.PathValue("id"),
-		Question:          req.Question,
-		Limit:             req.Limit,
-		Agent:             agent,
-		SaveTitle:         req.SaveTitle,
-		SearchStore:       s.searchStore,
-		GraphStore:        s.graphStore,
-		QueryLogStore:     s.queryLogStore,
-		EmbeddingProvider: s.embeddingProvider,
-		Runtime:           s.queryRuntime,
-		OnWriteback: func(ctx context.Context, writeback service.QueryWritebackResult) error {
-			return s.syncWrittenWikiPages(ctx, projectPath, projectID, aggregateWikiPaths(writeback.Path))
-		},
-	})
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"run": run, "session": session})
-}
-
-func (s *Server) handleChatRunEvents(w http.ResponseWriter, r *http.Request) {
-	projectPath := s.projectPath(r.URL.Query().Get("project"))
-	runID := r.PathValue("run_id")
-	file, events, unsubscribe, err := service.SubscribeChatRun(projectPath, runID)
-	if err != nil {
-		writeError(w, http.StatusNotFound, err)
-		return
-	}
-	defer unsubscribe()
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("streaming is not supported"))
-		return
-	}
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	for _, event := range file.Events {
-		if err := writeChatRunSSE(w, event); err != nil {
-			return
-		}
-		flusher.Flush()
-	}
-	if isTerminalChatRunStatus(file.Run.Status) {
-		return
-	}
-	heartbeat := time.NewTicker(3 * time.Second)
-	defer heartbeat.Stop()
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case now := <-heartbeat.C:
-			if err := writeChatRunSSE(w, service.ChatRunEvent{
-				ID:        fmt.Sprintf("%s-heartbeat-%d", runID, now.UnixNano()),
-				RunID:     runID,
-				Type:      "heartbeat",
-				Time:      now.UTC(),
-				Message:   "查询仍在运行",
-				ElapsedMS: now.Sub(file.Run.StartedAt).Milliseconds(),
-			}); err != nil {
-				return
-			}
-			flusher.Flush()
-		case event, ok := <-events:
-			if !ok {
-				return
-			}
-			if err := writeChatRunSSE(w, event); err != nil {
-				return
-			}
-			flusher.Flush()
-			if isTerminalChatRunEvent(event.Type) {
-				return
-			}
-		}
-	}
-}
-
-func (s *Server) handleCancelChatRun(w http.ResponseWriter, r *http.Request) {
-	projectPath := s.projectPath(r.URL.Query().Get("project"))
-	run, err := service.CancelChatRun(projectPath, r.PathValue("run_id"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"run": run})
-}
-
-func writeChatRunSSE(w http.ResponseWriter, event service.ChatRunEvent) error {
-	data, err := json.Marshal(event)
-	if err != nil {
-		return err
-	}
-	_, err = fmt.Fprintf(w, "event: %s\ndata: %s\n\n", chatRunSSEEventName(event.Type), data)
-	return err
-}
-
-func chatRunSSEEventName(eventType string) string {
-	if isTerminalChatRunEvent(eventType) {
-		return eventType
-	}
-	return "progress"
-}
-
-func isTerminalChatRunEvent(eventType string) bool {
-	return eventType == "completed" || eventType == "error" || eventType == "canceled"
-}
-
-func isTerminalChatRunStatus(status service.ChatRunStatus) bool {
-	return status == service.ChatRunSucceeded || status == service.ChatRunFailed || status == service.ChatRunCanceled
 }
 
 func (s *Server) handleReviews(w http.ResponseWriter, r *http.Request) {
@@ -1427,21 +664,12 @@ func (s *Server) handleReviewAction(w http.ResponseWriter, r *http.Request) {
 	}
 	projectPath := s.projectPath(req.ProjectPath)
 	projectID := firstNonEmpty(req.ProjectID, s.defaultProjectID, "local")
-	var agent service.QueryAgent
-	if req.Action == "deep-research" {
-		selected, err := s.queryAgentFor(firstNonEmpty(req.Agent, s.defaultAgent, "llm"))
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		agent = selected
-	}
 	result, err := service.RunReviewAction(service.ReviewActionOptions{
 		ProjectPath: projectPath,
 		ProjectID:   projectID,
 		ReviewID:    req.ID,
 		Action:      req.Action,
-		Agent:       agent,
+		Agent:       s.maintenanceAgent,
 		Research:    s.researchOptions,
 		Context:     r.Context(),
 	})
@@ -1470,17 +698,10 @@ func (s *Server) handleReviewSweep(w http.ResponseWriter, r *http.Request) {
 	}
 	projectPath := s.projectPath(req.ProjectPath)
 	projectID := firstNonEmpty(req.ProjectID, s.defaultProjectID, "local")
-	var agent service.QueryAgent
-	selected, err := s.queryAgentFor(firstNonEmpty(req.Agent, s.defaultAgent, "llm"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
-		return
-	}
-	agent = selected
 	result, err := service.SweepReviewItems(service.ReviewSweepOptions{
 		ProjectPath: projectPath,
 		ProjectID:   projectID,
-		Agent:       agent,
+		Agent:       s.maintenanceAgent,
 		Context:     r.Context(),
 	})
 	if err != nil {
@@ -1509,12 +730,7 @@ func (s *Server) handleCreateResearchJob(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	if !existing {
-		agent, err := s.queryAgentFor(firstNonEmpty(req.Agent, s.defaultAgent, "llm"))
-		if err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		go service.RunResearchJob(job, agent, s.researchOptions)
+		go service.RunResearchJob(job, s.maintenanceAgent, s.researchOptions)
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"job": job, "existing": existing})
 }
@@ -1674,19 +890,6 @@ func (s *Server) syncWrittenWikiPages(ctx context.Context, projectPath, projectI
 
 func (s *Server) projectPath(value string) string {
 	return firstNonEmpty(value, s.defaultProjectPath)
-}
-
-func (s *Server) queryAgentFor(agentName string) (service.QueryAgent, error) {
-	agentName = firstNonEmpty(agentName, s.defaultAgent, "llm")
-	switch agentName {
-	case "llm":
-		if s.queryAgent != nil {
-			return s.queryAgent, nil
-		}
-		return nil, fmt.Errorf("llm query agent is not configured")
-	default:
-		return nil, fmt.Errorf("unknown query agent %q", agentName)
-	}
 }
 
 func (s *Server) ingestProvider(agentName string) (compiler.Provider, error) {

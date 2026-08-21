@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/loon-hejw/knowlega/internal/agent/knowlega/core"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/loon-hejw/knowlega/internal/agent/knowlega/core"
 )
 
 // Run with a disposable pgvector-enabled database:

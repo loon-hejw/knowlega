@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/loon-hejw/knowlega/internal/qm/biz"
 	"github.com/jackc/pgx/v5"
+	"github.com/loon-hejw/knowlega/internal/qm/biz"
 )
 
 type ProjectRepository struct {
@@ -22,6 +22,53 @@ type ProjectRepository struct {
 
 func NewProjectRepository(pg *Postgres, orgID string) *ProjectRepository {
 	return &ProjectRepository{pg: pg, orgID: orgID, now: time.Now}
+}
+
+func (r *ProjectRepository) Get(ctx context.Context, id string) (*biz.Project, error) {
+	if strings.TrimSpace(id) == "" {
+		return nil, nil
+	}
+	var raw []byte
+	if err := r.pg.Pool.QueryRow(ctx, "SELECT json FROM projects WHERE id=$1", id).Scan(&raw); errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	var project biz.Project
+	if err := json.Unmarshal(raw, &project); err != nil {
+		return nil, err
+	}
+	if project.OrgID != r.orgID {
+		return nil, nil
+	}
+	return &project, nil
+}
+
+// FindOwnedByName is used by operator migrations that must adopt a project
+// already created by the Node-compatible control plane before directory state
+// has been synchronized into Go. Interactive project listing still requires
+// an active directory member through ListForMember.
+func (r *ProjectRepository) FindOwnedByName(ctx context.Context, ownerID, name string) ([]biz.Project, error) {
+	rows, err := r.pg.Pool.Query(ctx, `SELECT json FROM projects
+WHERE json->>'orgId'=$1 AND json->>'ownerId'=$2 AND json->>'name'=$3
+ORDER BY (json->>'createdAt')::bigint,id`, r.orgID, ownerID, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []biz.Project{}
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var project biz.Project
+		if err := json.Unmarshal(raw, &project); err != nil {
+			return nil, err
+		}
+		result = append(result, project)
+	}
+	return result, rows.Err()
 }
 
 func (r *ProjectRepository) Create(ctx context.Context, ownerID, name string) (*biz.Project, error) {

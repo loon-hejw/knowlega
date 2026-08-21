@@ -1,174 +1,204 @@
 # Configuration
 
-## Loading and Precedence
+## Loading and precedence
 
-Knowledge Core reads runtime settings only from:
-
-1. the path passed as global `--config PATH`; or
-2. repository-root `config.yaml` by default.
-
-Explicit CLI flags override YAML values, and YAML values override program
-defaults. Relative `project.path`, bootstrap source, and related paths resolve
-from the configuration file directory. Legacy environment variables and env
-files are intentionally not runtime configuration sources.
+`cmd/qm-backend` reads the QM YAML passed with `--config PATH`; its default is
+the ignored local path `configs/qm-config.yaml`. New deployments should keep
+database, model, worker, file-store, authentication, and Knowledge Agent
+settings in that one file.
 
 Start from the checked-in template:
 
 ```bash
-cp config.example.yaml config.yaml
-$EDITOR config.yaml
+cp configs/qm-config.example.yaml configs/qm-config.yaml
+$EDITOR configs/qm-config.yaml
 ```
 
-`config.yaml` is ignored by Git. Never commit real API keys, database DSNs,
-webhook secrets, or provider tokens.
+Never commit the local file, real API keys, database DSNs, signing secrets, or
+provider tokens. A limited set of legacy QM environment variables is still
+translated for migration compatibility, but it is not the configuration model
+to extend.
 
-## Sections
+## `server`
 
-### `project`
+- `http_addr`: QM HTTP listener; defaults to `:18083`.
+- `grpc_addr`: internal QM control/runner gRPC listener.
 
-Defines the active workspace and optional service bootstrap.
+Health and readiness are available at `/healthz` and `/readyz`. Readiness means
+the process and database are serving; it does not wait for every project wiki
+to finish compiling.
 
-| Field | Meaning |
-| --- | --- |
-| `name` | Project display/name seed. |
-| `path` | Wiki project directory. |
-| `bootstrap.source` | File or directory compiled while service starts. |
-| `bootstrap.agent` | Bootstrap agent; real workflows use `llm`. |
-| `bootstrap.reuse_existing` | Resume from existing Markdown and manifest state. |
-| `bootstrap.retry_initial_delay` | First transient-failure retry delay. |
-| `bootstrap.retry_max_delay` | Retry backoff ceiling. |
-| `bootstrap.concurrency` | Maximum number of complete source-file tasks. A completed task is replaced immediately; this is not a stage batch size. |
-| `bootstrap.max_task_attempts` | Per-source convergence guard; defaults to `4`. Exhaustion is a permanent bootstrap failure until the source or generation contract changes. |
-| `bootstrap.max_conflict_attempts` | Separate optimistic-commit conflict allowance; defaults to `8` and does not consume ordinary failure attempts. |
-| `bootstrap.max_impact_attempts` | Separate semantic impact re-integration allowance; defaults to `2`, so impact churn cannot consume the ordinary generation/conflict retry budget. |
-| `bootstrap.max_files_per_task` | Maximum generated/updated wiki pages per source task; defaults to `12` to prevent page fragmentation. |
-| `bootstrap.max_new_pages_per_source` | Lifetime maximum of new non-summary pages per source and generation contract; defaults to `3`. Existing canonical page updates do not count, and impact re-integration is update-only. |
+## `database`
 
-`purpose.md` is part of the generation contract. The default is domain-neutral
-and requires source-language output, evidence fidelity, reuse-first page
-selection, and durable provenance. Empty files and the legacy initialization
-placeholder are rejected before a real LLM request. Changing `purpose.md`,
-`schema.md`, the pipeline version, or either page budget invalidates unchanged
-manifest entries so the corpus is re-integrated under one consistent contract.
-Source files larger than 64 MiB are rejected before in-memory extraction, and
-multipart source uploads are limited to 128 MiB in total. Both HTTP and direct
-service uploads enforce the aggregate limit while source archive bytes are
-streamed to disk.
+`database.url` is required. `qm-backend` applies the public QM migrations and
+the isolated `knowledge_core` schema at startup. Markdown remains authoritative;
+the Knowledge schema is a rebuildable search, graph, review, source-manifest,
+and page-version index.
 
-### `llm`
+## `qm`
 
-Configures ingest, query planning/action use, overview synthesis, and semantic
-review.
+Core fields:
 
-- `protocol`: `openai` for Chat Completions or `anthropic` for Messages.
-- `base_url`: provider root, `/v1` base, or full operation URL.
-- `api_key`, `model`: required for user-facing LLM commands.
-- `user_agent`: optional gateway identity; defaults to
-  `knowledge-core/0.1`.
-- `anthropic_version`: defaults to `2023-06-01`.
-- `timeout`: per-request HTTP deadline.
-- `concurrency`: provider request ceiling. `0` inherits `project.bootstrap.concurrency`; set it lower when the upstream model has less stable parallel capacity than the file-task scheduler.
-- `operation_timeout`: total deadline for one logical LLM call including retries; when omitted, it inherits `timeout`.
-- `retries`, `retry_base_delay`, `retry_max_delay`: retry policy within that total deadline.
-- `max_input_chars`, `max_output_tokens`: prompt/response bounds.
-- `disable_thinking`: asks compatible providers to suppress extended thinking.
+- `org_id`: organization identifier used for QM and Knowledge scope bindings.
+- `node_core_url`: compatibility upstream while routes are still proxied.
+- `route_mode`: `proxy`, `shadow_read`, or `go`.
+- `agent_workspace_root`: parent directory for per-scope tool workspaces.
+- `sandbox_default_backend` and `sandbox_backends`: declared sandbox choices.
+  Local sandbox execution requires Docker and never falls back to the host.
 
-Anthropic mode sends both Anthropic-native and Bearer-compatible headers so it
-can work with native endpoints and compatible gateways. OpenAI-compatible `/v1`
-bases resolve to `/v1/chat/completions`.
+### `qm.file_store`
 
-### `embedding`
+The current Go-owned artifact store uses:
 
-Embeddings use an independently OpenAI-compatible endpoint. Set `model` to
-enable embedding generation. Empty `base_url` or `api_key` values can inherit
-the configured LLM endpoint/key where supported. `max_input_chars` truncates
-oversized semantic page text before embedding.
+- `mode: local`;
+- `local_dir` for durable content-addressed QM file blobs; and
+- `transfer_local_dir` for short-lived staged uploads.
 
-Wiki embedding text contains title, type, aliases, sources, and body. A change
-to any of these fields changes the source hash and refreshes the embedding on
-the next relevant sync.
+QM owns file artifacts, project memberships, authorization, and deletion.
+Knowledge receives an immutable read-only mirror only after those writes
+succeed.
 
-### `database`
+### `qm.slack` and `qm.oauth`
 
-- `dsn`: PostgreSQL connection string.
-- `project_id`: stable PostgreSQL scope for the Markdown project.
+Slack bot/app tokens and OAuth client declarations live in the shared QM YAML.
+OAuth clients declare provider, client credentials, scopes, redirect allowlist,
+consent mode, and optional hosted domain. Deprecated flattened OAuth/Slack
+catalog fields are rejected.
 
-Database use is optional. Configure PostgreSQL to enable durable operational
-indexes, FTS, pgvector, graph facts, query logs, and review filtering. Markdown
-remains authoritative.
+## `qm.models`
 
-### `server`
+This is the only model-selection source for QM turns and Knowledge maintenance.
+The outer QM Harness is the only query reasoner; Knowlega reuses the selected
+provider for ingest, overview synthesis, and semantic review.
 
-- `addr`: listen address, default `127.0.0.1:19829`.
-- `agent`: default server agent.
-- `worker`: opt-in ingest scan/queue worker.
-- `scan_interval`: worker polling interval.
-- `api_token`: Bearer token for protected API access.
-- `api_require_token`: also require the token for loopback clients.
+- `default_harness`: deployment-wide default Harness.
+- `request`: shared per-attempt timeout, total operation timeout, retries,
+  input/output bounds, and optional thinking suppression.
+- `providers[]`: deployment-specific OpenAI, Anthropic, or local `mock` wire
+  providers with models and credentials.
+- `harnesses[]`: binds `pi`, `opencode`, `codex`, `claude`, or `mock` to one
+  provider and an allowed model set.
 
-Non-loopback access requires a configured token. Keep the default loopback
-binding unless the service is intentionally protected and exposed.
+Each provider model may declare `context_window`, `max_tokens`, `fast_mode`,
+and `adaptive_thinking`. Provider IDs are deployment names, not subscription
+choices. The UI exposes only the Harness/model combinations declared here.
 
-#### Knowledge Agent
+The production Harnesses share the Go agent engine while retaining distinct
+transports:
 
-Knowlega has no public Knowledge gRPC configuration. QM creates the internal
-Agent at backend startup and derives each personal/project scope under
-`knowledge.root_dir`. The Agent owns Markdown raw/wiki artifacts, the durable
-ingest queue, page versions, lint/review, and derived PostgreSQL sync.
+| Harness | Provider wire | Runtime dependency |
+| --- | --- | --- |
+| `pi` | OpenAI or Anthropic | direct Go HTTP transport |
+| `opencode` | OpenAI or Anthropic | OpenCode runtime |
+| `codex` | OpenAI | Codex CLI/app-server |
+| `claude` | Anthropic | Claude CLI stream JSON |
 
-### `query`
+Harness `runtime` settings include executable paths where applicable, startup
+and wall-clock limits, optional detection/title/judge models, request capture,
+cache splitting, and controlled execution capabilities. Configuration
+validation rejects incompatible Harness/provider pairs.
 
-Controls the single-agent deep-query loop. `max_steps` is the one hard limit
-shared by model decisions, tool actions, and verification turns; it defaults to
-256. The query has no total wall-clock deadline by default (`total_timeout:
-0s`). A positive `total_timeout` remains available as an explicit operator
-override. Per-request LLM operation timeouts and retries are configured under
-`llm` and continue to apply.
+The legacy `knowledge.llm` block is accepted only as a one-time in-memory
+migration when `qm.models` is absent. New deployments must use `qm.models`.
 
-`initial_action_budget`, `max_action_budget`, and `stagnation_rounds` are
-deprecated compatibility keys and no longer divide or stop the action loop. If
-`max_steps` is omitted, an explicitly configured legacy `max_action_budget` is
-treated as `max_steps`. `verification_passes` still controls same-agent
-coverage/adversarial stop reviews, and those turns count toward `max_steps`.
+For an OpenAI-compatible model gateway, declare every selectable model in the
+same provider and allow it on the `pi` Harness. For example:
 
-### `research`
+```yaml
+qm:
+  models:
+    default_harness: pi
+    providers:
+      - id: company-modelgate
+        protocol: openai
+        base_url: https://model-gateway.example/v1
+        api_key: replace-with-your-key
+        models:
+          - id: k2.6
+            name: K2.6
+          - id: qwen3.8-27b-fp8
+            name: Qwen3.8 27B FP8
+    harnesses:
+      - id: pi
+        provider: company-modelgate
+        model_ids: [k2.6, qwen3.8-27b-fp8]
+        default_model: qwen3.8-27b-fp8
+```
 
-Configures optional SearXNG-backed research jobs:
+The model ID is sent to the gateway exactly as configured. Keep vendor API
+keys only in the ignored `configs/qm-config.yaml` file.
 
-- `searxng_url`: SearXNG endpoint; leave empty to disable external search.
-- `max_results`: bounded results per request.
-- `timeout`: research request timeout.
+## `knowledge`
 
-### `graph`
+Knowlega has no standalone listener or standalone project configuration. QM
+creates the internal Agent and derives every managed project scope below
+`knowledge.root_dir`.
 
-Enables managed remote code indexing.
+- `root_dir`: parent directory for managed Knowledge scopes.
+- `auto_process_project_files`: defaults to `true`; asynchronously compiles QM
+  uploads and attachments without blocking upload responses.
+- `worker`: opt-in generic scan for non-project `raw/sources/` workspaces.
+- `scan_interval_seconds`: polling interval for both maintenance paths.
 
-- `enabled`, `worker`: graph API/worker switches.
-- `checkout_root`: managed repository checkout directory.
-- `max_parallel_jobs`: graph-job concurrency limit.
-- `semantic_enrichment`: optional bounded LLM-inferred relations after exact
-  indexing.
-- `registries`: explicit GitHub/GitLab/Gitea allowlists.
+Project files progress through `queued`, `processing`, `ready`, or `failed`;
+a project with no sources is `empty`. Raw evidence remains searchable while
+derived pages are pending. Disabling the generic worker does not stop normal QM
+project files from becoming wiki knowledge.
 
-Each registry defines an ID, provider, base URL, credential sources, checkout
-directory, and allowed repositories. Each repository has an ID, full name,
-optional clone URL, branch, and disabled flag.
+There is no `knowledge.query` configuration. Such a block is rejected because
+Pi controls navigation and evidence gathering through the deterministic
+`knowledge` tool.
 
-Registry credentials may be indirect environment references through
-`api_token_env` and `webhook_secret_env`. These are narrowly scoped secret
-lookups for remote Git integration, not general runtime configuration. Clone
-credentials are passed through ephemeral Git HTTP headers and are not embedded
-in remote URLs, logs, snapshots, or API responses.
+## `workers`
+
+`qm-backend` runs categorized durable workers inside the same process.
+`workers.reap_interval_seconds` controls stale-lease recovery and
+`workers.pools.<name>` may set:
+
+- `concurrency`;
+- `lease_ttl_seconds`;
+- `heartbeat_interval_seconds`;
+- `poll_interval_millis`; and
+- `max_claim_backoff_millis`.
+
+The `turn` pool serializes work per session while allowing unrelated sessions
+to run concurrently. The `sandbox` pool handles container-backed execution.
+Other pools cover ingress, delivery, OAuth, deployment, skill, and maintenance
+tasks as configured.
+
+## `runner`
+
+`runner.lease_ttl_seconds` and `runner.max_claims` retain the compatibility
+runner lease settings. New categorized execution settings belong under
+`workers.pools`.
+
+## `auth`
+
+The backend supports:
+
+- `source_signing_secret` for trusted source requests;
+- `capability_secret` for scoped capabilities;
+- `portal_identity_secret` for portal identities;
+- `connector_secret_key` plus `previous_connector_secret_keys` for encrypted
+  connector-secret rotation;
+- `grpc_internal_token`; and
+- `replay_window_seconds`.
+
+The checked-in values are development placeholders and must be replaced outside
+local use.
 
 ## Local PostgreSQL
 
 ```bash
-docker compose -f docker-compose.local.yml up -d
+local-pg guard knowledge-core
 
 env GOCACHE=/private/tmp/knowlega-gocache \
-  go run ./cmd/qm-backend --config qm-backend/configs/config.yaml
+  go run ./cmd/qm-backend --config configs/qm-config.yaml
 ```
 
-Set `database.url` and the QM/Knowledge LLM settings in
-`qm-backend/configs/config.yaml`. `cmd/qm-backend` applies both QM migrations
-and the isolated `knowledge_core` PostgreSQL schema at startup.
+Set `database.url` and the shared provider/Harness settings under `qm.models`.
+Obsolete nested query settings are rejected.
+
+The shared local database listens on `127.0.0.1:55433` as user `kbcore` with
+database `kbcore`. A `postgres`/`5432` DSN belongs to a different server; use
+the compose DSN above or change all four connection fields together.

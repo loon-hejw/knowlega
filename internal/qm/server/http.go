@@ -16,6 +16,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -24,10 +25,12 @@ import (
 
 	khttp "github.com/go-kratos/kratos/v2/transport/http"
 	knowlega "github.com/loon-hejw/knowlega/internal/agent/knowlega"
+	agentservice "github.com/loon-hejw/knowlega/internal/agent/knowlega/service"
 	"github.com/loon-hejw/knowlega/internal/qm/auth"
 	"github.com/loon-hejw/knowlega/internal/qm/biz"
 	"github.com/loon-hejw/knowlega/internal/qm/config"
 	"github.com/loon-hejw/knowlega/internal/qm/data"
+	"github.com/loon-hejw/knowlega/internal/qm/secretbox"
 )
 
 type HTTPServer struct {
@@ -45,6 +48,8 @@ type HTTPServer struct {
 	egress            *data.EgressRepository
 	errors            *data.ErrorEventRepository
 	runs              *data.RunRepository
+	runtimeTasks      *data.RuntimeTaskRepository
+	agentApprovals    *data.AgentApprovalRepository
 	deliveries        *data.DeliveryRepository
 	sessions          *data.SessionRepository
 	replay            *data.ReplayRepository
@@ -52,12 +57,15 @@ type HTTPServer struct {
 	retention         *data.RetentionRepository
 	crons             *data.CronRepository
 	files             *data.FileArtifactRepository
+	projectFiles      *data.ProjectFileMembershipRepository
+	knowledgeScopes   *data.KnowledgeScopeRepository
 	deployments       *data.DeploymentRepository
 	memory            *data.MemoryRepository
 	skills            *data.SkillRepository
 	souls             *data.SoulRepository
 	userConfig        *data.UserConfigRepository
 	contextRequests   *data.ContextRequestRepository
+	connectorSecrets  *secretbox.Box
 	keychain          *data.KeychainStatusRepository
 	customProviders   *data.CustomProviderRepository
 	slackInstallation *data.SlackInstallationRepository
@@ -86,6 +94,13 @@ func NewHTTPServer(cfg config.Config, pg *data.Postgres, knowledgeAgent *knowleg
 		return nil, err
 	}
 	repo := data.NewProjectRepository(pg, cfg.QM.OrgID)
+	var connectorSecrets *secretbox.Box
+	if cfg.Auth.ConnectorSecretKey != "" {
+		connectorSecrets, err = secretbox.New(cfg.Auth.ConnectorSecretKey, cfg.Auth.PreviousConnectorSecrets, "connector-secrets")
+		if err != nil {
+			return nil, err
+		}
+	}
 	h := &HTTPServer{
 		config:            cfg,
 		projects:          biz.NewProjectUsecase(repo),
@@ -102,6 +117,8 @@ func NewHTTPServer(cfg config.Config, pg *data.Postgres, knowledgeAgent *knowleg
 		egress:            data.NewEgressRepository(pg),
 		errors:            data.NewErrorEventRepository(pg),
 		runs:              data.NewRunRepository(pg),
+		runtimeTasks:      data.NewRuntimeTaskRepository(pg),
+		agentApprovals:    data.NewAgentApprovalRepository(pg),
 		deliveries:        data.NewDeliveryRepository(pg),
 		sessions:          data.NewSessionRepository(pg),
 		replay:            data.NewReplayRepository(pg),
@@ -109,12 +126,15 @@ func NewHTTPServer(cfg config.Config, pg *data.Postgres, knowledgeAgent *knowleg
 		retention:         data.NewRetentionRepository(pg),
 		crons:             data.NewCronRepository(pg),
 		files:             data.NewFileArtifactRepository(pg),
+		projectFiles:      data.NewProjectFileMembershipRepository(pg),
+		knowledgeScopes:   data.NewKnowledgeScopeRepository(pg),
 		deployments:       data.NewDeploymentRepository(pg),
 		memory:            data.NewMemoryRepository(pg),
 		skills:            data.NewSkillRepository(pg),
 		souls:             data.NewSoulRepository(pg),
 		userConfig:        data.NewUserConfigRepository(pg),
 		contextRequests:   data.NewContextRequestRepository(pg),
+		connectorSecrets:  connectorSecrets,
 		keychain:          data.NewKeychainStatusRepository(pg),
 		customProviders:   data.NewCustomProviderRepository(pg),
 		slackInstallation: data.NewSlackInstallationRepository(pg),
@@ -128,7 +148,13 @@ func NewHTTPServer(cfg config.Config, pg *data.Postgres, knowledgeAgent *knowleg
 		proxy:  httputil.NewSingleHostReverseProxy(upstream),
 		logger: logger,
 	}
-	srv := khttp.NewServer(khttp.Address(cfg.Server.HTTPAddr))
+	// The browser-facing runtime exposes long-lived SSE streams (notably
+	// /v1/session-state/events). Kratos defaults to a one-second request
+	// context timeout, which silently tears those streams down while the
+	// reverse proxy is copying the body. Route handlers and upstream clients
+	// own their finite operation deadlines, so keep the transport context
+	// alive for streaming requests.
+	srv := khttp.NewServer(khttp.Address(cfg.Server.HTTPAddr), khttp.Timeout(0))
 	srv.HandlePrefix("/", h)
 	return srv, nil
 }
@@ -146,6 +172,35 @@ func (h *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
+	// Onboarding configuration is YAML-owned by the Go control plane. These
+	// routes must never fall through to the legacy Node proxy, regardless of
+	// the broader migration route mode.
+	if h.yamlOnboardingRoute(r.Method, r.URL.Path) {
+		h.serveOwned(w, r)
+		return
+	}
+	if h.agentRuntimeRoute(r.Method, r.URL.Path) {
+		h.serveOwned(w, r)
+		return
+	}
+	// The Web UI forwards file reads with Node-compatible source authentication.
+	// When both runtimes share the configured local store, Go must serve those
+	// bytes even in proxy mode; the legacy Node docstore may point elsewhere.
+	if h.localFileContentRoute(r) {
+		h.serveOwned(w, r)
+		return
+	}
+	// Project file knowledge state is Go-owned even while the remaining surface
+	// runs in proxy mode. Node's FileListItem has no projectFile projection, so
+	// proxying this read would hide queued/ready/failed state from the Web UI.
+	if projectScopeResourcesRoute(r) {
+		h.serveOwned(w, r)
+		return
+	}
+	if r.Method == http.MethodGet && projectKnowledgeDocumentID(r.URL.Path) != "" {
+		h.serveOwned(w, r)
+		return
+	}
 	if h.config.QM.RouteMode == "shadow_read" && r.Method == http.MethodGet && r.URL.Path == "/v1/projects" && r.Header.Get(auth.CapabilityHeader) != "" {
 		h.shadowProjects(w, r)
 		return
@@ -157,11 +212,28 @@ func (h *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveLocalBlob(w, r)
 		return
 	}
-	if h.config.QM.RouteMode != "go" || !h.owns(r.Method, r.URL.Path) || h.proxyCronRoute(r) || h.proxyViewerDeploymentRoute(r) || h.proxyDeploymentMutationRoute(r) || h.proxyCapabilityMemoryRoute(r) || h.proxyScopeResourcesRoute(r) || h.proxyFileListRoute(r) || h.proxyFileContentRoute(r) || h.proxyFileUploadRoute(r) || h.proxyAdminFileRoute(r) || h.proxySlackInstallationRoute(r) || h.proxySandboxRoutes(r) || h.proxyOAuthCatalogRoute(r) {
+	if h.config.QM.RouteMode != "go" || !h.owns(r.Method, r.URL.Path) || h.proxyCronRoute(r) || h.proxyViewerDeploymentRoute(r) || h.proxyDeploymentMutationRoute(r) || h.proxyCapabilityMemoryRoute(r) || h.proxyScopeResourcesRoute(r) || h.proxyFileListRoute(r) || h.proxyFileContentRoute(r) || h.proxyFileUploadRoute(r) || h.proxyAdminFileRoute(r) || h.proxySlackInstallationRoute(r) || h.proxySandboxRoutes(r) || h.proxyOAuthCatalogRoute(r) || h.proxySurfaceContextPendingRoute(r) {
 		h.proxy.ServeHTTP(w, r)
 		return
 	}
 	h.serveOwned(w, r)
+}
+
+func (h *HTTPServer) agentRuntimeRoute(method, path string) bool {
+	if len(h.config.QM.Models.Harnesses) == 0 {
+		return false
+	}
+	if path == "/v1/turns" || path == "/v1/runs" {
+		return method == http.MethodPost && path == "/v1/turns" || method == http.MethodGet && path == "/v1/runs"
+	}
+	if path == "/v1/approvals/pending" || approvalID(path) != "" {
+		return method == http.MethodGet
+	}
+	return method == http.MethodGet && runRecordID(path) != "" || method == http.MethodPost && (runSignalID(path) != "" || runDeliveryStateID(path) != "" || turnMetricsRunID(path) != "")
+}
+
+func projectScopeResourcesRoute(r *http.Request) bool {
+	return r.Method == http.MethodGet && r.URL.Path == "/v1/scope-resources" && strings.HasPrefix(strings.TrimSpace(r.URL.Query().Get("scope")), "group:web-project-")
 }
 
 func (h *HTTPServer) shadowProjects(w http.ResponseWriter, r *http.Request) {
@@ -182,6 +254,9 @@ func (h *HTTPServer) shadowProjects(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *HTTPServer) owns(method, path string) bool {
+	if h.yamlOnboardingRoute(method, path) {
+		return true
+	}
 	if path == "/v1/apis" {
 		return method == http.MethodGet
 	}
@@ -221,7 +296,25 @@ func (h *HTTPServer) owns(method, path string) bool {
 	if _, memberID := projectMemberID(path); memberID != "" {
 		return method == http.MethodDelete
 	}
+	if projectFileCollectionID(path) != "" {
+		return method == http.MethodPost
+	}
+	if projectKnowledgeDocumentID(path) != "" {
+		return method == http.MethodGet
+	}
+	if _, fileID := projectFileID(path); fileID != "" {
+		return method == http.MethodDelete
+	}
+	if _, fileID := projectFileRetryID(path); fileID != "" {
+		return method == http.MethodPost
+	}
 	if path == "/v1/runs" {
+		return method == http.MethodGet
+	}
+	if path == "/v1/turns" {
+		return method == http.MethodPost
+	}
+	if runRecordID(path) != "" {
 		return method == http.MethodGet
 	}
 	if path == "/v1/deployments" {
@@ -343,6 +436,12 @@ func (h *HTTPServer) owns(method, path string) bool {
 	}
 	if path == "/v1/contexts/policy" {
 		return method == http.MethodGet || method == http.MethodPut
+	}
+	if path == "/v1/surface-context" || path == "/v1/surface-file" {
+		return method == http.MethodPost
+	}
+	if path == "/v1/surface-context/pending" {
+		return method == http.MethodGet
 	}
 	if surfaceContextResultID(path) != "" {
 		return method == http.MethodPost
@@ -538,7 +637,7 @@ func (h *HTTPServer) proxyScopeResourcesRoute(r *http.Request) bool {
 // identity evaluator. The Go path below is the durable metadata projection for
 // capability callers whose scope authorization is already synchronized here.
 func (h *HTTPServer) proxyFileListRoute(r *http.Request) bool {
-	return r.Method == http.MethodGet && r.URL.Path == "/v1/files" && r.Header.Get(auth.CapabilityHeader) == ""
+	return r.Method == http.MethodGet && r.URL.Path == "/v1/files" && r.Header.Get(auth.CapabilityHeader) == "" && r.Header.Get("x-signature") == ""
 }
 
 func (h *HTTPServer) proxyFileListScope(identity auth.Identity, r *http.Request) bool {
@@ -560,7 +659,13 @@ func (h *HTTPServer) proxyFileContentRoute(r *http.Request) bool {
 	if r.Method != http.MethodGet || fileContentID(r.URL.Path) == "" {
 		return false
 	}
-	return h.config.QM.FileStore.Mode != "local" || strings.TrimSpace(h.config.QM.FileStore.LocalDir) == "" || r.Header.Get(auth.CapabilityHeader) == ""
+	return h.config.QM.FileStore.Mode != "local" || strings.TrimSpace(h.config.QM.FileStore.LocalDir) == "" || r.Header.Get(auth.CapabilityHeader) == "" && r.Header.Get("x-signature") == ""
+}
+
+func (h *HTTPServer) localFileContentRoute(r *http.Request) bool {
+	return r.Method == http.MethodGet && fileContentID(r.URL.Path) != "" &&
+		h.config.QM.FileStore.Mode == "local" && strings.TrimSpace(h.config.QM.FileStore.LocalDir) != "" &&
+		(r.Header.Get(auth.CapabilityHeader) != "" || r.Header.Get("x-signature") != "")
 }
 
 func (h *HTTPServer) proxyFileContentScope(identity auth.Identity, r *http.Request) bool {
@@ -624,11 +729,15 @@ func (h *HTTPServer) localBlobRoute(r *http.Request) bool {
 // declare their state in config before Go owns the read endpoint; the default
 // unknown value preserves the existing Node response without guessing.
 func (h *HTTPServer) proxySlackInstallationRoute(r *http.Request) bool {
-	return r.Method == http.MethodGet && r.URL.Path == "/v1/admin/slack-installation" && h.config.QM.SlackEnvironmentState == "unknown"
+	return false
 }
 
 func (h *HTTPServer) proxySandboxRoutes(r *http.Request) bool {
 	return r.Method == http.MethodGet && r.URL.Path == "/v1/admin/sandbox-routes" && h.config.QM.SandboxDefaultBackend == ""
+}
+
+func (h *HTTPServer) proxySurfaceContextPendingRoute(r *http.Request) bool {
+	return r.Method == http.MethodGet && r.URL.Path == "/v1/surface-context/pending"
 }
 
 func (h *HTTPServer) proxyCronPatch(r *http.Request, body []byte) bool {
@@ -702,7 +811,7 @@ func (h *HTTPServer) serveOwned(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	routeAuth := "either"
-	if r.URL.Path == "/v1/directory" || r.URL.Path == "/v1/directory/meta" || r.URL.Path == "/v1/runs" || r.URL.Path == "/v1/approvals/pending" || approvalID(r.URL.Path) != "" || r.URL.Path == "/v1/contexts" || r.URL.Path == "/v1/scope-resources" || r.URL.Path == "/v1/skills" || r.URL.Path == "/v1/grants" || r.URL.Path == "/v1/grants/revoke" || r.URL.Path == "/v1/session-cap" || r.URL.Path == "/v1/memory" || r.URL.Path == "/v1/sessions" || sessionBackgroundID(r.URL.Path) != "" || sessionApprovalsID(r.URL.Path) != "" || sessionEntryPath(r.URL.Path) || sessionID(r.URL.Path) != "" || runDeliveryStateID(r.URL.Path) != "" || runSignalID(r.URL.Path) != "" || r.URL.Path == "/v1/deliveries" || r.URL.Path == "/v1/deliveries/ack-by-key" || deliveryAckID(r.URL.Path) != "" || r.URL.Path == "/v1/egress-audit" || r.URL.Path == "/v1/auth/broker/claim" || turnMetricsRunID(r.URL.Path) != "" || surfaceContextResultID(r.URL.Path) != "" || r.URL.Path == "/v1/files/upload" || r.URL.Path == "/v1/connectors/catalog" || r.URL.Path == "/v1/connectors/oauth/status" || r.Method == http.MethodPost && r.URL.Path == "/v1/crons" || strings.HasPrefix(r.URL.Path, "/v1/principals/") || strings.HasPrefix(r.URL.Path, "/v1/surface-cache/") || strings.HasPrefix(r.URL.Path, "/v1/contexts/") {
+	if r.URL.Path == "/v1/directory" || r.URL.Path == "/v1/directory/meta" || r.URL.Path == "/v1/runs" || r.URL.Path == "/v1/turns" || runRecordID(r.URL.Path) != "" || r.URL.Path == "/v1/approvals/pending" || approvalID(r.URL.Path) != "" || r.URL.Path == "/v1/contexts" || r.URL.Path == "/v1/scope-resources" || r.URL.Path == "/v1/skills" || r.URL.Path == "/v1/grants" || r.URL.Path == "/v1/grants/revoke" || r.URL.Path == "/v1/session-cap" || r.URL.Path == "/v1/memory" || r.URL.Path == "/v1/sessions" || sessionBackgroundID(r.URL.Path) != "" || sessionApprovalsID(r.URL.Path) != "" || sessionEntryPath(r.URL.Path) || sessionID(r.URL.Path) != "" || runDeliveryStateID(r.URL.Path) != "" || runSignalID(r.URL.Path) != "" || r.URL.Path == "/v1/deliveries" || r.URL.Path == "/v1/deliveries/ack-by-key" || deliveryAckID(r.URL.Path) != "" || r.URL.Path == "/v1/egress-audit" || r.URL.Path == "/v1/auth/broker/claim" || turnMetricsRunID(r.URL.Path) != "" || surfaceContextResultID(r.URL.Path) != "" || r.URL.Path == "/v1/surface-context/pending" || r.URL.Path == "/v1/files/upload" || r.URL.Path == "/v1/connectors/catalog" || r.URL.Path == "/v1/connectors/oauth/status" || projectKnowledgeDocumentID(r.URL.Path) != "" || r.Method == http.MethodPost && r.URL.Path == "/v1/crons" || strings.HasPrefix(r.URL.Path, "/v1/principals/") || strings.HasPrefix(r.URL.Path, "/v1/surface-cache/") || strings.HasPrefix(r.URL.Path, "/v1/contexts/") {
 		routeAuth = "source"
 	}
 	identity, err := h.auth.Authenticate(r.Context(), r, body, routeAuth)
@@ -728,6 +837,20 @@ func (h *HTTPServer) serveOwned(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/admin/onboarding":
+		h.adminOnboarding(w, r, identity)
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/admin/model-providers":
+		h.adminModelProviders(w, r, identity)
+	case (r.Method == http.MethodPut || r.Method == http.MethodDelete) && strings.HasPrefix(r.URL.Path, "/v1/admin/model-providers/"):
+		h.yamlManaged(w, r, identity, "qm.models")
+	case (r.Method == http.MethodPut || r.Method == http.MethodDelete) && strings.HasPrefix(r.URL.Path, "/v1/admin/custom-providers/"):
+		h.yamlManaged(w, r, identity, "qm.models.providers")
+	case (r.Method == http.MethodPut || r.Method == http.MethodDelete) && r.URL.Path == "/v1/admin/slack-installation":
+		h.yamlManaged(w, r, identity, "qm.slack")
+	case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/base-model") && strings.HasPrefix(r.URL.Path, "/v1/admin/scopes/"):
+		h.yamlManaged(w, r, identity, "qm.models.harnesses")
+	case r.Method == http.MethodPut && strings.HasSuffix(r.URL.Path, "/connectors") && strings.HasPrefix(r.URL.Path, "/v1/admin/scopes/"):
+		h.yamlManaged(w, r, identity, "qm.oauth.clients")
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/apis":
 		h.listAgentAPIs(w, r, identity)
 	case r.Method == http.MethodGet && keychainReadPath(r.URL.Path):
@@ -784,6 +907,14 @@ func (h *HTTPServer) serveOwned(w http.ResponseWriter, r *http.Request) {
 		h.sessionApprovals(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/projects":
 		h.listProjects(w, r, identity)
+	case r.Method == http.MethodGet && projectKnowledgeDocumentID(r.URL.Path) != "":
+		h.openProjectKnowledgeDocument(w, r, identity)
+	case r.Method == http.MethodPost && projectFileCollectionID(r.URL.Path) != "":
+		h.attachProjectFile(w, r, body, identity)
+	case r.Method == http.MethodDelete && func() bool { _, fileID := projectFileID(r.URL.Path); return fileID != "" }():
+		h.removeProjectFile(w, r, body, identity)
+	case r.Method == http.MethodPost && func() bool { _, fileID := projectFileRetryID(r.URL.Path); return fileID != "" }():
+		h.retryProjectFile(w, r, body, identity)
 	case r.Method == http.MethodGet && conversationID(r.URL.Path) != "":
 		h.agentConversation(w, r, identity)
 	case r.Method == http.MethodPost && conversationID(r.URL.Path) != "":
@@ -796,6 +927,10 @@ func (h *HTTPServer) serveOwned(w http.ResponseWriter, r *http.Request) {
 		h.patchViewerSession(w, r, body)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/runs":
 		h.activeRunForThread(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/turns":
+		h.postAgentTurn(w, r, body, identity)
+	case r.Method == http.MethodGet && runRecordID(r.URL.Path) != "":
+		h.getAgentRun(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/contexts":
 		h.listContexts(w, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/scope-resources":
@@ -890,6 +1025,12 @@ func (h *HTTPServer) serveOwned(w http.ResponseWriter, r *http.Request) {
 		h.getContextPolicy(w, r)
 	case r.Method == http.MethodPut && r.URL.Path == "/v1/contexts/policy":
 		h.setContextPolicy(w, r, body)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/surface-context":
+		h.createSurfaceContext(w, r, body, identity)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/surface-file":
+		h.createSurfaceFile(w, r, body, identity)
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/surface-context/pending":
+		h.pendingSurfaceContext(w, r)
 	case r.Method == http.MethodPost && surfaceContextResultID(r.URL.Path) != "":
 		h.fulfillSurfaceContext(w, r, body)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/directory":
@@ -1798,7 +1939,7 @@ func (h *HTTPServer) downloadAdminFile(w http.ResponseWriter, r *http.Request, i
 	if !inline {
 		mimetype = "application/octet-stream"
 	}
-	w.Header().Set("content-type", mimetype)
+	w.Header().Set("content-type", browserFileContentType(mimetype))
 	w.Header().Set("content-length", strconv.FormatInt(size, 10))
 	w.Header().Set("content-disposition", adminContentDisposition(file.Name, inline))
 	w.Header().Set("x-content-type-options", "nosniff")
@@ -3875,10 +4016,13 @@ func (h *HTTPServer) adminCustomProviders(w http.ResponseWriter, r *http.Request
 	if !ok {
 		return
 	}
-	providers, _, err := h.customProviders.Statuses(r.Context())
-	if err != nil {
-		h.fail(w, err)
-		return
+	providers := make([]map[string]any, 0)
+	for _, provider := range safeModelProviders(h.config.QM.Models) {
+		if provider["protocol"] == "mock" {
+			continue
+		}
+		provider["hasKey"] = provider["configured"]
+		providers = append(providers, provider)
 	}
 	scope := "org:" + h.config.QM.OrgID
 	if err := h.audit.Record(r.Context(), data.AuditEvent{PrincipalID: actor, Action: "custom-providers.read", Resource: "custom-providers", ScopeLabel: scope, IdempotencyKey: requestID(r)}); err != nil {
@@ -3898,39 +4042,16 @@ func (h *HTTPServer) adminSlackInstallation(w http.ResponseWriter, r *http.Reque
 		h.fail(w, err)
 		return
 	}
-	status, err := h.slackInstallation.Status(r.Context(), h.config.QM.OrgID)
-	if err != nil {
-		h.fail(w, err)
-		return
+	configured := strings.TrimSpace(h.config.QM.Slack.BotToken) != "" && strings.TrimSpace(h.config.QM.Slack.AppToken) != ""
+	response := map[string]any{
+		"createUrl": slackManifestCreationURL(), "configured": configured, "managed": true,
+		"source": "yaml", "configPath": "qm.slack",
 	}
-	response := map[string]any{"createUrl": slackManifestCreationURL()}
-	if status != nil {
-		response["configured"], response["managed"], response["source"] = status.Configured, status.Managed, "admin"
-		if status.TeamID != "" {
-			response["teamId"] = status.TeamID
-		}
-		if status.TeamName != "" {
-			response["teamName"] = status.TeamName
-		}
-		if status.UpdatedAt != nil {
-			response["updatedAt"] = *status.UpdatedAt
-		}
-		if status.UpdatedBy != "" {
-			response["updatedBy"] = status.UpdatedBy
-		}
-		if status.Version != "" {
-			response["version"] = status.Version
-		}
-		writeJSON(w, http.StatusOK, response)
-		return
+	if h.config.QM.Slack.TeamID != "" {
+		response["teamId"] = h.config.QM.Slack.TeamID
 	}
-	switch h.config.QM.SlackEnvironmentState {
-	case "configured":
-		response["configured"], response["managed"], response["source"] = true, false, "environment"
-	case "partial":
-		response["configured"], response["managed"], response["source"] = false, false, "invalid_environment"
-	default:
-		response["configured"], response["managed"], response["source"] = false, false, "none"
+	if h.config.QM.Slack.TeamName != "" {
+		response["teamName"] = h.config.QM.Slack.TeamName
 	}
 	writeJSON(w, http.StatusOK, response)
 }
@@ -5223,7 +5344,15 @@ func (h *HTTPServer) listScopeResources(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_request", "message": "scope required"})
 		return
 	}
-	visible, err := h.canAccessResourceScope(r.Context(), principalID, scopeID)
+	projectMember, projectOwner, err := h.projectResourceAccess(r.Context(), principalID, scopeID)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	visible := projectMember
+	if !projectMember {
+		visible, err = h.canAccessResourceScope(r.Context(), principalID, scopeID)
+	}
 	if err != nil {
 		h.fail(w, err)
 		return
@@ -5236,6 +5365,9 @@ func (h *HTTPServer) listScopeResources(w http.ResponseWriter, r *http.Request) 
 	if err != nil {
 		h.fail(w, err)
 		return
+	}
+	if projectMember {
+		resourceScopes = appendUniqueStrings(resourceScopes, "personal:"+principalID, scopeID)
 	}
 	owned, err := h.files.ListOwnedInScope(r.Context(), resourceScopes, scopeID)
 	if err != nil {
@@ -5308,29 +5440,190 @@ func (h *HTTPServer) listScopeResources(w http.ResponseWriter, r *http.Request) 
 			skillViews = append(skillViews, map[string]any{"id": skill.ID, "name": skill.Manifest.Name, "description": skill.Manifest.Description, "status": skill.Status})
 		}
 	}
-	manageable, err := h.canManageResourceScope(r.Context(), principalID, scopeID)
+	manageable := projectOwner
+	if !projectMember {
+		manageable, err = h.canManageResourceScope(r.Context(), principalID, scopeID)
+	}
 	if err != nil {
 		h.fail(w, err)
 		return
 	}
 	fileViews := make([]map[string]any, 0, len(files))
+	memberships := h.projectFileMemberships(r.Context(), scopeID)
 	for _, file := range files {
-		view := map[string]any{"id": file.ID, "ownerScopeId": file.OwnerScopeID, "name": file.Name, "mimetype": file.Mimetype, "sizeBytes": file.SizeBytes, "direction": file.Direction, "createdAt": file.CreatedAt, "openable": file.BlobKey != nil}
-		if file.CreatedInScope != nil {
-			view["createdInScope"] = *file.CreatedInScope
+		view := fileListView(file)
+		if membership, ok := memberships[file.ID]; ok {
+			view["projectFile"] = membership
 		}
 		fileViews = append(fileViews, view)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"files": fileViews, "crons": cronViews, "deployments": deploymentViews, "skills": skillViews, "manageable": manageable})
+	response := map[string]any{"files": fileViews, "crons": cronViews, "deployments": deploymentViews, "skills": skillViews, "manageable": manageable}
+	if projectID := projectIDFromScope(scopeID); projectID != "" && h.knowledgeAgent != nil && h.projectRepo != nil {
+		project, lookupErr := h.projectRepo.Get(r.Context(), projectID)
+		if lookupErr != nil {
+			h.fail(w, lookupErr)
+			return
+		}
+		if project != nil {
+			status, statusErr := h.knowledgeAgent.Status(knowlega.ScopeRef{OrgID: project.OrgID, ExternalScopeID: scopeID, Kind: "project", Name: project.Name})
+			if statusErr == nil {
+				response["knowledge"] = projectKnowledgeStatusView(status)
+			} else {
+				response["knowledge"] = map[string]any{"status": "failed", "ready": false, "lastError": statusErr.Error()}
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func projectKnowledgeStatusView(status knowlega.ScopeStatus) map[string]any {
+	state := strings.TrimSpace(status.State)
+	if state == "" {
+		if status.Ready {
+			state = agentservice.KnowledgeWorkspaceReady
+		} else {
+			state = agentservice.KnowledgeWorkspaceEmpty
+		}
+	}
+	view := map[string]any{
+		"status": state, "ready": status.Ready, "sourceCount": status.SourceCount, "wikiPageCount": status.WikiPageCount,
+		"queue": map[string]int{"pending": status.Queue.Pending, "processing": status.Queue.Processing, "done": status.Queue.Done, "failed": status.Queue.Failed, "total": status.Queue.Total},
+	}
+	if strings.TrimSpace(status.LastError) != "" {
+		view["lastError"] = status.LastError
+	}
+	if status.LastSuccessfulAt != nil {
+		view["lastSuccessfulAt"] = status.LastSuccessfulAt.UTC().Format(time.RFC3339Nano)
+	}
+	return view
+}
+
+func (h *HTTPServer) projectResourceAccess(ctx context.Context, principalID, scopeID string) (member, owner bool, err error) {
+	const prefix = "group:web-project-"
+	if h.projectRepo == nil || !strings.HasPrefix(scopeID, prefix) {
+		return false, false, nil
+	}
+	project, err := h.projectRepo.Get(ctx, strings.TrimPrefix(scopeID, prefix))
+	if err != nil || project == nil {
+		return false, false, err
+	}
+	for _, candidate := range project.MemberIDs {
+		if sameSoulPerson(candidate, principalID) {
+			member = true
+			break
+		}
+	}
+	return member, member && sameSoulPerson(project.OwnerID, principalID), nil
+}
+
+func (h *HTTPServer) openProjectKnowledgeDocument(w http.ResponseWriter, r *http.Request, identity auth.Identity) {
+	projectID := projectKnowledgeDocumentID(r.URL.Path)
+	principalID, ok := capabilityPrincipal(w, identity, strings.TrimSpace(r.URL.Query().Get("viewer")))
+	if !ok {
+		return
+	}
+	if principalID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_request", "message": "viewer required"})
+		return
+	}
+	path := strings.TrimSpace(r.URL.Query().Get("path"))
+	if path == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_request", "message": "path required"})
+		return
+	}
+	if h.knowledgeAgent == nil || h.projectRepo == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "knowledge_unavailable"})
+		return
+	}
+	project, err := h.projectRepo.Get(r.Context(), projectID)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	if project == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		return
+	}
+	member, _, err := h.projectResourceAccess(r.Context(), principalID, biz.ProjectScopeID(projectID))
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	if !member {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		return
+	}
+	document, err := h.knowledgeAgent.Read(knowlega.ScopeRef{OrgID: project.OrgID, ExternalScopeID: biz.ProjectScopeID(project.ID), Kind: "project", Name: project.Name}, path)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		return
+	}
+	response := map[string]any{"path": document.Path, "title": document.Title, "kind": document.Kind, "content": document.Content}
+	if h.projectFiles != nil {
+		memberships, listErr := h.projectFiles.ListByProject(r.Context(), projectID)
+		if listErr != nil {
+			h.fail(w, listErr)
+			return
+		}
+		for _, membership := range memberships {
+			if membership.RawPath != nil && *membership.RawPath == document.Path {
+				response["qmFileId"] = membership.FileID
+				break
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func appendUniqueStrings(values []string, additions ...string) []string {
+	seen := make(map[string]bool, len(values)+len(additions))
+	for _, value := range values {
+		seen[value] = true
+	}
+	for _, value := range additions {
+		if value != "" && !seen[value] {
+			values = append(values, value)
+			seen[value] = true
+		}
+	}
+	return values
 }
 
 // listFilesForCapability is the Go projection of Node's GET /v1/files route.
 // It returns metadata only; the configured Node durable-byte-store continues to
 // own byte streaming at /v1/files/:id/content and upload handling.
 func (h *HTTPServer) listFilesForCapability(w http.ResponseWriter, r *http.Request, identity auth.Identity) {
-	principalID := strings.TrimSpace(identity.ActorID)
+	principalID := firstNonEmpty(strings.TrimSpace(identity.ActorID), strings.TrimSpace(r.URL.Query().Get("viewer")))
 	if principalID == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "capability_required"})
+		return
+	}
+	createdInScope := strings.TrimSpace(r.URL.Query().Get("scope"))
+	if projectID := projectIDFromScope(createdInScope); projectID != "" {
+		allowed, err := h.canAccessResourceScope(r.Context(), principalID, createdInScope)
+		if err != nil {
+			h.fail(w, err)
+			return
+		}
+		if !allowed {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+			return
+		}
+		files, err := h.files.ListForProject(r.Context(), projectID, fileListLimit(r.URL.Query().Get("limit")))
+		if err != nil {
+			h.fail(w, err)
+			return
+		}
+		memberships := h.projectFileMemberships(r.Context(), createdInScope)
+		views := make([]map[string]any, 0, len(files))
+		for _, file := range files {
+			view := fileListView(file)
+			if membership, ok := memberships[file.ID]; ok {
+				view["projectFile"] = membership
+			}
+			views = append(views, view)
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"owned": views, "shared": []any{}})
 		return
 	}
 	scopes, err := h.resourceScopesForPrincipal(r.Context(), principalID)
@@ -5363,7 +5656,7 @@ func (h *HTTPServer) listFilesForCapability(w http.ResponseWriter, r *http.Reque
 	for _, scope := range scopes {
 		ownedScopes[scope] = true
 	}
-	createdInScope := strings.TrimSpace(r.URL.Query().Get("scope"))
+	memberships := h.projectFileMemberships(r.Context(), createdInScope)
 	shared := make([]data.FileArtifact, 0, len(sharedRows))
 	for _, file := range sharedRows {
 		if ownedScopes[file.OwnerScopeID] || createdInScope != "" && (file.CreatedInScope == nil || *file.CreatedInScope != createdInScope) {
@@ -5374,11 +5667,19 @@ func (h *HTTPServer) listFilesForCapability(w http.ResponseWriter, r *http.Reque
 	sort.SliceStable(shared, func(i, j int) bool { return shared[i].UpdatedAt > shared[j].UpdatedAt })
 	ownedViews := make([]map[string]any, 0, len(page.Files))
 	for _, file := range page.Files {
-		ownedViews = append(ownedViews, fileListView(file))
+		view := fileListView(file)
+		if membership, ok := memberships[file.ID]; ok {
+			view["projectFile"] = membership
+		}
+		ownedViews = append(ownedViews, view)
 	}
 	sharedViews := make([]map[string]any, 0, len(shared))
 	for _, file := range shared {
-		sharedViews = append(sharedViews, fileListView(file))
+		view := fileListView(file)
+		if membership, ok := memberships[file.ID]; ok {
+			view["projectFile"] = membership
+		}
+		sharedViews = append(sharedViews, view)
 	}
 	response := map[string]any{"owned": ownedViews, "shared": sharedViews}
 	if page.NextCursor != "" {
@@ -5387,11 +5688,12 @@ func (h *HTTPServer) listFilesForCapability(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, response)
 }
 
-// openFileForCapability serves Node's local docstore layout after applying the
-// same owner-scope or ACL-handle check as openFileForViewer. The route is only
-// reached when qm.file_store.mode is explicitly configured as local.
+// openFileForCapability serves the configured local docstore after applying an
+// owner-scope or ACL-handle check. Source-authenticated Web UI requests may use
+// the QM project membership persisted in the project document while the legacy
+// directory projection is still being retired.
 func (h *HTTPServer) openFileForCapability(w http.ResponseWriter, r *http.Request, identity auth.Identity) {
-	principalID := strings.TrimSpace(identity.ActorID)
+	principalID := firstNonEmpty(strings.TrimSpace(identity.ActorID), strings.TrimSpace(r.URL.Query().Get("viewer")))
 	if principalID == "" {
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "capability_required"})
 		return
@@ -5409,6 +5711,17 @@ func (h *HTTPServer) openFileForCapability(w http.ResponseWriter, r *http.Reques
 	if err != nil {
 		h.fail(w, err)
 		return
+	}
+	if file.CreatedInScope != nil {
+		projectScope := strings.TrimSpace(*file.CreatedInScope)
+		member, _, err := h.projectResourceAccess(r.Context(), principalID, projectScope)
+		if err != nil {
+			h.fail(w, err)
+			return
+		}
+		if member {
+			scopes = appendUniqueStrings(scopes, "personal:"+principalID, projectScope)
+		}
 	}
 	allowed := false
 	for _, scope := range scopes {
@@ -5449,15 +5762,23 @@ func (h *HTTPServer) openFileForCapability(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	defer content.Close()
-	mimetype := strings.TrimSpace(file.Mimetype)
-	if mimetype == "" {
-		mimetype = "application/octet-stream"
-	}
-	w.Header().Set("content-type", mimetype)
+	w.Header().Set("content-type", browserFileContentType(file.Mimetype))
 	w.Header().Set("content-length", strconv.FormatInt(size, 10))
 	w.Header().Set("content-disposition", "inline; filename*=UTF-8''"+url.PathEscape(file.Name))
 	w.WriteHeader(http.StatusOK)
 	_, _ = io.Copy(w, content)
+}
+
+func browserFileContentType(value string) string {
+	contentType := strings.TrimSpace(value)
+	if contentType == "" {
+		return "application/octet-stream"
+	}
+	baseType := strings.ToLower(strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0]))
+	if strings.HasPrefix(baseType, "text/") && !strings.Contains(strings.ToLower(contentType), "charset=") {
+		return contentType + "; charset=utf-8"
+	}
+	return contentType
 }
 
 const maxBlobTransferBytes int64 = 1_000_000_000
@@ -5618,6 +5939,7 @@ func (h *HTTPServer) uploadFileFromLocalTransfer(w http.ResponseWriter, r *http.
 		Mimetype:       mimetype,
 		SizeBytes:      size,
 		BlobKey:        &blobKey,
+		SHA256:         strings.TrimPrefix(blobKey, "files/"),
 		Direction:      "in",
 		CreatedInScope: &createdInScope,
 		CreatedAt:      createdAt,
@@ -5635,47 +5957,379 @@ func (h *HTTPServer) uploadFileFromLocalTransfer(w http.ResponseWriter, r *http.
 	}
 	// Node records this audit event best-effort after the durable artifact write.
 	_ = h.audit.Record(r.Context(), data.AuditEvent{PrincipalID: principalID, Action: "file.upload", Resource: file.Path, ScopeLabel: createdScope, IdempotencyKey: requestID(r)})
-	h.enqueueKnowledgeFile(r.Context(), *file, createdScope, principalID)
-	writeJSON(w, http.StatusOK, map[string]any{"file": fileListView(*file)})
+	membership := h.enqueueKnowledgeFile(r.Context(), *file, createdScope, principalID)
+	response := map[string]any{"file": fileListView(*file)}
+	if membership != nil {
+		response["projectFile"] = membership
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 const knowledgeFileMaxBytes = 32 << 20
 
-func (h *HTTPServer) enqueueKnowledgeFile(ctx context.Context, file data.FileArtifact, scopeID, actor string) {
-	if h.knowledgeAgent == nil || file.BlobKey == nil {
-		return
+func (h *HTTPServer) enqueueKnowledgeFile(ctx context.Context, file data.FileArtifact, scopeID, actor string) *data.ProjectFileMembership {
+	const projectScopePrefix = "group:web-project-"
+	if h.knowledgeAgent == nil || h.projectFiles == nil || file.BlobKey == nil || !strings.HasPrefix(scopeID, projectScopePrefix) {
+		return nil
 	}
-	kind, external := splitScopeID(scopeID)
-	if kind == "" || external == "" {
-		_ = h.audit.Record(ctx, data.AuditEvent{PrincipalID: actor, Action: "knowledge.file.enqueue_failed", Resource: file.Path, ScopeLabel: scopeID, Detail: "unsupported source scope"})
-		return
+	projectID := strings.TrimPrefix(scopeID, projectScopePrefix)
+	projectName := ""
+	if h.projectRepo != nil {
+		project, lookupErr := h.projectRepo.Get(ctx, projectID)
+		if lookupErr != nil {
+			_ = h.audit.Record(ctx, data.AuditEvent{PrincipalID: actor, Action: "project.file.enqueue_failed", Resource: file.Path, ScopeLabel: scopeID, Detail: lookupErr.Error()})
+			return nil
+		}
+		if project != nil {
+			projectName = project.Name
+		}
+	}
+	ref := knowlega.ScopeRef{OrgID: h.config.QM.OrgID, ExternalScopeID: scopeID, Kind: "project", Name: projectName}
+	status, err := h.knowledgeAgent.EnsureScope(ctx, ref)
+	if err != nil {
+		_ = h.audit.Record(ctx, data.AuditEvent{PrincipalID: actor, Action: "project.file.enqueue_failed", Resource: file.Path, ScopeLabel: scopeID, Detail: err.Error()})
+		return nil
+	}
+	if err := h.persistKnowledgeScope(ctx, ref, status); err != nil {
+		_ = h.audit.Record(ctx, data.AuditEvent{PrincipalID: actor, Action: "project.file.enqueue_failed", Resource: file.Path, ScopeLabel: scopeID, Detail: err.Error()})
+		return nil
+	}
+	defer func() {
+		if err := h.refreshKnowledgeScope(ctx, ref); err != nil {
+			_ = h.audit.Record(ctx, data.AuditEvent{PrincipalID: actor, Action: "project.knowledge.status_refresh_failed", Resource: file.Path, ScopeLabel: scopeID, Detail: err.Error()})
+		}
+	}()
+	sha := strings.TrimSpace(file.SHA256)
+	if sha == "" {
+		sha = strings.TrimPrefix(*file.BlobKey, "files/")
+	}
+	membership, err := h.projectFiles.PutQueued(ctx, data.ProjectFileMembership{ProjectID: projectID, ProjectScopeID: scopeID, FileID: file.ID, KnowledgeProjectID: status.ProjectID, SourceSHA256: sha})
+	if err != nil {
+		_ = h.audit.Record(ctx, data.AuditEvent{PrincipalID: actor, Action: "project.file.enqueue_failed", Resource: file.Path, ScopeLabel: scopeID, Detail: err.Error()})
+		return nil
+	}
+	if !supportedKnowledgeFile(file.Name) {
+		detail := "supported knowledge file extensions are .txt, .md, .pdf, and .docx"
+		_ = h.projectFiles.SetState(ctx, projectID, file.ID, "unsupported", nil, nil, 0, &detail)
+		membership.Status = "unsupported"
+		membership.LastError = &detail
+		return &membership
 	}
 	content, size, err := data.OpenLocalFileBlob(h.config.QM.FileStore.LocalDir, *file.BlobKey)
 	if err != nil || content == nil {
 		if err == nil {
 			err = errors.New("file blob not found")
 		}
-		_ = h.audit.Record(ctx, data.AuditEvent{PrincipalID: actor, Action: "knowledge.file.enqueue_failed", Resource: file.Path, ScopeLabel: scopeID, Detail: err.Error()})
-		return
+		_ = h.projectFiles.SetState(ctx, projectID, file.ID, "failed", nil, nil, 0, stringPointer(err.Error()))
+		_ = h.audit.Record(ctx, data.AuditEvent{PrincipalID: actor, Action: "project.file.enqueue_failed", Resource: file.Path, ScopeLabel: scopeID, Detail: err.Error()})
+		membership.Status = "failed"
+		membership.LastError = stringPointer(err.Error())
+		return &membership
 	}
 	defer content.Close()
 	if size > knowledgeFileMaxBytes {
-		_ = h.audit.Record(ctx, data.AuditEvent{PrincipalID: actor, Action: "knowledge.file.enqueue_skipped", Resource: file.Path, ScopeLabel: scopeID, Detail: "file exceeds knowledge ingestion limit"})
-		return
+		detail := "file exceeds knowledge ingestion limit"
+		_ = h.projectFiles.SetState(ctx, projectID, file.ID, "failed", nil, nil, 0, &detail)
+		_ = h.audit.Record(ctx, data.AuditEvent{PrincipalID: actor, Action: "project.file.enqueue_failed", Resource: file.Path, ScopeLabel: scopeID, Detail: detail})
+		membership.Status = "failed"
+		membership.LastError = &detail
+		return &membership
 	}
 	dataBytes, err := io.ReadAll(io.LimitReader(content, knowledgeFileMaxBytes+1))
 	if err != nil {
-		_ = h.audit.Record(ctx, data.AuditEvent{PrincipalID: actor, Action: "knowledge.file.enqueue_failed", Resource: file.Path, ScopeLabel: scopeID, Detail: err.Error()})
-		return
+		_ = h.projectFiles.SetState(ctx, projectID, file.ID, "failed", nil, nil, 0, stringPointer(err.Error()))
+		_ = h.audit.Record(ctx, data.AuditEvent{PrincipalID: actor, Action: "project.file.enqueue_failed", Resource: file.Path, ScopeLabel: scopeID, Detail: err.Error()})
+		membership.Status = "failed"
+		membership.LastError = stringPointer(err.Error())
+		return &membership
 	}
 	if int64(len(dataBytes)) > knowledgeFileMaxBytes {
-		_ = h.audit.Record(ctx, data.AuditEvent{PrincipalID: actor, Action: "knowledge.file.enqueue_skipped", Resource: file.Path, ScopeLabel: scopeID, Detail: "file exceeds knowledge ingestion limit"})
+		detail := "file exceeds knowledge ingestion limit"
+		_ = h.projectFiles.SetState(ctx, projectID, file.ID, "failed", nil, nil, 0, &detail)
+		_ = h.audit.Record(ctx, data.AuditEvent{PrincipalID: actor, Action: "project.file.enqueue_failed", Resource: file.Path, ScopeLabel: scopeID, Detail: detail})
+		membership.Status = "failed"
+		membership.LastError = &detail
+		return &membership
+	}
+	task, err := h.knowledgeAgent.EnqueueQMFile(ref, file.ID, file.Name, sha, dataBytes)
+	if err != nil {
+		_ = h.projectFiles.SetState(ctx, projectID, file.ID, "failed", nil, nil, 0, stringPointer(err.Error()))
+		_ = h.audit.Record(ctx, data.AuditEvent{PrincipalID: actor, Action: "project.file.enqueue_failed", Resource: file.Path, ScopeLabel: scopeID, Detail: err.Error()})
+		membership.Status = "failed"
+		membership.LastError = stringPointer(err.Error())
+		return &membership
+	}
+	rawPath, relErr := filepath.Rel(status.ProjectPath, filepath.FromSlash(task.SourcePath))
+	if relErr != nil {
+		rawPath = task.SourcePath
+	}
+	rawPath = filepath.ToSlash(rawPath)
+	_ = h.projectFiles.SetState(ctx, projectID, file.ID, "queued", &rawPath, &task.ID, 0, nil)
+	membership.RawPath = &rawPath
+	membership.QueueTaskID = &task.ID
+	return &membership
+}
+
+func supportedKnowledgeFile(name string) bool {
+	switch strings.ToLower(path.Ext(name)) {
+	case ".txt", ".md", ".pdf", ".docx":
+		return true
+	default:
+		return false
+	}
+}
+
+func stringPointer(value string) *string { return &value }
+
+func (h *HTTPServer) attachProjectFile(w http.ResponseWriter, r *http.Request, raw []byte, identity auth.Identity) {
+	projectID := projectFileCollectionID(r.URL.Path)
+	var input struct {
+		PrincipalID string `json:"principalId"`
+		FileID      string `json:"fileId"`
+	}
+	if !decodeJSON(w, raw, &input) {
 		return
 	}
-	_, err = h.knowledgeAgent.EnqueueBytes(knowlega.ScopeRef{OrgID: h.config.QM.OrgID, ExternalScopeID: external, Kind: kind, Name: file.Name}, file.Name, "file", dataBytes)
-	if err != nil {
-		_ = h.audit.Record(ctx, data.AuditEvent{PrincipalID: actor, Action: "knowledge.file.enqueue_failed", Resource: file.Path, ScopeLabel: scopeID, Detail: err.Error()})
+	principalID := firstNonEmpty(strings.TrimSpace(identity.ActorID), strings.TrimSpace(input.PrincipalID))
+	if principalID == "" || strings.TrimSpace(input.FileID) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_request", "message": "principalId and fileId required"})
+		return
 	}
+	scopeID := biz.ProjectScopeID(projectID)
+	allowed, err := h.canManageResourceScope(r.Context(), principalID, scopeID)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	if !allowed {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		return
+	}
+	file, err := h.files.Get(r.Context(), strings.TrimSpace(input.FileID))
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	if file == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		return
+	}
+	readable, err := h.canReadFile(r.Context(), principalID, *file)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	if !readable {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		return
+	}
+	if file.OwnerScopeID != scopeID {
+		if err := h.acl.Put(r.Context(), data.Grant{OwnerScopeID: file.OwnerScopeID, Path: file.Path, GranteeScopeID: scopeID, Permission: "read", GrantedBy: principalID}); err != nil {
+			h.fail(w, err)
+			return
+		}
+	}
+	membership := h.enqueueKnowledgeFile(r.Context(), *file, scopeID, principalID)
+	if membership == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "not_configured", "message": "project file ingestion is unavailable"})
+		return
+	}
+	_ = h.audit.Record(r.Context(), data.AuditEvent{PrincipalID: principalID, Action: "project.file.attach", Resource: file.Path, ScopeLabel: scopeID, IdempotencyKey: requestID(r)})
+	writeJSON(w, http.StatusAccepted, map[string]any{"file": fileListView(*file), "projectFile": membership})
+}
+
+func (h *HTTPServer) retryProjectFile(w http.ResponseWriter, r *http.Request, raw []byte, identity auth.Identity) {
+	projectID, fileID := projectFileRetryID(r.URL.Path)
+	principalID := projectFilePrincipal(raw, identity)
+	scopeID := biz.ProjectScopeID(projectID)
+	allowed, err := h.canManageResourceScope(r.Context(), principalID, scopeID)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	if principalID == "" || !allowed {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		return
+	}
+	membership, err := h.projectFiles.Find(r.Context(), projectID, fileID)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	file, err := h.files.Get(r.Context(), fileID)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	if membership == nil || file == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		return
+	}
+	updated := h.enqueueKnowledgeFile(r.Context(), *file, scopeID, principalID)
+	if updated == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "not_configured"})
+		return
+	}
+	_ = h.audit.Record(r.Context(), data.AuditEvent{PrincipalID: principalID, Action: "project.file.retry", Resource: file.Path, ScopeLabel: scopeID, IdempotencyKey: requestID(r)})
+	writeJSON(w, http.StatusAccepted, map[string]any{"file": fileListView(*file), "projectFile": updated})
+}
+
+func (h *HTTPServer) removeProjectFile(w http.ResponseWriter, r *http.Request, raw []byte, identity auth.Identity) {
+	projectID, fileID := projectFileID(r.URL.Path)
+	principalID := projectFilePrincipal(raw, identity)
+	scopeID := biz.ProjectScopeID(projectID)
+	allowed, err := h.canManageResourceScope(r.Context(), principalID, scopeID)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	if principalID == "" || !allowed {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		return
+	}
+	membership, err := h.projectFiles.Find(r.Context(), projectID, fileID)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	file, err := h.files.Get(r.Context(), fileID)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	if membership == nil || file == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not_found"})
+		return
+	}
+	projectName := ""
+	if h.projectRepo != nil {
+		project, lookupErr := h.projectRepo.Get(r.Context(), projectID)
+		if lookupErr != nil {
+			h.fail(w, lookupErr)
+			return
+		}
+		if project != nil {
+			projectName = project.Name
+		}
+	}
+	ref := knowlega.ScopeRef{OrgID: h.config.QM.OrgID, ExternalScopeID: scopeID, Kind: "project", Name: projectName}
+	if err := h.projectFiles.SetState(r.Context(), projectID, fileID, "removing", nil, membership.QueueTaskID, membership.GeneratedPageCount, nil); err != nil {
+		h.fail(w, err)
+		return
+	}
+	var cleanup any = map[string]any{}
+	if membership.RawPath != nil && strings.TrimSpace(*membership.RawPath) != "" {
+		taskID := ""
+		if membership.QueueTaskID != nil {
+			taskID = *membership.QueueTaskID
+		}
+		result, err := h.knowledgeAgent.RemoveQMFile(ref, *membership.RawPath, taskID)
+		if err != nil {
+			message := err.Error()
+			_ = h.projectFiles.SetState(r.Context(), projectID, fileID, "failed", membership.RawPath, membership.QueueTaskID, membership.GeneratedPageCount, &message)
+			h.fail(w, err)
+			return
+		}
+		if err := h.knowledgeAgent.SyncWiki(r.Context(), ref); err != nil {
+			message := err.Error()
+			_ = h.projectFiles.SetState(r.Context(), projectID, fileID, "failed", membership.RawPath, membership.QueueTaskID, membership.GeneratedPageCount, &message)
+			h.fail(w, err)
+			return
+		}
+		cleanup = result
+	}
+	if err := h.acl.Revoke(r.Context(), file.OwnerScopeID, file.Path, scopeID); err != nil {
+		message := err.Error()
+		_ = h.projectFiles.SetState(r.Context(), projectID, fileID, "failed", membership.RawPath, membership.QueueTaskID, membership.GeneratedPageCount, &message)
+		h.fail(w, err)
+		return
+	}
+	if err := h.projectFiles.Delete(r.Context(), projectID, fileID); err != nil {
+		h.fail(w, err)
+		return
+	}
+	remaining, err := h.projectFiles.ListByFile(r.Context(), fileID)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	fileDeleted := false
+	if len(remaining) == 0 {
+		if err := h.acl.DeleteResource(r.Context(), file.OwnerScopeID, file.Path); err != nil {
+			h.fail(w, err)
+			return
+		}
+		blobKey := ""
+		if file.BlobKey != nil {
+			blobKey = *file.BlobKey
+		}
+		if err := h.files.Delete(r.Context(), file.ID); err != nil {
+			h.fail(w, err)
+			return
+		}
+		if blobKey != "" {
+			references, err := h.files.CountBlobReferences(r.Context(), blobKey)
+			if err != nil {
+				h.fail(w, err)
+				return
+			}
+			if references == 0 {
+				if err := data.DeleteLocalFileBlob(h.config.QM.FileStore.LocalDir, blobKey); err != nil {
+					h.fail(w, err)
+					return
+				}
+			}
+		}
+		fileDeleted = true
+	}
+	if err := h.refreshKnowledgeScope(r.Context(), ref); err != nil {
+		_ = h.audit.Record(r.Context(), data.AuditEvent{PrincipalID: principalID, Action: "project.knowledge.status_refresh_failed", Resource: file.Path, ScopeLabel: scopeID, Detail: err.Error()})
+	}
+	_ = h.audit.Record(r.Context(), data.AuditEvent{PrincipalID: principalID, Action: "project.file.remove", Resource: file.Path, ScopeLabel: scopeID, IdempotencyKey: requestID(r)})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "fileDeleted": fileDeleted, "cleanup": cleanup})
+}
+
+func projectFilePrincipal(raw []byte, identity auth.Identity) string {
+	if strings.TrimSpace(identity.ActorID) != "" {
+		return strings.TrimSpace(identity.ActorID)
+	}
+	var input struct {
+		PrincipalID string `json:"principalId"`
+	}
+	_ = json.Unmarshal(raw, &input)
+	return strings.TrimSpace(input.PrincipalID)
+}
+
+func (h *HTTPServer) canReadFile(ctx context.Context, principalID string, file data.FileArtifact) (bool, error) {
+	scopes, err := h.resourceScopesForPrincipal(ctx, principalID)
+	if err != nil {
+		return false, err
+	}
+	for _, scopeID := range scopes {
+		if scopeID == file.OwnerScopeID {
+			return true, nil
+		}
+	}
+	grants, err := h.acl.List(ctx, file.OwnerScopeID, file.Path)
+	if err != nil {
+		return false, err
+	}
+	for _, grant := range grants {
+		for _, scopeID := range scopes {
+			if grant.GranteeScopeID == scopeID {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+func projectIDFromScope(scopeID string) string {
+	const prefix = "group:web-project-"
+	if !strings.HasPrefix(scopeID, prefix) {
+		return ""
+	}
+	return strings.TrimPrefix(scopeID, prefix)
 }
 
 func safeUploadFileName(name string) string {
@@ -5726,6 +6380,22 @@ func fileListView(file data.FileArtifact) map[string]any {
 		view["createdInScope"] = *file.CreatedInScope
 	}
 	return view
+}
+
+func (h *HTTPServer) projectFileMemberships(ctx context.Context, scopeID string) map[string]data.ProjectFileMembership {
+	const prefix = "group:web-project-"
+	result := map[string]data.ProjectFileMembership{}
+	if h.projectFiles == nil || !strings.HasPrefix(scopeID, prefix) {
+		return result
+	}
+	items, err := h.projectFiles.ListByProject(ctx, strings.TrimPrefix(scopeID, prefix))
+	if err != nil {
+		return result
+	}
+	for _, item := range items {
+		result[item.FileID] = item
+	}
+	return result
 }
 
 func (h *HTTPServer) resourceScopesForPrincipal(ctx context.Context, principalID string) ([]string, error) {
@@ -7144,7 +7814,19 @@ func (h *HTTPServer) activeRunForThread(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_request", "message": "threadRef required"})
 		return
 	}
-	id, err := h.runs.ActiveForSession(r.Context(), threadRef)
+	session, err := h.sessions.GetByThread(r.Context(), threadRef)
+	if err != nil {
+		h.fail(w, err)
+		return
+	}
+	lookup := threadRef
+	if session != nil {
+		lookup = session.ID
+	}
+	id, err := h.runs.ActiveForSession(r.Context(), lookup)
+	if err == nil && id == "" && lookup != threadRef {
+		id, err = h.runs.ActiveForSession(r.Context(), threadRef)
+	}
 	if err != nil {
 		h.fail(w, err)
 		return
@@ -7596,6 +8278,12 @@ func (h *HTTPServer) signalRun(w http.ResponseWriter, r *http.Request, raw []byt
 	if err != nil {
 		h.fail(w, err)
 		return
+	}
+	if outcome == "accepted" && kind == "abort" && h.runtimeTasks != nil {
+		if _, err := h.runtimeTasks.Cancel(r.Context(), runSignalID(r.URL.Path)); err != nil {
+			h.fail(w, err)
+			return
+		}
 	}
 	switch outcome {
 	case "accepted":
@@ -9023,10 +9711,10 @@ func (h *HTTPServer) fulfillSurfaceContext(w http.ResponseWriter, r *http.Reques
 		}
 		var file struct {
 			BlobID, Name, Mimetype, Author string
-			SizeBytes                      float64
+			SizeBytes                      *float64
 		}
-		if source, ok := body["file"]; ok && json.Unmarshal(source, &file) == nil && file.BlobID != "" && file.Name != "" && file.SizeBytes >= 0 {
-			entry := map[string]any{"blobId": file.BlobID, "name": file.Name, "sizeBytes": file.SizeBytes}
+		if source, ok := body["file"]; ok && json.Unmarshal(source, &file) == nil && file.BlobID != "" && file.Name != "" && file.SizeBytes != nil {
+			entry := map[string]any{"blobId": file.BlobID, "name": file.Name, "sizeBytes": *file.SizeBytes}
 			if file.Mimetype != "" {
 				entry["mimetype"] = file.Mimetype
 			}
@@ -9253,9 +9941,41 @@ func (h *HTTPServer) ensureProjectKnowledge(ctx context.Context, project biz.Pro
 	if h.knowledgeAgent == nil {
 		return
 	}
-	if _, err := h.knowledgeAgent.EnsureScope(ctx, knowlega.ScopeRef{OrgID: project.OrgID, ExternalScopeID: biz.ProjectScopeID(project.ID), Kind: "project", Name: project.Name}); err != nil {
+	ref := knowlega.ScopeRef{OrgID: project.OrgID, ExternalScopeID: biz.ProjectScopeID(project.ID), Kind: "project", Name: project.Name}
+	status, err := h.knowledgeAgent.EnsureScope(ctx, ref)
+	if err == nil {
+		err = h.persistKnowledgeScope(ctx, ref, status)
+	}
+	if err != nil {
 		_ = h.audit.Record(ctx, data.AuditEvent{PrincipalID: actor, Action: "project.knowledge.ensure_failed", Resource: project.ID, ScopeLabel: biz.ProjectScopeID(project.ID), Detail: err.Error()})
 	}
+}
+
+func (h *HTTPServer) persistKnowledgeScope(ctx context.Context, ref knowlega.ScopeRef, status knowlega.ScopeStatus) error {
+	if h.knowledgeScopes == nil {
+		return nil
+	}
+	_, err := h.knowledgeScopes.Ensure(ctx, data.KnowledgeScope{
+		OrgID:           ref.OrgID,
+		ExternalScopeID: ref.ExternalScopeID,
+		Kind:            ref.Kind,
+		ProjectID:       status.ProjectID,
+		ProjectName:     ref.Name,
+		RootPath:        status.ProjectPath,
+		Status:          status.State,
+	})
+	return err
+}
+
+func (h *HTTPServer) refreshKnowledgeScope(ctx context.Context, ref knowlega.ScopeRef) error {
+	if h.knowledgeAgent == nil {
+		return nil
+	}
+	status, err := h.knowledgeAgent.RefreshScope(ctx, ref)
+	if err != nil {
+		return err
+	}
+	return h.persistKnowledgeScope(ctx, ref, status)
 }
 
 func (h *HTTPServer) fail(w http.ResponseWriter, err error) {
@@ -9296,6 +10016,38 @@ func projectMemberCollectionID(path string) string {
 func projectMemberID(path string) (string, string) {
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	if len(parts) != 5 || parts[0] != "v1" || parts[1] != "projects" || parts[2] == "" || parts[3] != "members" || parts[4] == "" {
+		return "", ""
+	}
+	return parts[2], parts[4]
+}
+
+func projectFileCollectionID(value string) string {
+	parts := strings.Split(strings.Trim(value, "/"), "/")
+	if len(parts) != 4 || parts[0] != "v1" || parts[1] != "projects" || parts[2] == "" || parts[3] != "files" {
+		return ""
+	}
+	return parts[2]
+}
+
+func projectKnowledgeDocumentID(value string) string {
+	parts := strings.Split(strings.Trim(value, "/"), "/")
+	if len(parts) != 5 || parts[0] != "v1" || parts[1] != "projects" || parts[2] == "" || parts[3] != "knowledge" || parts[4] != "documents" {
+		return ""
+	}
+	return parts[2]
+}
+
+func projectFileID(value string) (string, string) {
+	parts := strings.Split(strings.Trim(value, "/"), "/")
+	if len(parts) != 5 || parts[0] != "v1" || parts[1] != "projects" || parts[2] == "" || parts[3] != "files" || parts[4] == "" {
+		return "", ""
+	}
+	return parts[2], parts[4]
+}
+
+func projectFileRetryID(value string) (string, string) {
+	parts := strings.Split(strings.Trim(value, "/"), "/")
+	if len(parts) != 6 || parts[0] != "v1" || parts[1] != "projects" || parts[2] == "" || parts[3] != "files" || parts[4] == "" || parts[5] != "retry" {
 		return "", ""
 	}
 	return parts[2], parts[4]
@@ -9374,6 +10126,14 @@ func runDeliveryStateID(path string) string {
 func runSignalID(path string) string {
 	parts := strings.Split(strings.Trim(path, "/"), "/")
 	if len(parts) != 4 || parts[0] != "v1" || parts[1] != "runs" || parts[2] == "" || parts[3] != "signal" {
+		return ""
+	}
+	return parts[2]
+}
+
+func runRecordID(path string) string {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) != 3 || parts[0] != "v1" || parts[1] != "runs" || parts[2] == "" {
 		return ""
 	}
 	return parts[2]

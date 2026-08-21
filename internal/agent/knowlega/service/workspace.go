@@ -27,9 +27,14 @@ type WorkspaceStatus struct {
 	OK                  bool                  `json:"ok"`
 	Service             string                `json:"service"`
 	Time                string                `json:"time"`
+	Status              string                `json:"status"`
 	ProjectPath         string                `json:"project_path"`
 	ProjectID           string                `json:"project_id"`
 	Agent               string                `json:"agent"`
+	SourceCount         int64                 `json:"source_count"`
+	WikiPageCount       int64                 `json:"wiki_page_count"`
+	LastError           string                `json:"last_error,omitempty"`
+	LastSuccessfulAt    *time.Time            `json:"last_successful_at,omitempty"`
 	Files               []WorkspaceFileStatus `json:"files"`
 	Queue               WorkspaceQueueStatus  `json:"queue"`
 	Reviews             WorkspaceReviewStatus `json:"reviews"`
@@ -74,7 +79,8 @@ type MaintainWikiOptions struct {
 	RunLLMReview      bool
 	ReviewAgent       WikiReviewAgent
 	ReviewAgentError  error
-	SweepAgent        QueryAgent
+	SweepAgent        MaintenanceSynthesisAgent
+	RefreshOverview   func() (bool, error)
 	RunPGSync         bool
 	WikiStore         WikiPageStore
 	EmbeddingProvider EmbeddingProvider
@@ -147,6 +153,7 @@ func WorkspaceStatusForProject(opts WorkspaceStatusOptions) (WorkspaceStatus, er
 		EmbeddingConfigured: opts.EmbeddingConfigured,
 	}
 	if projectPath == "" {
+		status.Status = KnowledgeWorkspaceFailed
 		status.Lint.Error = "project path is required"
 		return status, nil
 	}
@@ -157,11 +164,21 @@ func WorkspaceStatusForProject(opts WorkspaceStatusOptions) (WorkspaceStatus, er
 			status.OK = false
 		}
 	}
-	queue, err := LoadIngestQueue(projectPath)
+	workspaceState, err := InspectKnowledgeWorkspace(projectPath)
 	if err != nil {
 		status.OK = false
+		status.Status = KnowledgeWorkspaceFailed
+		status.LastError = err.Error()
 	} else {
-		status.Queue = queueStatus(queue)
+		status.Status = workspaceState.Status
+		status.SourceCount = workspaceState.SourceCount
+		status.WikiPageCount = workspaceState.WikiPageCount
+		status.Queue = workspaceState.Queue
+		status.LastError = workspaceState.LastError
+		status.LastSuccessfulAt = workspaceState.LastSuccessfulAt
+		if workspaceState.Status == KnowledgeWorkspaceFailed {
+			status.OK = false
+		}
 	}
 	reviews, err := wiki.ScanReviewItems(wiki.ScanOptions{ProjectPath: projectPath, ProjectID: firstNonEmptyString(opts.ProjectID, "local")})
 	if err != nil {
@@ -193,6 +210,23 @@ func MaintainWiki(opts MaintainWikiOptions) (result MaintainWikiResult, err erro
 	defer func() {
 		result.FinishedAt = time.Now().UTC()
 	}()
+	if err := beginKnowledgeMaintenance(opts.ProjectPath); err != nil {
+		result.Status = "failed"
+		return result, err
+	}
+	defer func() {
+		success := err == nil && result.Status != "failed"
+		message := ""
+		if err != nil {
+			message = err.Error()
+		} else if !success {
+			message = firstFailedStepError(result)
+		}
+		if stateErr := finishKnowledgeMaintenance(opts.ProjectPath, success, message); stateErr != nil && err == nil {
+			result.Status = "failed"
+			err = stateErr
+		}
+	}()
 
 	addStep := func(step MaintainWikiStep) bool {
 		result.Steps = append(result.Steps, step)
@@ -216,17 +250,22 @@ func MaintainWiki(opts MaintainWikiOptions) (result MaintainWikiResult, err erro
 		return result, nil
 	}
 
+	var queueResult RunIngestQueueResult
 	if !addStep(runMaintainStep("run_ingest_queue", func() (map[string]any, any, error) {
 		if opts.QueueValidator == nil {
 			return nil, nil, fmt.Errorf("ingest queue validator is required")
 		}
-		queueResult, err := RunIngestQueue(RunIngestQueueOptions{
+		var err error
+		queueResult, err = RunIngestQueue(RunIngestQueueOptions{
 			ProjectPath:   opts.ProjectPath,
 			Validator:     opts.QueueValidator,
 			SkipUnchanged: opts.SkipUnchanged,
 			RetryFailed:   opts.RetryFailed,
 			KeepDone:      opts.KeepDone,
 		})
+		if err == nil && queueResult.Failed > 0 {
+			err = fmt.Errorf("%d ingest task(s) failed", queueResult.Failed)
+		}
 		return map[string]any{
 			"processed": queueResult.Processed,
 			"done":      queueResult.Done,
@@ -234,6 +273,36 @@ func MaintainWiki(opts MaintainWikiOptions) (result MaintainWikiResult, err erro
 			"skipped":   queueResult.Skipped,
 			"files":     queueResult.Files,
 		}, queueResult, err
+	})) {
+		_ = appendMaintainLog(opts.ProjectPath, result)
+		return result, nil
+	}
+
+	if !addStep(runMaintainStep("refresh_navigation", func() (map[string]any, any, error) {
+		overviewPending, err := knowledgeOverviewRefreshPending(opts.ProjectPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		if queueResult.Files > 0 && opts.RefreshOverview != nil {
+			if err := setKnowledgeOverviewRefreshPending(opts.ProjectPath, true); err != nil {
+				return nil, nil, err
+			}
+			overviewPending = true
+		}
+		if err := wiki.RebuildIndex(opts.ProjectPath); err != nil {
+			return nil, nil, err
+		}
+		overviewRefreshed := false
+		if overviewPending && opts.RefreshOverview != nil {
+			overviewRefreshed, err = opts.RefreshOverview()
+			if err != nil {
+				return nil, nil, err
+			}
+			if err := setKnowledgeOverviewRefreshPending(opts.ProjectPath, false); err != nil {
+				return nil, nil, err
+			}
+		}
+		return map[string]any{"index_rebuilt": true, "overview_pending": overviewPending, "overview_refreshed": overviewRefreshed, "changed_files": queueResult.Files}, nil, nil
 	})) {
 		_ = appendMaintainLog(opts.ProjectPath, result)
 		return result, nil

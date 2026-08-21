@@ -19,11 +19,12 @@ import (
 const _ = grpc.SupportPackageIsVersion7
 
 const (
-	ControlService_Health_FullMethodName              = "/qm.control.v1.ControlService/Health"
-	ControlService_ListProjects_FullMethodName        = "/qm.control.v1.ControlService/ListProjects"
-	ControlService_CreateProject_FullMethodName       = "/qm.control.v1.ControlService/CreateProject"
-	ControlService_AddProjectMember_FullMethodName    = "/qm.control.v1.ControlService/AddProjectMember"
-	ControlService_RemoveProjectMember_FullMethodName = "/qm.control.v1.ControlService/RemoveProjectMember"
+	ControlService_Health_FullMethodName                  = "/qm.control.v1.ControlService/Health"
+	ControlService_ListProjects_FullMethodName            = "/qm.control.v1.ControlService/ListProjects"
+	ControlService_CreateProject_FullMethodName           = "/qm.control.v1.ControlService/CreateProject"
+	ControlService_AddProjectMember_FullMethodName        = "/qm.control.v1.ControlService/AddProjectMember"
+	ControlService_RemoveProjectMember_FullMethodName     = "/qm.control.v1.ControlService/RemoveProjectMember"
+	ControlService_GetRuntimeConfiguration_FullMethodName = "/qm.control.v1.ControlService/GetRuntimeConfiguration"
 )
 
 // ControlServiceClient is the client API for ControlService service.
@@ -35,6 +36,7 @@ type ControlServiceClient interface {
 	CreateProject(ctx context.Context, in *CreateProjectRequest, opts ...grpc.CallOption) (*ProjectReply, error)
 	AddProjectMember(ctx context.Context, in *ProjectMemberRequest, opts ...grpc.CallOption) (*ProjectReply, error)
 	RemoveProjectMember(ctx context.Context, in *ProjectMemberRequest, opts ...grpc.CallOption) (*ProjectReply, error)
+	GetRuntimeConfiguration(ctx context.Context, in *RuntimeConfigurationRequest, opts ...grpc.CallOption) (*RuntimeConfigurationReply, error)
 }
 
 type controlServiceClient struct {
@@ -90,6 +92,15 @@ func (c *controlServiceClient) RemoveProjectMember(ctx context.Context, in *Proj
 	return out, nil
 }
 
+func (c *controlServiceClient) GetRuntimeConfiguration(ctx context.Context, in *RuntimeConfigurationRequest, opts ...grpc.CallOption) (*RuntimeConfigurationReply, error) {
+	out := new(RuntimeConfigurationReply)
+	err := c.cc.Invoke(ctx, ControlService_GetRuntimeConfiguration_FullMethodName, in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControlServiceServer is the server API for ControlService service.
 // All implementations must embed UnimplementedControlServiceServer
 // for forward compatibility
@@ -99,6 +110,7 @@ type ControlServiceServer interface {
 	CreateProject(context.Context, *CreateProjectRequest) (*ProjectReply, error)
 	AddProjectMember(context.Context, *ProjectMemberRequest) (*ProjectReply, error)
 	RemoveProjectMember(context.Context, *ProjectMemberRequest) (*ProjectReply, error)
+	GetRuntimeConfiguration(context.Context, *RuntimeConfigurationRequest) (*RuntimeConfigurationReply, error)
 	mustEmbedUnimplementedControlServiceServer()
 }
 
@@ -120,6 +132,9 @@ func (UnimplementedControlServiceServer) AddProjectMember(context.Context, *Proj
 }
 func (UnimplementedControlServiceServer) RemoveProjectMember(context.Context, *ProjectMemberRequest) (*ProjectReply, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method RemoveProjectMember not implemented")
+}
+func (UnimplementedControlServiceServer) GetRuntimeConfiguration(context.Context, *RuntimeConfigurationRequest) (*RuntimeConfigurationReply, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method GetRuntimeConfiguration not implemented")
 }
 func (UnimplementedControlServiceServer) mustEmbedUnimplementedControlServiceServer() {}
 
@@ -224,6 +239,24 @@ func _ControlService_RemoveProjectMember_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ControlService_GetRuntimeConfiguration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RuntimeConfigurationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlServiceServer).GetRuntimeConfiguration(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlService_GetRuntimeConfiguration_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlServiceServer).GetRuntimeConfiguration(ctx, req.(*RuntimeConfigurationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ControlService_ServiceDesc is the grpc.ServiceDesc for ControlService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -250,6 +283,10 @@ var ControlService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RemoveProjectMember",
 			Handler:    _ControlService_RemoveProjectMember_Handler,
+		},
+		{
+			MethodName: "GetRuntimeConfiguration",
+			Handler:    _ControlService_GetRuntimeConfiguration_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

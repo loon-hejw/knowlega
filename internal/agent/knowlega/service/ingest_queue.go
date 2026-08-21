@@ -410,10 +410,11 @@ func RunIngestQueue(opts RunIngestQueueOptions) (RunIngestQueueResult, error) {
 		task.SHA256 = validateResult.SHA256
 		if validateResult.Skipped {
 			result.Skipped++
+		} else {
+			result.Files += len(validateResult.Files)
 		}
 		task.Status = IngestTaskDone
 		result.Done++
-		result.Files += len(validateResult.Files)
 	}
 	if !opts.KeepDone {
 		queue.Tasks = pruneDoneTasks(queue.Tasks)
@@ -462,6 +463,78 @@ func SaveIngestQueue(projectPath string, queue IngestQueue) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// RecoverProcessingIngestTasks requeues tasks whose worker disappeared after
+// persisting the processing state. It is intended for backend startup, before
+// that process begins normal maintenance ticks.
+func RecoverProcessingIngestTasks(projectPath string) (int, error) {
+	release, err := acquireServiceProjectLock(projectPath)
+	if err != nil {
+		return 0, err
+	}
+	defer release()
+	queue, err := LoadIngestQueue(projectPath)
+	if err != nil {
+		return 0, err
+	}
+	recovered := 0
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	for i := range queue.Tasks {
+		if queue.Tasks[i].Status != IngestTaskProcessing {
+			continue
+		}
+		queue.Tasks[i].Status = IngestTaskPending
+		queue.Tasks[i].Error = ""
+		queue.Tasks[i].RetryCount++
+		queue.Tasks[i].UpdatedAt = now
+		recovered++
+	}
+	if recovered == 0 {
+		return 0, nil
+	}
+	return recovered, SaveIngestQueue(projectPath, queue)
+}
+
+func RemoveQueuedSource(projectPath, taskID, sourcePath string) error {
+	release, err := acquireServiceProjectLock(projectPath)
+	if err != nil {
+		return err
+	}
+	defer release()
+	queue, err := LoadIngestQueue(projectPath)
+	if err != nil {
+		return err
+	}
+	kept := make([]IngestTask, 0, len(queue.Tasks))
+	for _, task := range queue.Tasks {
+		if task.ID == taskID || sourcePath != "" && sameSourcePath(task.SourcePath, sourcePath) {
+			continue
+		}
+		kept = append(kept, task)
+	}
+	queue.Tasks = kept
+	if err := SaveIngestQueue(projectPath, queue); err != nil {
+		return err
+	}
+	if strings.TrimSpace(sourcePath) == "" {
+		return nil
+	}
+	abs, err := filepath.Abs(sourcePath)
+	if err != nil {
+		return err
+	}
+	rawRoot, err := filepath.Abs(filepath.Join(projectPath, "raw", "sources", "qm"))
+	if err != nil {
+		return err
+	}
+	if abs != rawRoot && !strings.HasPrefix(abs, rawRoot+string(filepath.Separator)) {
+		return fmt.Errorf("qm source path escapes raw mirror root: %s", sourcePath)
+	}
+	if err := os.Remove(abs); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 func ingestQueuePath(projectPath string) string {

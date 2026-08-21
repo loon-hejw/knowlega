@@ -16,7 +16,8 @@ wiki maintained by an LLM:
 
 - `raw/` contains immutable source material.
 - `wiki/` contains generated Markdown pages that evolve over time.
-- `schema.md` and `purpose.md` guide every ingest, query, and lint operation.
+- `schema.md` and `purpose.md` guide every ingest, knowledge interaction, and
+  lint operation.
 - PostgreSQL is an index/state/graph/cache layer, not the only knowledge source.
 - Markdown artifacts must remain readable by humans, agents, Git, and Obsidian.
 - Generated page overwrites must preserve the previous page under
@@ -29,10 +30,10 @@ Follow the Karpathy LLM Wiki pattern:
 - Ingest should compile sources into durable wiki pages, not only index chunks.
 - One source may update many pages: source summary, entity pages, concept pages,
   synthesis pages, index, overview, and log.
-- Query results that create useful synthesis should be saveable back into wiki.
-- Saved query answers belong under `wiki/syntheses/` with `type: synthesis`,
-  citation sources, the original question, and the query plan used to produce
-  the answer.
+- Useful knowledge submissions may be explicitly written back into the wiki.
+- Saved knowledge syntheses belong under `wiki/syntheses/` with `type: synthesis`,
+  citation sources, the original question, and the evidence context used to
+  produce the answer.
 - Lint should check wiki health: contradictions, stale claims, orphan pages,
   missing cross-links, missing concept/entity pages, and source gaps.
 - Keep structural lint and semantic review separate. `kbcore lint` is the
@@ -54,8 +55,8 @@ Follow the Karpathy LLM Wiki pattern:
   Code; do not append every generated page into an undifferentiated tail.
 - `wiki/log.md` is append-only operational history.
 - `wiki/overview.md` is the current high-level synthesis of the whole wiki.
-  Ingest and saved query workflows must update it so the LLM has a compact
-  navigation/synthesis entrypoint before drilling into individual pages.
+  Ingest and explicit knowledge writeback workflows must update it so the LLM
+  has a compact navigation/synthesis entrypoint before drilling into pages.
 - Generated pages must use YAML frontmatter and body `[[wikilink]]` references.
 
 The internal Knowlega Agent exposes the same validation workflow through Go
@@ -103,42 +104,29 @@ Borrow these behaviors:
   Both deterministic `ingest` and LLM `validate-llmwiki` must update it. Batch
   ingest should use `--skip-unchanged` when rerunning large corpora so LLM
   work is only spent on changed sources.
-- Query should combine lexical search, source search, graph expansion, context
-  budgeting, and citations.
-- Query must be planner-driven. Lexical/FTS/vector/graph search is only a
-  candidate recall tool; the user-facing query workflow should have an LLM
-  planning step, read `wiki/index.md` first, inspect relevant wiki pages/raw
-  sources, synthesize with citations, and optionally write valuable answers
-  back into the wiki.
-- The LLM query planner may choose direct `read_first` pages without running
-  search. Search should never be the controlling workflow; it is one tool the
-  planner can call when navigation pages and graph context are insufficient.
-- LLM-backed query agents should use the bounded action loop: `read` wiki/raw
-  pages, `list_pages` for wiki navigation, `follow_links` to traverse linked
-  pages, `search` for candidate recall, `graph` for imported graphify/GitNexus
-  evidence, then `final` or `writeback` only after enough evidence has been
-  read. `writeback` records a suggested synthesis title; it does not write files
-  unless the caller explicitly requests save-title/auto save-title. `search`
-  should prefer pgvector when an embedding provider and vector store are
-  configured, then PG `wiki_pages.search_vector`, and finally file scanning only
-  when PG has no evidence. `graph` should prefer a PG `GraphEvidenceStore` when
-  configured and fall back to `raw/code-graphs/` snapshots only when PG has no
-  evidence. `list_pages` is navigation only; it is not final-answer evidence.
-  Navigation observations must be passed to the next LLM action separately from
-  evidence documents. The runtime auto-reads top wiki/raw candidates after
-  `search` and rejects `final` when only aggregate navigation, page lists, or
-  search snippets are available. Do not let search snippets become the answer
-  without a read or graph evidence step. Query citations must be built from read
-  evidence documents only, never directly from raw search results.
+- QM's outer Pi loop is the only user-facing reasoning agent. Knowledge Core
+  exposes one deterministic `knowledge` tool and must not run a nested query
+  model, hidden classifier, candidate-hypothesis/audit pipeline, verifier, or
+  fixed multi-pass query workflow.
+- The `knowledge` actions are `status`, `search`, `discover`, `read`, `list`,
+  `follow_links`, `graph`, `submit`, and `writeback`. `search`, `discover`, and
+  `list` are navigation only. Only `read`, `follow_links`, and `graph` create
+  evidence. `submit` validates the current turn's evidence ledger; `writeback`
+  is allowed only when the user explicitly requests it.
+- Recall should combine lexical/source search, pgvector/PG FTS when configured,
+  and graph expansion. Search remains a tool chosen by Pi, never the controlling
+  workflow. Search snippets and aggregate navigation pages must not become
+  citations without a read or graph evidence action.
+- `search` should prefer pgvector when an embedding provider and vector store
+  are configured, then PG `wiki_pages.search_vector`, and finally file scanning
+  when PG has no evidence. `graph` should prefer a PG `GraphEvidenceStore` and
+  fall back to `raw/code-graphs/` snapshots when PG has no evidence.
 - `read` actions may use project-relative wiki/raw paths, relative wiki links,
   exact wiki titles, `[[wikilink]]` names, or aliases. The runtime must resolve
   those names back to safe Markdown paths before reading.
-- Query writeback must be enforced in `WriteQueryAnswer`, not only in CLI/API
-  callers. Only non-offline answers with `can_write_back=true` and at least one
+- Knowledge writeback must be enforced in `WriteKnowledgeSubmission`, not only
+  in QM callers. Only a complete validated submission with at least one
   non-navigation citation may be saved under `wiki/syntheses/`.
-- Query workflows configured with PostgreSQL should append to `query_logs`.
-  Treat questions as useful maintenance signals for missing pages, recurring
-  synthesis needs, and review follow-up.
 - CLI/API database configuration is available through `database.dsn` and
   `database.project_id`, with explicit `--db-dsn`/`--project-id` CLI overrides.
 - Embedding generation must be injected through a real provider. Tests may use
@@ -150,10 +138,11 @@ Borrow these behaviors:
 - OpenAI-compatible embedding configuration uses the `embedding` YAML section;
   an enabled embedding model may inherit the configured LLM base URL/API key.
 - Use `sync-wiki-pg --embed` to populate `wiki_pages.embedding` from current
-  Markdown pages. Query can then use pgvector before PG FTS and file fallback.
+  Markdown pages. Knowledge recall can then use pgvector before PG FTS and file
+  fallback.
 - Full `sync-wiki-pg` treats PostgreSQL wiki rows as a rebuildable index:
   delete `wiki_pages` rows for paths that no longer exist in Markdown. Incremental
-  sync after `ingest`, `validate-llmwiki`, or query writeback must only update
+  sync after `ingest`, `validate-llmwiki`, or knowledge writeback must only update
   the pages it wrote and must not prune unrelated rows.
 - Full `sync-wiki-pg` should import `.kbcore/page-versions/` archives into
   `wiki_page_versions`, preserving previous page content, sources, reason, and
@@ -170,14 +159,14 @@ Borrow these behaviors:
   entries. Use the same manifest to sync PG `sources` rows for immutable raw
   source provenance, including raw path, original path, title, SHA256, and
   import time.
-- When `ingest`, `validate-llmwiki`, `query --save-title`, or
+- When `ingest`, `validate-llmwiki`, explicit knowledge writeback, or
   `code-import-graphify` run with PG configuration, they should incrementally
   sync the pages they write into PG. If embedding env vars are configured, those
   page embeddings should refresh in the same pass only when the embedding text
   hash or embedding model changed. Track freshness with `embedding_model`,
   `embedding_source_sha256`, and `embedding_updated_at`.
 - API write paths should keep parity with CLI write paths: when `serve` is
-  configured with a PG-backed wiki store and project id, ingest and query
+  configured with a PG-backed wiki store and project id, ingest and knowledge
   writeback should sync written wiki pages, source manifest entries, and raw
   source provenance into PG before returning success. Code graph imports should
   also sync graph facts and the generated code overview page before returning
@@ -208,24 +197,18 @@ Borrow these behaviors:
   old graph facts for the repo before inserting the current snapshot.
 - Do not hard-code corpus-specific aliases in the search scorer. Aliases and
   semantic expansions belong in page frontmatter, graph facts, the index, or the
-  LLM query plan.
+  Pi-selected evidence plan.
 - Candidate recall must read `aliases` frontmatter as structured metadata and
   boost it over repeated body-term frequency. This preserves the LLM Wiki model:
   the wiki stores semantic naming decisions; search only uses them. Keep file
   search, PG `wiki_pages.search_vector`, and PG fallback scoring aligned on
   alias handling.
-- `FallbackQueryAgent` is only for offline tests. When API credentials are
-  available, query should use the OpenAI-compatible `QueryAgent` so planning and
-  synthesis are actually LLM-driven. Fallback query answers must keep
-  `can_write_back=false`; only LLM-backed synthesis should be saved to
-  `wiki/syntheses/`.
-- `MockQueryAgent` is a deterministic offline tool-loop scaffold for local
-  validation only. It may exercise `list_pages`, `read`, `search`, and `final`,
-  but it must keep `can_write_back=false` and must not be treated as semantic
-  LLM reasoning.
+- Deterministic Knowledge fakes are test scaffolds only and must not be
+  described as semantic reasoning. The semantic reasoning belongs to QM's
+  selected outer model.
 - Graph relevance should consider direct links, source overlap, common
   neighbors, and type affinity.
-- Ordinary wiki graph relevance is part of query evidence expansion. The
+- Ordinary wiki graph relevance is part of Knowledge evidence expansion. The
   `graph` action should combine code graph evidence with wiki page graph
   evidence when both are available.
 

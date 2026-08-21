@@ -29,6 +29,10 @@ func TestImportReaderCreatesImmutablePerSourceArchive(t *testing.T) {
 	if err != nil || string(data) != "# Alpha\n" {
 		t.Fatalf("original data=%q err=%v", string(data), err)
 	}
+	info, err := os.Stat(filepath.Join(root, filepath.FromSlash(first.Metadata.OriginalRawPath)))
+	if err != nil || info.Mode().Perm()&0o222 != 0 {
+		t.Fatalf("original source is writable: info=%v err=%v", info, err)
+	}
 
 	again, err := ImportReader(ImportOptions{
 		ProjectPath:  root,

@@ -51,6 +51,9 @@ func TestResolverEnsureDerivesServerOwnedProjectRoot(t *testing.T) {
 	if binding.ProjectID == "" || binding.RootPath == "" {
 		t.Fatalf("incomplete binding: %+v", binding)
 	}
+	if binding.Status != "empty" {
+		t.Fatalf("new binding status=%q, want empty", binding.Status)
+	}
 	if filepath.Dir(binding.RootPath) != root {
 		t.Fatalf("root escaped scope root: %s", binding.RootPath)
 	}

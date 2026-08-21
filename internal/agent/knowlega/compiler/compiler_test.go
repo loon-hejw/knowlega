@@ -183,7 +183,7 @@ AuthService validates JWT claims and rejects expired sessions.
 		t.Fatalf("entity entry not under Entities:\n%s", indexText)
 	}
 
-	queryResults, err := service.QueryWiki(root, "token validation auth service", 10)
+	queryResults, err := service.SearchProjectDocuments(t.Context(), root, "", "token validation auth service", 10, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -240,6 +240,21 @@ func TestValidateLLMWikiUsesFilenameSlugForChineseChapterTitle(t *testing.T) {
 			t.Fatalf("missing %s from files %v", file, result.Files)
 		}
 	}
+	entries, err := LoadSourceManifestEntries(root, "project")
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("manifest entries=%+v err=%v", entries, err)
+	}
+	info, err := os.Stat(filepath.Join(root, filepath.FromSlash(entries[0].OriginalRawPath)))
+	if err != nil || info.Mode().Perm()&0o222 != 0 {
+		t.Fatalf("immutable raw source info=%v err=%v", info, err)
+	}
+}
+
+func TestInferSourceTitleSkipsGenericStandaloneWorkTitle(t *testing.T) {
+	content := "《Example Chronicle》\n《》目录 Chapter One  A General Beginning\nBody.\n"
+	if got := inferSourceTitle("chapter-001.txt", content); got != "Chapter One  A General Beginning" {
+		t.Fatalf("title=%q", got)
+	}
 }
 
 func TestValidateLLMWikiPathBuildsXiyoujiCorpusWiki(t *testing.T) {
@@ -281,7 +296,7 @@ func TestValidateLLMWikiPathBuildsXiyoujiCorpusWiki(t *testing.T) {
 			t.Fatalf("unexpected broken link after corpus ingest: %+v", issue)
 		}
 	}
-	queryResults, err := service.QueryWiki(root, "花果山", 5)
+	queryResults, err := service.SearchProjectDocuments(t.Context(), root, "", "花果山", 5, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -586,6 +601,23 @@ func TestFilterUnplannedNewPagesKeepsSourceSummaryAndDowngradesLinks(t *testing.
 	}
 	if len(blocks.Reviews) != 1 || blocks.Reviews[0].Type != "review-needed" || !strings.Contains(blocks.Reviews[0].Title, "unplanned.md") {
 		t.Fatalf("reviews=%+v", blocks.Reviews)
+	}
+}
+
+func TestValidateGeneratedBlocksRequiresAnalysisPlannedNewPages(t *testing.T) {
+	root := t.TempDir()
+	raw := filepath.Join(root, "raw", "sources", "a.txt")
+	if err := os.MkdirAll(filepath.Dir(raw), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(raw, []byte("source"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	blocks := ParsedBlocks{Files: []FileBlock{{Path: "wiki/sources/a.md", Content: "---\ntype: source-summary\ntitle: A\nsources: [raw/sources/a.txt]\n---\n\n# A\n"}}}
+	opts := ValidateOptions{ProjectPath: root, AnalysisPlan: "## Wiki Plan\n- SOURCE SUMMARY | wiki/sources/a.md | evidence=source\n- CREATE NEW | wiki/entities/approved.md | durability=central | evidence=named actor"}
+	err := validateGeneratedBlocksForPolicy(opts, blocks, "raw/sources/a.txt", GenerationPolicy{MaxFileBlocks: 4, RemainingNewPages: 3})
+	if err == nil || !strings.Contains(err.Error(), "omitted analysis-planned new page") {
+		t.Fatalf("err=%v", err)
 	}
 }
 

@@ -6,8 +6,9 @@ The long-term integration direction is to use QM as the collaboration and
 access-control substrate, with Knowledge Core as a project and personal
 knowledge plugin. QM owns users, projects, memberships, permissions, channels,
 tasks, schedules, approvals, and agent runtime. Knowledge Core owns immutable
-source ingestion, durable Markdown Wiki pages, provenance, evidence-backed
-query, citations, lint, review, and knowledge maintenance.
+source ingestion, durable Markdown Wiki pages, provenance, deterministic
+knowledge facts, lint, review, and knowledge maintenance. QM owns the
+user-facing reasoning loop.
 
 This is a boundary decision, not a second persistence model: QM scope identifiers
 must resolve to a controlled Knowledge Core project/scope, while `raw/`, `wiki/`,
@@ -28,10 +29,11 @@ answers from retrieved chunks. Each layer has a distinct responsibility:
 | `raw/` | Immutable imported evidence | Yes |
 | `wiki/` | Evolving Markdown knowledge and navigation | Yes |
 | `.kbcore/` | Manifests, queues, archived page versions, graph snapshots | Durable operational state |
-| PostgreSQL | Search, graph, cache, jobs, review/query indexes | No; rebuildable |
-| LLM | Planning, synthesis, semantic review, wiki maintenance | No; writes validated artifacts |
+| PostgreSQL | Search, graph, cache, jobs, and review indexes | No; rebuildable |
+| QM outer model | User-facing planning and synthesis through tools | No; may request explicit validated writeback |
+| Maintenance LLM | Ingest, research, semantic review, graph enrichment | No; writes validated artifacts |
 
-`purpose.md` and `schema.md` guide ingest, query, and semantic review. Generated
+`purpose.md` and `schema.md` guide ingest, knowledge use, and semantic review. Generated
 wiki pages use YAML frontmatter, source provenance, and body `[[wikilink]]`
 references. A generated page overwrite archives the previous version under
 `.kbcore/page-versions/`.
@@ -77,58 +79,69 @@ logical source path with different bytes creates a new immutable raw archive;
 the current entry points at the new version while `versions[]` preserves prior
 hashes and raw paths. Shared pages retain version provenance, while the live
 source-summary represents only the current version. `page_owners` distinguishes
-source-managed pages from manual, review, code, and query pages, so convergence
+source-managed pages from manual, review, code, and synthesis pages, so convergence
 never treats an unknown human page as disposable. Pages attributed only to a
 retained historical source version remain source-owned; historical summaries
 are still superseded by the single current source-summary.
 
 LLM concurrency is a separately configurable process-wide request ceiling
-shared by compile, impact, query, review, and graph clients. Complete source tasks generate from
+shared by compile, impact, research, review, and graph clients. Complete source tasks generate from
 consistent snapshots without holding page locks during LLM work. A stale commit
 requeues only that source; conflict retries with overlapping paths are isolated,
 while disjoint retries continue in parallel. Semantic impact retries use a
 separate bounded allowance and require exact source and post-change evidence.
 
-The durable queue is `.kbcore/ingest-queue.json`. `queue-ingest`,
-`scan-sources`, `run-queue`, and optional service workers reuse the same
-compiler. The source manifest enables restart and `--skip-unchanged` behavior.
+The durable queue is `.kbcore/ingest-queue.json`. QM project-file uploads create
+an immutable raw mirror and enqueue work without blocking the upload response.
+The project-file worker runs by default, uses a per-scope maintenance lock plus
+the filesystem project lock, requeues interrupted `processing` tasks on
+restart, and retries failed queue tasks idempotently. Generic non-project
+raw-directory scanning remains separately opt-in. The source manifest enables
+restart and unchanged-source skipping.
 
-## Query and Writeback
+Workspace state is derived from Markdown, raw sources, the source manifest, and
+the queue rather than a second readiness flag. It is one of `empty`, `queued`,
+`processing`, `ready`, or `failed`, with queue counts, the latest error, and the
+last successful compile time. PostgreSQL scope rows mirror this state for
+operations, but are not authoritative. A queued/processing search with no hits
+returns `pending`; it cannot be used as evidence that the corpus lacks a fact.
 
-Query is a bounded LLM action loop, not a search-result formatter. The agent can
-use:
+## Knowledge Tool and Writeback
 
-- `list_pages` for navigation;
-- `read` for wiki/raw evidence;
-- `follow_links` for wiki traversal;
-- `search` for candidate recall;
-- `graph` for exact code facts and related wiki evidence;
-- `assess_candidate` to persist one candidate's requirement ledger;
-- `final` to answer from evidence; and
-- `writeback` to suggest a durable synthesis.
+QM's outer Pi loop is the only user-facing reasoner. Knowledge Core exposes one
+deterministic `knowledge` tool with these actions:
 
-Planning seeds navigation, then one agent owns the complete tool transcript,
-candidate state, correction feedback, stop reviews, and final answer. Candidate
-generation, candidate audit, and verification are not separate LLM personas.
-The runtime reads `wiki/index.md`, `wiki/overview.md`, and `wiki/log.md` first.
-Search snippets and page lists are navigation only. A final answer requires a
-read wiki/raw document or graph evidence, and citations come from the canonical
-answer-level evidence ledger rather than the last trace action.
+- `status`, `search`, `discover`, and `list` for status/navigation;
+- `read`, `follow_links`, and `graph` for evidence;
+- `submit` to validate the current turn's candidate, requirements, checks, and
+  evidence ledger; and
+- `writeback` to save an already validated submission when explicitly requested.
+
+There is no nested Knowledge query model, hidden classifier,
+candidate-hypothesis/audit chain, verifier, or fixed pass count. Search snippets,
+candidate lists, and aggregate navigation pages are not evidence. Citations are
+reconstructed only from read/follow/graph results produced after the current
+user entry.
 
 Recall order is:
 
 1. pgvector when embeddings and a vector store are configured;
 2. PostgreSQL full-text search;
-3. Markdown/raw file scanning when PostgreSQL has no evidence.
+3. Markdown and immutable raw-source file scanning;
+4. lower-priority wiki/code graph expansion.
 
-Aliases in page frontmatter are first-class recall metadata. They are boosted
-without corpus-specific scoring rules.
+Raw sources and generated pages participate in one result set. Chinese
+punctuation and whitespace are normalized, the complete phrase is retained,
+and continuous CJK text receives general 2-gram/3-gram terms. Title, aliases,
+sources, and body use aligned scoring; aliases and titles are boosted while
+aggregate navigation pages are downranked. There are no corpus-specific search
+aliases or hard-coded semantic expansions.
 
-`writeback` alone does not modify the wiki. `WriteQueryAnswer` permits a saved
-page under `wiki/syntheses/` only for a non-offline answer with
-`can_write_back=true`, an explicit/automatic save title, and at least one
-non-navigation citation. Saved answers include the original question, query
-plan, and citation sources.
+`WriteKnowledgeSubmission` permits a page under `wiki/syntheses/` only for a
+complete validated submission with at least one non-navigation citation. The
+user must explicitly request writeback. Saved pages include the original
+question and citation sources, and repeated identical submissions are
+idempotent.
 
 ## Wiki Maintenance
 
@@ -166,7 +179,7 @@ affinity.
 ## PostgreSQL Boundary
 
 PostgreSQL stores projects, sources, source manifests, wiki pages and versions,
-review items, query logs, jobs, code repositories, graph nodes/edges, FTS, and
+review items, historical query indexes, jobs, code repositories, graph nodes/edges, FTS, and
 pgvector embeddings.
 
 Full wiki sync treats PostgreSQL as replaceable derived state:

@@ -83,6 +83,17 @@ func DeleteLocalTransferBlob(transferDir, blobID string) error {
 	return err
 }
 
+func DeleteLocalFileBlob(localDir, blobKey string) error {
+	if !localFileBlobKey.MatchString(blobKey) {
+		return nil
+	}
+	err := os.Remove(filepath.Join(localDir, "files", blobKey[len("files/"):]))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
 // PutLocalTransferBlob is the local raw Blob-transfer store shared with Node:
 // <transferDir>/<32-hex-id>. The upload remains opaque until a later consumer
 // (such as /v1/files/upload) turns it into a durable file artifact.

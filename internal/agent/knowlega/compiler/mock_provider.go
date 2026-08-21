@@ -187,9 +187,6 @@ func sourceExcerpt(text string) string {
 }
 
 func reviewSearch(title string) string {
-	if strings.Contains(title, "回") {
-		return title + " 西游记 人物 情节 | " + title + " 西游记 主题 分析"
-	}
 	return title + " background research | " + title + " related concepts"
 }
 

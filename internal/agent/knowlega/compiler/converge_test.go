@@ -255,7 +255,7 @@ func TestConvergeQuarantinesSupersededHistoricalSourceSummary(t *testing.T) {
 	}
 }
 
-func TestConvergenceGroupsShareIdentityRequiresReciprocalAliases(t *testing.T) {
+func TestConvergenceGroupsShareIdentityUsesReciprocalOrMultipleSpecificAliases(t *testing.T) {
 	page := func(title string, aliases ...string) []convergencePage {
 		values := make([]any, 0, len(aliases))
 		for _, alias := range aliases {
@@ -276,11 +276,17 @@ func TestConvergenceGroupsShareIdentityRequiresReciprocalAliases(t *testing.T) {
 	) {
 		t.Fatal("reciprocal aliases should merge duplicate identity pages")
 	}
-	if convergenceGroupsShareIdentity(
+	if !convergenceGroupsShareIdentity(
 		page("Tang Sanzang", "唐三藏", "玄奘"),
 		page("Xuanzang", "唐三藏", "玄奘"),
 	) {
-		t.Fatal("shared aliases alone must not merge pages")
+		t.Fatal("multiple shared aliases with a specific native name should merge translated duplicate titles")
+	}
+	legacyAmbiguous := func(title string) []convergencePage {
+		return []convergencePage{{title: title, fm: map[string]any{"ambiguous_aliases": []any{"唐太宗", "太宗"}}}}
+	}
+	if !convergenceGroupsShareIdentity(legacyAmbiguous("Tang Taizong"), legacyAmbiguous("Emperor Taizong")) {
+		t.Fatal("aliases quarantined by an earlier convergence pass must remain usable for a later semantic merge")
 	}
 	if !convergenceGroupsShareIdentity(
 		page("Sanzang", "Tang Sanzang"),

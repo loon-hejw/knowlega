@@ -141,13 +141,17 @@ func upsertIngestSourceManifest(projectPath, sourcePath, rawRel, title, hash str
 	key := manifestfile.Key(sourcePath)
 	previous, existed := value.Sources[key]
 	entry := manifestfile.Entry{
-		OriginalPath: key,
-		SHA256:       hash,
-		RawPath:      filepath.ToSlash(rawRel),
-		Title:        title,
-		Files:        files,
-		ReviewCount:  0,
-		UpdatedAt:    time.Now().UTC().Format(time.RFC3339),
+		QMFileID:       previous.QMFileID,
+		QMProjectID:    previous.QMProjectID,
+		QMScopeID:      previous.QMScopeID,
+		QMSourceSHA256: previous.QMSourceSHA256,
+		OriginalPath:   key,
+		SHA256:         hash,
+		RawPath:        filepath.ToSlash(rawRel),
+		Title:          title,
+		Files:          files,
+		ReviewCount:    0,
+		UpdatedAt:      time.Now().UTC().Format(time.RFC3339),
 	}
 	if archive != nil {
 		entry.OriginalPath = key

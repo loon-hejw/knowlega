@@ -51,6 +51,39 @@ func TestRunIngestQueueUsesPersistentTasks(t *testing.T) {
 	}
 }
 
+func TestRunIngestQueueDoesNotReportSkippedPagesAsChanged(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.md")
+	if err := os.WriteFile(source, []byte("# Source\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := QueueIngestSource(QueueIngestOptions{ProjectPath: root, SourcePath: source}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := RunIngestQueue(RunIngestQueueOptions{
+		ProjectPath: root,
+		Validator: func(QueueValidateOptions) (QueueValidateResult, error) {
+			return QueueValidateResult{
+				RawPath: "raw/sources/source.md",
+				Files:   []string{"wiki/sources/source.md", "wiki/entities/source.md"},
+				Skipped: true,
+				SHA256:  "abc123",
+			}, nil
+		},
+		KeepDone: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Processed != 1 || result.Done != 1 || result.Skipped != 1 || result.Files != 0 {
+		t.Fatalf("skipped queue result=%+v", result)
+	}
+	queue, err := LoadIngestQueue(root)
+	if err != nil || len(queue.Tasks) != 1 || len(queue.Tasks[0].Files) != 2 {
+		t.Fatalf("queue=%+v err=%v", queue, err)
+	}
+}
+
 func TestRunIngestQueuePrunesDoneTasksByDefault(t *testing.T) {
 	root := t.TempDir()
 	source := filepath.Join(root, "source.md")
@@ -74,6 +107,34 @@ func TestRunIngestQueuePrunesDoneTasksByDefault(t *testing.T) {
 	}
 	if len(queue.Tasks) != 0 {
 		t.Fatalf("done tasks not pruned: %+v", queue.Tasks)
+	}
+}
+
+func TestRecoverProcessingIngestTasksRequeuesInterruptedWork(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.md")
+	if err := os.WriteFile(source, []byte("content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := QueueIngestSource(QueueIngestOptions{ProjectPath: root, SourcePath: source}); err != nil {
+		t.Fatal(err)
+	}
+	queue, err := LoadIngestQueue(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	queue.Tasks[0].Status = IngestTaskProcessing
+	queue.Tasks[0].Error = "stale error"
+	if err := SaveIngestQueue(root, queue); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := RecoverProcessingIngestTasks(root)
+	if err != nil || recovered != 1 {
+		t.Fatalf("recovered=%d err=%v", recovered, err)
+	}
+	queue, err = LoadIngestQueue(root)
+	if err != nil || queue.Tasks[0].Status != IngestTaskPending || queue.Tasks[0].Error != "" || queue.Tasks[0].RetryCount != 1 {
+		t.Fatalf("queue=%+v err=%v", queue, err)
 	}
 }
 
@@ -167,7 +228,17 @@ func TestScanRawSourcesRejectsMutatedArchiveOriginal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(archive.Metadata.OriginalRawPath)), []byte("mutated"), 0o644); err != nil {
+	originalPath := filepath.Join(root, filepath.FromSlash(archive.Metadata.OriginalRawPath))
+	// ImportReader deliberately makes archived originals read-only. Temporarily
+	// relax the fixture permissions so this test can simulate external tampering,
+	// then restore the immutable mode before asking the scanner to detect it.
+	if err := os.Chmod(originalPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(originalPath, []byte("mutated"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(originalPath, 0o444); err != nil {
 		t.Fatal(err)
 	}
 	result, err := ScanRawSources(QueueIngestOptions{ProjectPath: root})

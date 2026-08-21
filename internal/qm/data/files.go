@@ -16,6 +16,7 @@ import (
 // store. Byte contents remain owned by the configured durable byte store.
 type FileArtifact struct {
 	ID, OwnerScopeID, CreatedBy, Name, Path, Mimetype, Direction string
+	SHA256                                                       string
 	SizeBytes, CreatedAt, UpdatedAt                              int64
 	BlobKey, CreatedInScope                                      *string
 }
@@ -44,8 +45,8 @@ func (r *FileArtifactRepository) Get(ctx context.Context, id string) (*FileArtif
 		return nil, err
 	}
 	var file FileArtifact
-	err = r.pg.Pool.QueryRow(ctx, `SELECT id,owner_scope_id,created_by,name,path,mimetype,size_bytes,blob_key,direction,created_in_scope,created_at,updated_at
-FROM file_artifacts WHERE id=$1 AND enabled=TRUE`, id).Scan(&file.ID, &file.OwnerScopeID, &file.CreatedBy, &file.Name, &file.Path, &file.Mimetype, &file.SizeBytes, &file.BlobKey, &file.Direction, &file.CreatedInScope, &file.CreatedAt, &file.UpdatedAt)
+	err = r.pg.Pool.QueryRow(ctx, `SELECT id,owner_scope_id,created_by,name,path,mimetype,size_bytes,blob_key,COALESCE(sha256,''),direction,created_in_scope,created_at,updated_at
+FROM file_artifacts WHERE id=$1 AND enabled=TRUE`, id).Scan(&file.ID, &file.OwnerScopeID, &file.CreatedBy, &file.Name, &file.Path, &file.Mimetype, &file.SizeBytes, &file.BlobKey, &file.SHA256, &file.Direction, &file.CreatedInScope, &file.CreatedAt, &file.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -74,8 +75,8 @@ func (r *FileArtifactRepository) Create(ctx context.Context, file FileArtifact) 
 	if !exists {
 		return nil, errors.New("file_artifacts table is not available")
 	}
-	_, err = r.pg.Pool.Exec(ctx, `INSERT INTO file_artifacts(id,kind,owner_scope_id,path,name,mimetype,size_bytes,blob_key,direction,created_by,created_in_scope,created_at,updated_at,enabled,source)
-VALUES($1,'file',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,TRUE,'live')`, file.ID, file.OwnerScopeID, file.Path, file.Name, file.Mimetype, file.SizeBytes, *file.BlobKey, file.Direction, file.CreatedBy, file.CreatedInScope, file.CreatedAt, file.UpdatedAt)
+	_, err = r.pg.Pool.Exec(ctx, `INSERT INTO file_artifacts(id,kind,owner_scope_id,path,name,mimetype,size_bytes,blob_key,sha256,direction,created_by,created_in_scope,created_at,updated_at,enabled,source)
+VALUES($1,'file',$2,$3,$4,$5,$6,$7,NULLIF($8,''),$9,$10,$11,$12,$13,TRUE,'live')`, file.ID, file.OwnerScopeID, file.Path, file.Name, file.Mimetype, file.SizeBytes, *file.BlobKey, file.SHA256, file.Direction, file.CreatedBy, file.CreatedInScope, file.CreatedAt, file.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -106,7 +107,7 @@ func (r *FileArtifactRepository) List(ctx context.Context, scopeID string, orgWi
 	if !exists {
 		return []FileArtifact{}, nil
 	}
-	query := `SELECT id,owner_scope_id,created_by,name,path,mimetype,size_bytes,blob_key,direction,created_in_scope,created_at,updated_at
+	query := `SELECT id,owner_scope_id,created_by,name,path,mimetype,size_bytes,blob_key,COALESCE(sha256,''),direction,created_in_scope,created_at,updated_at
 FROM file_artifacts WHERE enabled=TRUE`
 	args := []any{}
 	if !orgWide {
@@ -143,7 +144,7 @@ func (r *FileArtifactRepository) ListOwned(ctx context.Context, ownerScopeID str
 	if err != nil || !exists {
 		return []FileArtifact{}, err
 	}
-	rows, err := r.pg.Pool.Query(ctx, `SELECT id,owner_scope_id,created_by,name,path,mimetype,size_bytes,blob_key,direction,created_in_scope,created_at,updated_at
+	rows, err := r.pg.Pool.Query(ctx, `SELECT id,owner_scope_id,created_by,name,path,mimetype,size_bytes,blob_key,COALESCE(sha256,''),direction,created_in_scope,created_at,updated_at
 FROM file_artifacts WHERE enabled=TRUE AND owner_scope_id=$1 ORDER BY created_at DESC,id DESC LIMIT $2`, ownerScopeID, limit)
 	if err != nil {
 		return nil, err
@@ -183,7 +184,7 @@ func (r *FileArtifactRepository) ListOwnedByScopes(ctx context.Context, ownerSco
 		filters = append(filters, "(created_at,id) < ($"+strconv.Itoa(len(params)-1)+"::bigint,$"+strconv.Itoa(len(params))+"::text)")
 	}
 	params = append(params, limit+1)
-	query := `SELECT id,owner_scope_id,created_by,name,path,mimetype,size_bytes,blob_key,direction,created_in_scope,created_at,updated_at
+	query := `SELECT id,owner_scope_id,created_by,name,path,mimetype,size_bytes,blob_key,COALESCE(sha256,''),direction,created_in_scope,created_at,updated_at
 FROM file_artifacts WHERE ` + strings.Join(filters, " AND ") + ` ORDER BY created_at DESC,id DESC LIMIT $` + strconv.Itoa(len(params))
 	rows, err := r.pg.Pool.Query(ctx, query, params...)
 	if err != nil {
@@ -214,7 +215,7 @@ func (r *FileArtifactRepository) ListOwnedInScope(ctx context.Context, ownerScop
 	if err != nil || !exists {
 		return []FileArtifact{}, err
 	}
-	rows, err := r.pg.Pool.Query(ctx, `SELECT id,owner_scope_id,created_by,name,path,mimetype,size_bytes,blob_key,direction,created_in_scope,created_at,updated_at
+	rows, err := r.pg.Pool.Query(ctx, `SELECT id,owner_scope_id,created_by,name,path,mimetype,size_bytes,blob_key,COALESCE(sha256,''),direction,created_in_scope,created_at,updated_at
 FROM file_artifacts WHERE enabled=TRUE AND owner_scope_id=ANY($1::text[]) AND created_in_scope=$2
 ORDER BY created_at DESC,id DESC`, ownerScopes, scopeID)
 	if err != nil {
@@ -238,8 +239,22 @@ func (r *FileArtifactRepository) ResolveByOwnerPaths(ctx context.Context, handle
 	for _, handle := range handles {
 		owners, paths = append(owners, handle.OwnerScopeID), append(paths, handle.Path)
 	}
-	rows, err := r.pg.Pool.Query(ctx, `SELECT id,owner_scope_id,created_by,name,path,mimetype,size_bytes,blob_key,direction,created_in_scope,created_at,updated_at
+	rows, err := r.pg.Pool.Query(ctx, `SELECT id,owner_scope_id,created_by,name,path,mimetype,size_bytes,blob_key,COALESCE(sha256,''),direction,created_in_scope,created_at,updated_at
 FROM file_artifacts WHERE enabled=TRUE AND (owner_scope_id,path) IN (SELECT * FROM unnest($1::text[],$2::text[]))`, owners, paths)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return collectFileArtifacts(rows)
+}
+
+func (r *FileArtifactRepository) ListForProject(ctx context.Context, projectID string, limit int) ([]FileArtifact, error) {
+	if limit <= 0 || limit > 2000 {
+		limit = 2000
+	}
+	rows, err := r.pg.Pool.Query(ctx, `SELECT f.id,f.owner_scope_id,f.created_by,f.name,f.path,f.mimetype,f.size_bytes,f.blob_key,COALESCE(f.sha256,''),f.direction,f.created_in_scope,f.created_at,f.updated_at
+FROM file_artifacts f JOIN project_file_memberships p ON p.file_id=f.id
+WHERE p.project_id=$1 AND f.enabled=TRUE ORDER BY p.created_at DESC,f.id DESC LIMIT $2`, projectID, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -264,7 +279,18 @@ func collectFileArtifacts(rows pgx.Rows) ([]FileArtifact, error) {
 }
 
 func scanFileArtifact(row fileArtifactScanner, item *FileArtifact) error {
-	return row.Scan(&item.ID, &item.OwnerScopeID, &item.CreatedBy, &item.Name, &item.Path, &item.Mimetype, &item.SizeBytes, &item.BlobKey, &item.Direction, &item.CreatedInScope, &item.CreatedAt, &item.UpdatedAt)
+	return row.Scan(&item.ID, &item.OwnerScopeID, &item.CreatedBy, &item.Name, &item.Path, &item.Mimetype, &item.SizeBytes, &item.BlobKey, &item.SHA256, &item.Direction, &item.CreatedInScope, &item.CreatedAt, &item.UpdatedAt)
+}
+
+func (r *FileArtifactRepository) Delete(ctx context.Context, id string) error {
+	_, err := r.pg.Pool.Exec(ctx, "DELETE FROM file_artifacts WHERE id=$1", id)
+	return err
+}
+
+func (r *FileArtifactRepository) CountBlobReferences(ctx context.Context, blobKey string) (int, error) {
+	var count int
+	err := r.pg.Pool.QueryRow(ctx, "SELECT COUNT(*) FROM file_artifacts WHERE blob_key=$1", blobKey).Scan(&count)
+	return count, err
 }
 
 func (r *FileArtifactRepository) tableExists(ctx context.Context) (bool, error) {

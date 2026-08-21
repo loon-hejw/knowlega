@@ -10,6 +10,7 @@ service ControlService {
   rpc CreateProject(CreateProjectRequest) returns (ProjectReply);
   rpc AddProjectMember(ProjectMemberRequest) returns (ProjectReply);
   rpc RemoveProjectMember(ProjectMemberRequest) returns (ProjectReply);
+  rpc GetRuntimeConfiguration(RuntimeConfigurationRequest) returns (RuntimeConfigurationReply);
 }
 
 message CallerContext {
@@ -34,4 +35,58 @@ message Project {
   repeated string member_ids = 5;
   int64 created_at = 6;
   int64 updated_at = 7;
+}
+
+message RuntimeConfigurationRequest {}
+message RuntimeConfigurationReply {
+  string revision = 1;
+  string default_harness = 2;
+  ModelRequestConfig request = 3;
+  repeated ModelProvider providers = 4;
+  SlackRuntimeConfig slack = 5;
+  repeated OAuthClientConfig oauth_clients = 6;
+  repeated RuntimeHarness harnesses = 7;
+}
+message ModelRequestConfig {
+  int32 timeout_seconds = 1;
+  int32 retries = 2;
+  int32 max_input_chars = 3;
+  int32 max_output_tokens = 4;
+  bool disable_thinking = 5;
+}
+message ModelProvider {
+  string id = 1;
+  string protocol = 2;
+  string base_url = 3;
+  string api_key = 4;
+  string user_agent = 5;
+  string anthropic_version = 6;
+  repeated RuntimeModel models = 7;
+}
+message RuntimeModel {
+  string id = 1;
+  string name = 2;
+  int32 context_window = 3;
+  int32 max_tokens = 4;
+}
+message RuntimeHarness {
+  string id = 1;
+  string provider = 2;
+  repeated string model_ids = 3;
+  string default_model = 4;
+}
+message SlackRuntimeConfig {
+  string bot_token = 1;
+  string app_token = 2;
+  string team_id = 3;
+  string team_name = 4;
+}
+message OAuthClientConfig {
+  string provider = 1;
+  string client_id = 2;
+  string client_secret = 3;
+  repeated string scopes = 4;
+  repeated string redirect_allowlist = 5;
+  string consent_mode = 6;
+  string hosted_domain = 7;
 }

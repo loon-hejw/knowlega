@@ -34,6 +34,7 @@ type Claims struct {
 	Blob            *BlobGrant            `json:"blob,omitempty"`
 	Memory          *MemoryGrant          `json:"memory,omitempty"`
 	KeychainMembers []KeychainMember      `json:"keychainMembers,omitempty"`
+	Destination     *Destination          `json:"destination,omitempty"`
 	Destinations    DestinationCandidates `json:"destinations,omitempty"`
 	ExpiresAt       int64                 `json:"exp"`
 }
@@ -65,6 +66,17 @@ type DestinationCandidate struct {
 	Type            string `json:"type"`
 	Target          string `json:"target"`
 	AudienceScopeID string `json:"audienceScopeId,omitempty"`
+}
+
+type Destination struct {
+	Type            string `json:"type"`
+	Target          string `json:"target"`
+	AudienceScopeID string `json:"audienceScopeId,omitempty"`
+	OnBehalfOf      string `json:"onBehalfOf,omitempty"`
+	EditRef         string `json:"editRef,omitempty"`
+	UnfurlLinks     *bool  `json:"unfurlLinks,omitempty"`
+	Identity        string `json:"identity,omitempty"`
+	DebugFooter     string `json:"debugFooter,omitempty"`
 }
 
 // DestinationCandidates intentionally validates only the top-level array.
@@ -103,12 +115,14 @@ type PortalIdentity struct {
 type Identity struct {
 	ActorID         string
 	ScopeID         string
+	ScopeVersion    string
 	Audience        string
 	LiveActor       bool
 	LiveAuthor      bool
 	Triggered       bool
 	Memory          *MemoryGrant
 	KeychainMembers []KeychainMember
+	Destination     *Destination
 	Destinations    DestinationCandidates
 	Source          bool
 }
@@ -159,7 +173,7 @@ func (v Verifier) Authenticate(ctx context.Context, r *http.Request, body []byte
 		if routeAuth == "either" && claims.Audience != "" && claims.Audience != "control-plane" {
 			return Identity{}, forbidden("capability token audience not valid for this route")
 		}
-		return Identity{ActorID: claims.ActorID, ScopeID: claims.ScopeID, Audience: claims.Audience, LiveActor: claims.LiveActor, LiveAuthor: claims.LiveAuthor, Triggered: claims.Triggered, Memory: claims.Memory, KeychainMembers: claims.KeychainMembers, Destinations: claims.Destinations}, nil
+		return Identity{ActorID: claims.ActorID, ScopeID: claims.ScopeID, ScopeVersion: claims.ScopeVersion, Audience: claims.Audience, LiveActor: claims.LiveActor, LiveAuthor: claims.LiveAuthor, Triggered: claims.Triggered, Memory: claims.Memory, KeychainMembers: claims.KeychainMembers, Destination: claims.Destination, Destinations: claims.Destinations}, nil
 	}
 	if routeAuth != "either" && routeAuth != "source" {
 		return Identity{}, unauthorized("capability token required")

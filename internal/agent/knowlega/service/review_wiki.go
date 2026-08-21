@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"github.com/loon-hejw/knowlega/internal/agent/knowlega/config"
 	"github.com/loon-hejw/knowlega/internal/agent/knowlega/llmretry"
 	"github.com/loon-hejw/knowlega/internal/agent/knowlega/promptbudget"
+	"github.com/loon-hejw/knowlega/internal/agent/knowlega/wiki"
 )
 
 type WikiReviewOptions struct {
@@ -110,6 +112,17 @@ func ReviewWiki(opts WikiReviewOptions) ([]LintIssue, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Review items are durable semantic evidence written during ingest. The
+	// maintenance model may legitimately add new findings, but an empty or
+	// incomplete response must not erase unresolved contradictions, stale
+	// claims, source gaps, or missing-page judgments already persisted in
+	// wiki/reviews.md. Carry those open items into this pass so the semantic
+	// result remains monotonic until a later explicit review action resolves it.
+	carried, err := carriedForwardReviewIssues(opts.ProjectPath)
+	if err != nil {
+		return nil, err
+	}
+	issues = mergeReviewIssues(issues, carried)
 	sort.Slice(issues, func(i, j int) bool {
 		if issues[i].Type == issues[j].Type {
 			return issues[i].Path < issues[j].Path
@@ -117,6 +130,59 @@ func ReviewWiki(opts WikiReviewOptions) ([]LintIssue, error) {
 		return issues[i].Type < issues[j].Type
 	})
 	return issues, nil
+}
+
+func carriedForwardReviewIssues(projectPath string) ([]LintIssue, error) {
+	items, err := wiki.ScanReviewItems(wiki.ScanOptions{ProjectPath: projectPath, ProjectID: "review-wiki"})
+	if err != nil {
+		return nil, err
+	}
+	issues := make([]LintIssue, 0, len(items))
+	for _, item := range items {
+		status := strings.ToLower(strings.TrimSpace(item.Status))
+		if status != "" && status != "open" && status != "pending" {
+			continue
+		}
+		path := "wiki/reviews.md"
+		if len(item.AffectedPages) > 0 && strings.TrimSpace(item.AffectedPages[0]) != "" {
+			path = filepath.ToSlash(strings.TrimSpace(item.AffectedPages[0]))
+		} else if strings.TrimSpace(item.SourcePath) != "" {
+			path = filepath.ToSlash(strings.TrimSpace(item.SourcePath))
+		}
+		detail := strings.TrimSpace(item.Title)
+		if description := strings.TrimSpace(item.Description); description != "" {
+			if detail != "" {
+				detail += ": "
+			}
+			detail += description
+		}
+		if strings.TrimSpace(item.Type) == "" || detail == "" {
+			continue
+		}
+		issues = append(issues, LintIssue{Type: strings.TrimSpace(item.Type), Path: path, Detail: detail})
+	}
+	return issues, nil
+}
+
+func mergeReviewIssues(primary, carried []LintIssue) []LintIssue {
+	out := append([]LintIssue(nil), primary...)
+	seen := make(map[string]struct{}, len(out))
+	for _, issue := range out {
+		seen[reviewIssueKey(issue)] = struct{}{}
+	}
+	for _, issue := range carried {
+		key := reviewIssueKey(issue)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, issue)
+	}
+	return out
+}
+
+func reviewIssueKey(issue LintIssue) string {
+	return strings.ToLower(strings.TrimSpace(issue.Type)) + "\x00" + filepath.ToSlash(strings.TrimSpace(issue.Path)) + "\x00" + strings.ToLower(strings.TrimSpace(issue.Detail))
 }
 
 func wikiReviewInput(projectPath string) (WikiReviewInput, error) {
@@ -206,6 +272,7 @@ Rules:
 - Focus on semantic wiki maintenance, not markdown formatting.
 - Report contradictions, duplicate pages, missing concept/entity/synthesis pages, stale or weakly sourced claims, and source gaps.
 - Pay special attention to concrete unresolved review items in wiki/reviews.md, raw source excerpts, and source manifest entries that conflict with generated wiki pages.
+- If wiki/reviews.md contains an open contradiction, stale-claim, source-gap, missing-page, duplicate, or review-needed item, carry it forward unless the supplied evidence clearly resolves it; do not return an empty issues list while such an item remains unresolved.
 - Treat page aliases as valid names for their page; do not report an alias as a missing page when it is listed on the target page.
 - Do not report missing content just because excerpt is absent or excerpt_omitted_due_to_budget is true; use body_runes to distinguish omitted prompt context from empty files.
 - Do not report a broad review-needed issue solely because many source_manifest entries have review_count > 0; report specific actionable unresolved review items instead.
@@ -242,17 +309,17 @@ Pages:
 		Issues []LintIssue `json:"issues"`
 	}
 	if err := json.Unmarshal([]byte(extractJSONObject(content)), &parsed); err != nil {
-		return nil, fmt.Errorf("parse llm wiki review: %w: %s", err, content)
+		return nil, fmt.Errorf("parse llm wiki review: %w: %s", err, promptSnippet(content, 800))
 	}
 	return sanitizeReviewIssues(parsed.Issues), nil
 }
 
 func (a OpenAICompatibleWikiReviewAgent) chat(system, user string) (string, error) {
 	maxOutputTokens := a.MaxOutputTokens
-	if maxOutputTokens <= 0 || maxOutputTokens > 2048 {
-		maxOutputTokens = 2048
+	if maxOutputTokens <= 0 || maxOutputTokens > 8192 {
+		maxOutputTokens = 8192
 	}
-	queryAgent := OpenAICompatibleQueryAgent{
+	options := llmChatOptions{
 		Protocol:         a.Protocol,
 		BaseURL:          a.BaseURL,
 		APIKey:           a.APIKey,
@@ -265,7 +332,7 @@ func (a OpenAICompatibleWikiReviewAgent) chat(system, user string) (string, erro
 		DisableThinking:  a.DisableThinking,
 		RetryOptions:     a.RetryOptions,
 	}
-	return queryAgent.chat(system, user)
+	return chatLLM(context.Background(), options, system, user)
 }
 
 func budgetWikiReviewInput(input WikiReviewInput) WikiReviewInput {

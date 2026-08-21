@@ -2,23 +2,56 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "kbcore: wait for configured backend",
-      "type": "shell",
-      "command": "go",
+      "label": "qm: start full stack (no Slack)",
+      "type": "process",
+      "command": "npm",
       "args": [
         "run",
-        "./cmd/kbcore",
-        "--config",
-        "${workspaceFolder}/config.yaml",
-        "wait-ready",
-        "--timeout",
-        "2h"
+        "dev-instance:no-slack",
+        "--",
+        "--force"
       ],
       "options": {
-        "cwd": "${workspaceFolder}",
-        "env": {
-          "GOCACHE": "/private/tmp/kbcore-gocache"
-        }
+        "cwd": "${workspaceFolder}/qm"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "qm: dev status",
+      "type": "process",
+      "command": "npm",
+      "args": [
+        "run",
+        "dev-instance:status"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/qm"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "qm: dev doctor",
+      "type": "process",
+      "command": "npm",
+      "args": [
+        "run",
+        "dev-instance:doctor"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/qm"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "qm: stop full stack",
+      "type": "process",
+      "command": "npm",
+      "args": [
+        "run",
+        "dev-instance:down"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/qm"
       },
       "problemMatcher": []
     }

@@ -10,6 +10,30 @@ import (
 	"github.com/loon-hejw/knowlega/internal/agent/knowlega/wiki"
 )
 
+func TestBindQMSourcePersistsProjectFileProvenance(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "kb")
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {
+		t.Fatal(err)
+	}
+	manifest := sourceManifestFile{Version: 1, Sources: map[string]sourceManifestFileEntry{
+		"source": {OriginalPath: "source", RawPath: "raw/sources/qm/file-1/source.md", SHA256: "sha", Title: "Source"},
+	}}
+	if err := saveSourceManifestFile(root, manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := BindQMSource(root, "raw/sources/qm/file-1/source.md", "file-1", "project-1", "group:web-project-project-1", "sha"); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := loadSourceManifestFile(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := loaded.Sources["source"]
+	if entry.QMFileID != "file-1" || entry.QMProjectID != "project-1" || entry.QMScopeID != "group:web-project-project-1" || entry.QMSourceSHA256 != "sha" {
+		t.Fatalf("entry=%+v", entry)
+	}
+}
+
 func TestDeleteSourceCleansManifestPagesLinksAndReviews(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "kb")
 	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "demo"}); err != nil {

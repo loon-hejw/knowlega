@@ -127,8 +127,13 @@ func ConvergeWikiArtifacts(projectPath string) (WikiConvergenceResult, error) {
 		for _, candidate := range candidates {
 			for _, alias := range frontmatterStrings(candidate.fm["ambiguous_aliases"]) {
 				alias = strings.TrimSpace(alias)
-				if alias != "" && !strings.EqualFold(alias, base.title) {
+				if alias == "" || strings.EqualFold(alias, base.title) {
+					continue
+				}
+				if ambiguousAliases[normalizeIdentityName(alias)] {
 					ambiguousPageAliases[alias] = true
+				} else {
+					aliases[alias] = true
 				}
 			}
 			for _, alias := range frontmatterStrings(candidate.fm["aliases"]) {
@@ -635,6 +640,24 @@ func convergenceGroupsShareIdentity(left, right []convergencePage) bool {
 	if leftRecognizesRight && rightRecognizesLeft {
 		return true
 	}
+	// Legacy compilers sometimes translated the canonical title differently
+	// while preserving the same native-language identity set. Two shared
+	// aliases, including at least one specific name of three or more runes, are
+	// strong enough to coalesce without relying on corpus-specific knowledge.
+	sharedAliases := 0
+	hasSpecificSharedAlias := false
+	for alias := range leftAliases {
+		if !rightAliases[alias] {
+			continue
+		}
+		sharedAliases++
+		if len([]rune(strings.ReplaceAll(alias, " ", ""))) >= 3 {
+			hasSpecificSharedAlias = true
+		}
+	}
+	if sharedAliases >= 2 && hasSpecificSharedAlias {
+		return true
+	}
 	return convergenceShortTitleRecognizesLongTitle(leftTitles, leftAliases, rightTitles, rightAliases)
 }
 
@@ -653,7 +676,8 @@ func convergenceIdentityNames(pages []convergencePage) (map[string]bool, map[str
 		if title != "" {
 			titles[title] = true
 		}
-		for _, alias := range frontmatterStrings(page.fm["aliases"]) {
+		identityAliases := append(frontmatterStrings(page.fm["aliases"]), frontmatterStrings(page.fm["ambiguous_aliases"])...)
+		for _, alias := range identityAliases {
 			alias = normalizeIdentityName(alias)
 			if alias != "" {
 				aliases[alias] = true

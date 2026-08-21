@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/loon-hejw/knowlega/internal/agent/knowlega/core"
+	"github.com/loon-hejw/knowlega/internal/agent/knowlega/service"
 )
 
 type Store struct {
@@ -284,9 +285,13 @@ func (s *Store) UpsertSourceManifestEntry(ctx context.Context, entry core.Source
 		entry.UpdatedAt = time.Now()
 	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO source_manifest (id, project_id, original_path, pipeline_version, sha256, raw_path, archive_path, original_raw_path, content_path, original_sha256, content_sha256, title, files, generation_contract_sha256, new_page_budget, new_page_count, created_pages, review_count, updated_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+INSERT INTO source_manifest (id, project_id, qm_file_id, qm_project_id, qm_scope_id, qm_source_sha256, original_path, pipeline_version, sha256, raw_path, archive_path, original_raw_path, content_path, original_sha256, content_sha256, title, files, generation_contract_sha256, new_page_budget, new_page_count, created_pages, review_count, updated_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 ON CONFLICT (project_id, original_path) DO UPDATE SET
+  qm_file_id = EXCLUDED.qm_file_id,
+  qm_project_id = EXCLUDED.qm_project_id,
+  qm_scope_id = EXCLUDED.qm_scope_id,
+  qm_source_sha256 = EXCLUDED.qm_source_sha256,
   pipeline_version = EXCLUDED.pipeline_version,
   sha256 = EXCLUDED.sha256,
   raw_path = EXCLUDED.raw_path,
@@ -303,7 +308,7 @@ ON CONFLICT (project_id, original_path) DO UPDATE SET
   created_pages = EXCLUDED.created_pages,
   review_count = EXCLUDED.review_count,
   updated_at = EXCLUDED.updated_at
-`, entry.ID, entry.ProjectID, entry.OriginalPath, entry.PipelineVersion, entry.SHA256, entry.RawPath, entry.ArchivePath, entry.OriginalRawPath, entry.ContentPath, entry.OriginalSHA256, entry.ContentSHA256, entry.Title, sqlArray(entry.Files), entry.GenerationContractSHA256, entry.NewPageBudget, entry.NewPageCount, sqlArray(entry.CreatedPages), entry.ReviewCount, entry.UpdatedAt)
+`, entry.ID, entry.ProjectID, entry.QMFileID, entry.QMProjectID, entry.QMScopeID, entry.QMSourceSHA256, entry.OriginalPath, entry.PipelineVersion, entry.SHA256, entry.RawPath, entry.ArchivePath, entry.OriginalRawPath, entry.ContentPath, entry.OriginalSHA256, entry.ContentSHA256, entry.Title, sqlArray(entry.Files), entry.GenerationContractSHA256, entry.NewPageBudget, entry.NewPageCount, sqlArray(entry.CreatedPages), entry.ReviewCount, entry.UpdatedAt)
 	return err
 }
 
@@ -401,38 +406,6 @@ WHERE project_id = $1
   AND id NOT IN (%s)
 `, strings.Join(placeholders, ", ")), args...)
 	return err
-}
-
-func (s *Store) InsertQueryLog(ctx context.Context, id, projectID, query, mode string, resultCount int) error {
-	_, err := s.db.ExecContext(ctx, `
-INSERT INTO query_logs (id, project_id, query, mode, result_count)
-VALUES ($1, $2, $3, $4, $5)
-ON CONFLICT (id) DO NOTHING
-`, id, projectID, query, mode, resultCount)
-	return err
-}
-
-func (s *Store) SaveQueryAnswerPayload(ctx context.Context, id, projectID string, payload []byte) error {
-	if len(payload) == 0 {
-		return fmt.Errorf("query answer payload is empty")
-	}
-	_, err := s.db.ExecContext(ctx, `
-INSERT INTO query_logs (id, project_id, query, mode, result_count, answer_payload)
-VALUES ($1, $2, '', 'answer_payload', 0, $3::jsonb)
-ON CONFLICT (id) DO UPDATE SET answer_payload = EXCLUDED.answer_payload
-`, id, projectID, string(payload))
-	return err
-}
-
-func (s *Store) LoadQueryAnswerPayload(ctx context.Context, id, projectID string) ([]byte, error) {
-	var payload []byte
-	err := s.db.QueryRowContext(ctx, `
-SELECT answer_payload FROM query_logs WHERE id = $1 AND project_id = $2
-`, id, projectID).Scan(&payload)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	return payload, err
 }
 
 func (s *Store) AddGraphNode(ctx context.Context, node core.GraphNode) error {
@@ -564,25 +537,27 @@ LIMIT $%d
 	return evidence, nil
 }
 
-func (s *Store) SearchWikiEvidence(ctx context.Context, projectID string, plan core.QueryPlan, limit int) ([]core.QueryResult, error) {
-	searchText := searchTextFromPlan(plan)
+func (s *Store) SearchWikiEvidence(ctx context.Context, projectID string, plan service.KnowledgeSearchPlan) ([]core.KnowledgeSearchResult, error) {
+	searchText := strings.TrimSpace(plan.Query)
 	if searchText == "" {
 		return nil, nil
 	}
-	if limit <= 0 {
-		limit = plan.CandidateLimit
-	}
+	limit := plan.Limit
 	if limit <= 0 {
 		limit = 10
 	}
-	rows, err := s.db.QueryContext(ctx, wikiEvidenceSearchSQL, projectID, searchText, limit)
+	terms := plan.Terms
+	if len(terms) == 0 {
+		terms = service.KnowledgeSearchTerms(searchText)
+	}
+	rows, err := s.db.QueryContext(ctx, wikiEvidenceSearchSQL, projectID, searchText, limit, sqlArray(terms), plan.ExactPhrase)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var results []core.QueryResult
+	var results []core.KnowledgeSearchResult
 	for rows.Next() {
-		var result core.QueryResult
+		var result core.KnowledgeSearchResult
 		if err := rows.Scan(&result.Path, &result.Title, &result.Kind, &result.Snippet, &result.Score); err != nil {
 			return nil, err
 		}
@@ -599,12 +574,13 @@ func (s *Store) SearchWikiEvidence(ctx context.Context, projectID string, plan c
 
 const wikiEvidenceSearchSQL = `
 WITH q AS (
-  SELECT plainto_tsquery('simple', $2) AS tsq, lower($2) AS raw
+  SELECT plainto_tsquery('simple', $2) AS tsq, lower($2) AS raw, lower($5) AS exact, $4::text[] AS terms
 ),
 pages AS (
   SELECT
     wp.*,
     lower(coalesce(wp.frontmatter->>'aliases', '')) AS aliases_text,
+	lower(array_to_string(wp.sources, ' ')) AS sources_text,
     lower(concat_ws(' ', wp.title, wp.body, wp.frontmatter::text, array_to_string(wp.sources, ' '))) AS haystack
   FROM wiki_pages wp
   WHERE wp.project_id = $1
@@ -617,15 +593,17 @@ ranked AS (
     left(pages.body, 320) AS snippet,
     (
       (ts_rank(pages.search_vector, q.tsq) * 1000)::int +
-      CASE WHEN lower(pages.title) LIKE '%' || q.raw || '%' THEN 160 ELSE 0 END +
-      CASE WHEN pages.aliases_text LIKE '%' || q.raw || '%' THEN 320 ELSE 0 END +
-      CASE WHEN lower(pages.frontmatter::text) LIKE '%' || q.raw || '%' THEN 120 ELSE 0 END +
-      CASE WHEN lower(pages.body) LIKE '%' || q.raw || '%' THEN 80 ELSE 0 END
+	  COALESCE((SELECT sum(CASE WHEN lower(pages.title) LIKE '%' || term || '%' THEN 160 ELSE 0 END) FROM unnest(q.terms) term), 0) +
+	  COALESCE((SELECT sum(CASE WHEN pages.aliases_text LIKE '%' || term || '%' THEN 320 ELSE 0 END) FROM unnest(q.terms) term), 0) +
+	  COALESCE((SELECT sum(CASE WHEN pages.sources_text LIKE '%' || term || '%' THEN 120 ELSE 0 END) FROM unnest(q.terms) term), 0) +
+	  COALESCE((SELECT sum(CASE WHEN lower(pages.body) LIKE '%' || term || '%' THEN 80 ELSE 0 END) FROM unnest(q.terms) term), 0)
     ) AS score
   FROM pages, q
   WHERE (
+      q.exact = '' OR pages.haystack LIKE '%' || q.exact || '%'
+  ) AND (
       pages.search_vector @@ q.tsq
-      OR pages.haystack LIKE '%' || q.raw || '%'
+	  OR EXISTS (SELECT 1 FROM unnest(q.terms) term WHERE pages.haystack LIKE '%' || term || '%')
   )
 )
 SELECT path, title, type, snippet, score
@@ -634,13 +612,11 @@ ORDER BY score DESC, path
 LIMIT $3
 `
 
-func (s *Store) SearchWikiEvidenceVector(ctx context.Context, projectID string, plan core.QueryPlan, embedding []float32, limit int) ([]core.QueryResult, error) {
+func (s *Store) SearchWikiEvidenceVector(ctx context.Context, projectID string, plan service.KnowledgeSearchPlan, embedding []float32) ([]core.KnowledgeSearchResult, error) {
 	if len(embedding) == 0 {
 		return nil, nil
 	}
-	if limit <= 0 {
-		limit = plan.CandidateLimit
-	}
+	limit := plan.Limit
 	if limit <= 0 {
 		limit = 10
 	}
@@ -653,16 +629,17 @@ SELECT
   GREATEST(1, (1000 - ((embedding <=> $2::vector) * 1000))::int) AS score
 FROM wiki_pages
 WHERE project_id = $1 AND embedding IS NOT NULL
+  AND ($4 = '' OR lower(concat_ws(' ', title, body, frontmatter::text, array_to_string(sources, ' '))) LIKE '%' || lower($4) || '%')
 ORDER BY embedding <=> $2::vector, path
 LIMIT $3
-`, projectID, vectorLiteral(embedding), limit)
+`, projectID, vectorLiteral(embedding), limit, plan.ExactPhrase)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var results []core.QueryResult
+	var results []core.KnowledgeSearchResult
 	for rows.Next() {
-		var result core.QueryResult
+		var result core.KnowledgeSearchResult
 		if err := rows.Scan(&result.Path, &result.Title, &result.Kind, &result.Snippet, &result.Score); err != nil {
 			return nil, err
 		}
@@ -677,19 +654,6 @@ LIMIT $3
 	return results, nil
 }
 
-func searchTextFromPlan(plan core.QueryPlan) string {
-	var parts []string
-	for _, search := range plan.Searches {
-		if strings.TrimSpace(search.Text) != "" {
-			parts = append(parts, strings.TrimSpace(search.Text))
-		}
-	}
-	if len(parts) > 0 {
-		return strings.Join(parts, " ")
-	}
-	return strings.TrimSpace(plan.Question)
-}
-
 func vectorLiteral(values []float32) string {
 	parts := make([]string, 0, len(values))
 	for _, value := range values {
@@ -699,25 +663,7 @@ func vectorLiteral(values []float32) string {
 }
 
 func graphEvidenceTerms(q string) []string {
-	q = strings.ToLower(strings.TrimSpace(q))
-	if q == "" {
-		return nil
-	}
-	seen := map[string]bool{}
-	var terms []string
-	add := func(term string) {
-		term = strings.Trim(strings.TrimSpace(term), `"'.,:;()[]{}<>`)
-		if term == "" || seen[term] {
-			return
-		}
-		seen[term] = true
-		terms = append(terms, term)
-	}
-	add(q)
-	for _, field := range strings.Fields(q) {
-		add(field)
-	}
-	return terms
+	return service.KnowledgeSearchTerms(q)
 }
 
 // sqlArray keeps the core driver-agnostic. The default lib/pq and pgx stdlib

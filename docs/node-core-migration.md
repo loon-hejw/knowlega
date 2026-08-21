@@ -9,9 +9,10 @@ one domain at a time:
 | `shadow_read` | Compare capability-authenticated `GET /v1/projects` against Go, then return the Node response. |
 | `go` | Serve projects, directory synchronization, principal activation, and admin grants from Go; proxy all remaining routes. |
 
-Set `DATABASE_URL`, `ORG_ID`, `CORE_SIGNING_SECRET`, `CAPABILITY_SECRET`,
-`PORTAL_IDENTITY_SECRET`, and `QM_BACKEND_GRPC_INTERNAL_TOKEN` through the
-existing deployment secret flow.
+Pass the QM YAML file to `qm-backend --config`. Database, organization,
+signing, capability, connector-encryption, model-provider, Slack, OAuth, and
+internal gRPC settings are read from that file; local files containing real
+credentials must not be committed.
 Keep `NODE_CORE_URL` private. Migrate with this order:
 
 1. Run `qm-backend` with `QM_ROUTE_MODE=proxy` and apply its migrations.
@@ -33,7 +34,7 @@ The Go listener addresses and internal token are configured in the Kratos YAML:
 
 ```yaml
 server:
-  http_addr: ":8080"
+  http_addr: ":18083"
   grpc_addr: ":9090" # bind privately in production
 database:
   url: "postgres://…"
@@ -77,6 +78,88 @@ Source authentication follows the Node replay contract: signed `GET` requests
 are repeatable polling reads, while non-GET requests consume a durable replay
 key. A repeated signed mutation is therefore rejected without making normal
 source-read polling fail.
+
+## Go worker and Agent engine convergence
+
+The Go process has one PostgreSQL `runtime_tasks` queue and multiple categorized
+goroutine pools. Each task has an idempotency key, payload version, priority,
+attempt limit, lease owner/token/expiry, heartbeat, cancellation state, event
+sequence, result, and terminal error. Claims use `FOR UPDATE SKIP LOCKED`, so
+several `qm-backend` replicas can drain the same queue without a separate Go
+worker service. Pool concurrency, lease, heartbeat, polling, and retry backoff
+come from `workers.pools` in the QM YAML.
+
+The Go Agent engine preserves the Node Harness adapter contract instead of
+normalizing all adapters to a generic model call. Its fixed profiles are:
+
+| Harness | Control transport | Tool transport | Transcript | Capabilities |
+| --- | --- | --- | --- | --- |
+| `pi` | in-process | in-process | `pi` | abort, steer, images, thinking level, fast mode, provider sessions |
+| `opencode` | HTTP | plugin | `opencode` | abort, steer, images, provider sessions |
+| `codex` | JSON-RPC | dynamic | `responses-api` | abort, steer, images, provider sessions |
+| `claude` | SDK | in-process MCP | `claude-agent-sdk` | abort, steer, images, thinking level, fast mode |
+| `mock` | mock | mock | `qm` | deterministic test scaffold only |
+
+Provider/model bindings and each adapter's runtime options are declared under
+`qm.models.harnesses`. The durable resolver reads the existing
+`approved_harness_configs` and `base_model_configs` maps, preserves org-to-scope
+inheritance, rejects unapproved requested combinations, and falls back to YAML
+defaults when stored settings are stale. `agent_harness_state` records the last
+adapter used by each session, so an adapter switch triggers both reset hooks
+even across replicas. `agent.turn` is the versioned runtime-task contract for
+the turn pool and persists delta, text-block, and progress events. Runtime tasks
+carry a durable `serial_key`; the partial unique lease index permits different
+sessions to execute in parallel while preventing two replicas from running
+turns for the same session at once.
+
+Each of the four production adapters is registered in `qm-backend` only when
+YAML declares that Harness. All four are selected through the same `Engine`,
+but retain their Node wire contracts instead of being flattened:
+
+- Pi performs the in-process OpenAI-compatible/Anthropic multi-step tool loop.
+- OpenCode launches its HTTP sidecar and a per-process HMAC loopback bridge.
+  The bridge plugin is embedded in the Go binary and materialized into the
+  isolated jail, so production startup does not read the Node source tree.
+- Codex launches app-server JSON-RPC with an ephemeral read-only control jail
+  and exposes QM tools as dynamic functions.
+- Claude launches the CLI stream-JSON protocol with an ephemeral control jail
+  and a token-protected loopback MCP server.
+
+Pi uses the configured OpenAI-compatible or Anthropic endpoint, runs the
+multi-step tool loop, consumes SSE deltas, applies cancellation and the turn
+wall-clock cap, consumes durable `abort` and `steer` run signals, replays
+persisted entries, emits Node-compatible user,
+thinking, text, tool-call, tool-result, and assistant entries, and records
+image-redacted request snapshots and usage in `session_llm_requests`. The turn
+pool concurrency comes from `workers.pools.turn`; these are goroutines in the
+one `qm-backend` process, not another service. Session writes use a PostgreSQL
+advisory transaction lock, so sequence and parent links remain valid across
+replicas. Pi also writes Node-compatible durable `session_tape` records. In
+`serve` mode, cold starts fold legacy imports/patches, compaction events,
+interrupt healing, and message rows, lint the result, reject tape written by a
+different Harness, and only then use it instead of reconstructed entry history.
+
+Browser `POST /v1/turns` now persists `runtime_owner=go`, enqueues the matching
+`agent.turn` task, and lets only the Go turn pool claim it; the legacy Node
+runner filters those rows out. The Go adapter emits the existing session-entry,
+tape, model-call, request-capture, approval, progress, and run-completion
+artifacts. Codex child threads and Claude Agent tasks also update the same
+`tasks` and `task_events` tables used by Node, including terminal failure of
+children left open when a parent turn exits. Inbound transfer attachments are
+materialized inside the per-scope Go workspace, with safe paths and image-byte
+redaction in durable observability records.
+
+The `execute` primitive enqueues a separate `sandbox.exec` runtime task. A
+categorized sandbox goroutine pool in the same `qm-backend` process claims it
+and invokes the declared local Docker backend; the model command is passed to
+the container shell and is never evaluated by the host shell. Local execution
+therefore requires the configured sandbox image and a reachable Docker daemon.
+
+This remains a staged control-plane cutover: Slack ingress/delivery and several
+artifact/runtime mutations still proxy to Node. That compatibility boundary no
+longer makes Node the browser turn executor, and it does not introduce a second
+Go service. The remaining gaps are tracked by tool/route capability, not by
+creating a fifth generic Harness.
 
 In `route_mode: go`, project reads and all project mutations are Go-owned:
 `GET`/`POST /v1/projects`, `PATCH /v1/projects/:id`,
@@ -136,9 +219,10 @@ the Runner contract changes.
 Knowlega is now an internal Agent in `qm-backend`, not a public Knowledge gRPC
 contract. QM writes files, memory revisions, and valuable completed
 conversations first; the Agent then content-addresses them into raw sources,
-queues ingestion, compiles versioned Markdown pages, and exposes planner-driven
-query/writeback only through internal Go interfaces. The bounded query runtime
-reads navigation first and never treats search snippets as final evidence.
+queues ingestion, and compiles versioned Markdown pages. QM's outer Pi loop is
+the sole user-facing reasoner and receives one deterministic `knowledge` tool:
+search/discover/list navigate, read/follow_links/graph produce evidence,
+submit validates the current-turn ledger, and writeback is explicit.
 
 Cron state is owned by internal `qm.cron.v1.CronService` when Node is started
 with `QM_BACKEND_CRON_GRPC_URL`. The service persists the complete cron JSON
@@ -524,11 +608,21 @@ returns `503 { "ok": false }` until the durable control-plane state is
 reachable. Deployments should use `/readyz` for traffic admission and keep
 `/healthz` for process-restart liveness.
 
-The source callback `POST /v1/surface-context/:id/result` is Go-owned. It
-updates the Node-created `context_requests` durable-map row atomically and
-bumps its map version so Node waiters observe completion. Request creation and
-pending reads remain Node-owned because they carry a non-durable viewer-token
-sidecar needed by the Slack worker.
+`POST /v1/surface-context` and `POST /v1/surface-file` are Go-owned in
+`route_mode: go`. Go applies the same channel resolution, public/private
+visibility, request limits, polling timeouts, result merge, and short-lived
+Blob download capability contract while the existing Node Slack worker drains
+the shared request rows. The source callback
+`POST /v1/surface-context/:id/result` is Go-owned as well.
+
+The Go pending implementation and PostgreSQL `context_request_tokens` sidecar
+are complete, including Node-compatible AES-GCM key derivation and fallback-key
+decryption from `auth.connector_secret_key`. The public
+`GET /v1/surface-context/pending` routing boundary deliberately still proxies
+to Node: Node-internal live-search callers currently keep their viewer token in
+that process's memory. Switch pending to Go only when both the live-search
+request producer and the Slack context worker move together; otherwise a
+partial cutover would silently downgrade authenticated Slack search.
 
 `GET /v1/admin/skills` and `GET /v1/admin/skills/:id` are Go-owned read
 projections of the shared `skills` and `skill_packs` durable maps. They retain
@@ -567,20 +661,14 @@ summary, and atomically marks expired asks while invalidating Node's map cache.
 Credential creation, encryption, OAuth exchange/refresh, grants, approval,
 revocation, and sandbox materialization remain Node-owned.
 
-`GET /v1/admin/custom-providers` is Go-owned as an org-admin projection of
-the shared `custom_model_providers` durable map. It returns provider specs,
-disabled state, timestamps, and `hasKey`, while never exposing or decrypting
-`apiKeyEnc`. Provider registration, API-key validation, runtime-registry
-refresh, and removal remain Node-owned.
-
-`GET /v1/admin/slack-installation` can be Go-owned after setting
-`qm.slack_environment_state` in the Go YAML configuration to `absent`,
-`configured`, or `partial`. The default `unknown` intentionally proxies the
-request to Node so Go never guesses the state of legacy environment credentials.
-After cutover, Go reads the managed `slack_installation` durable record,
-returns only status metadata and a Slack manifest creation URL, and never
-decrypts or exposes bot/app token ciphertext. Installation validation, writes,
-deletion, Socket Mode lifecycle, and Slack event processing remain Node-owned.
+Model providers, the base model, Slack installation, and OAuth clients are now
+YAML-managed by Go. `GET /v1/admin/onboarding`, the legacy model/custom-provider
+reads, and `GET /v1/admin/slack-installation` return safe status projections
+without secrets. Their legacy HTTP mutations return `409 yaml_managed` and
+point operators to `qm.models`, `qm.slack`, or `qm.oauth.clients`. Node no
+longer registers those administration routes; it receives the secret-bearing
+runtime projection only through the internal-token-protected Control gRPC
+service and remains the execution adapter for model, Slack, and OAuth traffic.
 
 `GET /v1/admin/sandbox-routes` can be Go-owned after declaring both
 `qm.sandbox_default_backend` and the ordered `qm.sandbox_backends` list in the
@@ -714,30 +802,29 @@ keychain state first. Go also reads each keychain DurableMap independently, so
 a never-created asks map cannot hide already-created credentials or grants.
 Capability validation distinguishes an omitted `memory` or `keychainMembers`
 claim from an explicit `null`, matching Node's object/array claim validation.
-OAuth consent, callback/exchange, refresh, token writes, and all other
-external OAuth interactions remain Node-owned. The read-only
-`GET /v1/connectors/catalog` and `GET /v1/connectors/oauth/status` endpoints
-can move independently after an operator explicitly declares the safe metadata
-projection in Go configuration:
+OAuth consent, callback/exchange, refresh, token writes, and all other external
+OAuth interactions remain Node execution work. The read-only
+`GET /v1/connectors/catalog` and `GET /v1/connectors/oauth/status` endpoints are
+Go-owned, with availability derived from YAML OAuth clients:
 
 ```yaml
 qm:
-  oauth_catalog_enabled: true
-  oauth_configured_providers: [google, slack]
+  oauth:
+    clients:
+      - provider: google
+        client_id: example.apps.googleusercontent.com
+        client_secret: replace-me
 ```
 
-Until `oauth_catalog_enabled` is true, both requests proxy to Node. With it
-enabled, Go returns the Node-compatible public provider catalog and aggregates
-the three shared keychain connector slots (default, personal, company) without
-reading ciphertext or invoking a refresh. `oauth_configured_providers` is an
-operator declaration, not a credential source; it may contain only known
-providers and does not make Go resolve a client secret. This prevents Go from
-mistakenly presenting an unconfigured OAuth integration as available while
-still allowing the safe read path to migrate before the runtime OAuth flow.
+Go returns the public provider catalog and aggregates the three shared keychain
+connector slots (default, personal, company) without exposing a client secret
+or invoking a refresh. Node receives the selected YAML client through protected
+internal gRPC when it performs the OAuth flow.
 
 The generic administrative scope configuration routes
 `GET /v1/admin/scopes/:scope` and
-`PUT /v1/admin/scopes/:scope/:resource` remain Node-owned. Their payloads
+`PUT /v1/admin/scopes/:scope/:resource` remain Node-owned except for YAML-managed
+`base-model` and `connectors` writes, which Go rejects with HTTP 409. Their payloads
 combine persisted settings with live model/provider availability, harness
 approval, connector configuration, and in-process config-cache flushes. Go
 continues to own the individual persisted admin endpoints already listed here,

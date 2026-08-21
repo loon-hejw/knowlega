@@ -27,7 +27,7 @@ func TestIngestQueryAndLint(t *testing.T) {
 	if result.RawPath == "" || result.WikiPath == "" || result.SHA256 == "" {
 		t.Fatalf("incomplete ingest result: %+v", result)
 	}
-	results, err := QueryWiki(root, "token auth", 5)
+	results, err := SearchProjectDocuments(t.Context(), root, "", "token auth", 5, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,6 +69,16 @@ func TestIngestQueryAndLint(t *testing.T) {
 	}
 	if len(issues) == 0 {
 		t.Fatal("expected deterministic lint issues for unlinked generated source page")
+	}
+}
+
+func mustWrite(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 

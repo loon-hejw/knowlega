@@ -117,7 +117,9 @@ func (r *Resolver) Ensure(ctx context.Context, externalScopeID, kind, organizati
 		if organizationID != "" {
 			existing.OrganizationID = strings.TrimSpace(organizationID)
 		}
-		existing.Status = "active"
+		if strings.TrimSpace(existing.Status) == "" {
+			existing.Status = "empty"
+		}
 		existing.UpdatedAt = time.Now()
 		if err := r.persist(ctx, existing); err != nil {
 			return core.ScopeBinding{}, err
@@ -147,7 +149,7 @@ func (r *Resolver) Ensure(ctx context.Context, externalScopeID, kind, organizati
 		ProjectID:       projectID,
 		ProjectName:     projectName,
 		RootPath:        rootPath,
-		Status:          "active",
+		Status:          "empty",
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
@@ -205,7 +207,7 @@ func normalizeBinding(binding core.ScopeBinding, provider string) core.ScopeBind
 	binding.RootPath = strings.TrimSpace(binding.RootPath)
 	binding.Status = strings.TrimSpace(binding.Status)
 	if binding.Status == "" {
-		binding.Status = "active"
+		binding.Status = "empty"
 	}
 	return binding
 }

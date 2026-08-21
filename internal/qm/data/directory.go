@@ -300,8 +300,10 @@ func (r *DirectoryRepository) Channel(ctx context.Context, channelID string) (*D
 
 func (r *DirectoryRepository) ChannelsFor(ctx context.Context, principalID string) ([]DirectoryChannel, error) {
 	rows, err := r.pg.Pool.Query(ctx, `SELECT c.channel_id,c.name,c.is_private FROM directory_channels c
-		JOIN directory_channel_members m ON m.org_id=c.org_id AND m.channel_id=c.channel_id
-		WHERE c.org_id=$1 AND m.principal_id=$2 ORDER BY c.name_lc,c.channel_id`, r.orgID, principalID)
+		WHERE c.org_id=$1 AND (c.is_private=FALSE OR EXISTS (
+			SELECT 1 FROM directory_channel_members m
+			WHERE m.org_id=c.org_id AND m.channel_id=c.channel_id AND m.principal_id=$2
+		)) ORDER BY c.name_lc,c.channel_id`, r.orgID, principalID)
 	if err != nil {
 		return nil, err
 	}

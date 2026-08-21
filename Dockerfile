@@ -14,6 +14,8 @@ RUN adduser -D -H -u 10001 qm
 USER qm
 WORKDIR /app
 COPY --from=build /out/qm-backend /usr/local/bin/qm-backend
-COPY configs/config.yaml /app/config.yaml
-EXPOSE 8080 9090
+# Runtime credentials stay outside the image; mount the real file at
+# /app/config.yaml and keep the checked-in template only as a reference.
+COPY configs/qm-config.example.yaml /app/config.example.yaml
+EXPOSE 18083 9090
 ENTRYPOINT ["/usr/local/bin/qm-backend", "--config", "/app/config.yaml"]

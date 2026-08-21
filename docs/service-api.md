@@ -5,33 +5,33 @@
 Start the QM backend with:
 
 ```bash
-go run ./cmd/qm-backend --config qm-backend/configs/config.yaml
+go run ./cmd/qm-backend --config configs/qm-config.yaml
 ```
 
-`GET /healthz` and `GET /readyz` expose backend readiness. Knowlega workspace
-status, queue progress, lint, review, and maintenance are internal Agent state;
-QM handlers invoke them after successful product writes.
+`GET /healthz` and `GET /readyz` expose process and database readiness. They do
+not wait for project knowledge compilation. `GET /v1/scope-resources` includes
+the selected project's knowledge state (`empty`, `queued`, `processing`,
+`ready`, or `failed`), source/page counts, queue counts, latest error, and last
+successful compile time.
 
-Bootstrap checkpoints each completed source in
-`.kbcore/source-manifest.json`. Restarting resumes from durable state and skips
-unchanged sources. `wait-ready` is available for scripts that must block until
-the complete workspace is ready.
+Each completed source is checkpointed in `.kbcore/source-manifest.json` and the
+durable ingest queue. Restarting requeues interrupted work and skips unchanged
+sources. Raw project-file mirrors are searchable immediately, including while
+the workspace is still queued or processing.
 
-The backend does not expose a standalone Knowledge listener. Queue consumption
-is an explicit QM/Agent maintenance operation so starting the server does not
-unexpectedly spend LLM tokens.
+The backend does not expose a standalone Knowledge listener. Project uploads
+and attachments are compiled asynchronously by default when
+`knowledge.auto_process_project_files: true`. This is independent of
+`knowledge.worker`, which remains the opt-in switch for generic non-project
+raw-directory scanning and may spend additional LLM tokens.
 
 ## Authentication
 
-The service is local-first. Configure `server.api_token` to require:
-
-```http
-Authorization: Bearer <token>
-```
-
-Non-loopback requests require protection. Set `server.api_require_token: true`
-to require the token for loopback clients as well. Keep the default
-`127.0.0.1` binding when remote exposure is unnecessary.
+Health endpoints are unauthenticated. QM product routes use either a signed
+source request or a scoped capability token, depending on the caller. Configure
+the signing, capability, portal identity, connector encryption, replay window,
+and internal gRPC secrets under `auth`; do not add a separate Knowledge API
+token or expose Knowledge Agent methods directly.
 
 ## Route Groups
 
@@ -40,37 +40,32 @@ the Go handlers and TypeScript API client.
 
 | Area | Routes |
 | --- | --- |
-| Health/workspace | `GET /health`, `GET /workspace/status`, `POST /workspace/maintain`, `GET /workspace/jobs`, `GET /workspace/jobs/{id}` |
-| Project files | `GET /projects/files`, `GET/PUT /projects/files/content`, `POST /projects/search` |
-| Sources | `GET /projects/sources`, `POST /projects/sources/upload`, `POST /projects/sources/rescan`, `POST /projects/sources/delete`, layout-migration GET/POST routes |
-| Legacy/project operations | `POST /projects/init`, `POST /projects/ingest`, `GET /projects/query`, `GET /projects/lint` |
-| Queue and compile | `POST /sources/queue`, `POST /sources/scan`, `GET /queue/tasks`, `POST /queue/run`, `POST /wiki/validate` |
-| Query/chat | `POST /query`, chat collection/item/message/run/event/cancel routes under `/chats` |
-| Review | `GET /reviews`, resolve/bulk/action/sweep routes, `POST /wiki/review` |
-| Research | `GET/POST /research/jobs`, `GET /research/jobs/{id}` |
-| Graph | project graph/query/node/insights/repositories/jobs routes, `POST /code/import-graphify` |
-| Persistence | `POST /wiki/sync-pg` |
-| Webhooks | `POST /webhooks/code/{registry}` |
+| Health | `GET /healthz`, `GET /readyz` |
+| Project knowledge status | `GET /v1/scope-resources?principalId=...&scope=group:web-project-...` |
+| Upload and attach | `POST /v1/files/upload`, `POST /v1/projects/{project_id}/files` |
+| Retry and delete | `POST /v1/projects/{project_id}/files/{file_id}/retry`, `DELETE /v1/projects/{project_id}/files/{file_id}` |
+| Files and evidence documents | `GET /v1/files`, `GET /v1/files/{file_id}/content`, `GET /v1/projects/{project_id}/knowledge/documents` |
+| Project Q&A | normal QM conversation turns using the internal `knowledge` tool |
 
 Common calls:
 
 ```bash
-curl -sS http://127.0.0.1:19829/health
+curl -sS http://127.0.0.1:19829/healthz
 
-curl -sS -X POST http://127.0.0.1:19829/sources/queue \
-  -H 'Content-Type: application/json' \
-  -d '{"source_path":"/path/to/new-file.md","title":"New File"}'
+curl -sS 'http://127.0.0.1:19829/v1/scope-resources?principalId=alice&scope=group:web-project-123'
 
-curl -sS -X POST http://127.0.0.1:19829/query \
-  -H 'Content-Type: application/json' \
-  -d '{"q":"How does source archiving work?","agent":"llm","save_title":"Source archiving"}'
-
-curl -sS 'http://127.0.0.1:19829/reviews?status=open'
+curl -sS 'http://127.0.0.1:19829/v1/projects/123/knowledge/documents?viewer=alice&path=wiki%2Foverview.md'
 ```
 
-Source deletion supports a dry-run request and must preserve immutable/raw and
-wiki provenance rules. File writes are restricted to safe project-relative
-paths.
+Knowledge does not expose file upload, source mutation, raw queue, or direct
+project-file write routes. QM is the only product entry for files. It owns the
+file artifact, blob, project membership, authorization, and deletion lifecycle;
+the internal Knowledge Agent receives an immutable, read-only raw mirror and
+maintains generated wiki artifacts asynchronously.
+
+Project Q&A is part of the normal QM conversation turn. The selected outer Pi
+loop receives one internal `knowledge` tool; Knowledge Core does not expose
+`/query`, `/projects/query`, or a separate `/chats` runtime.
 
 ## Managed Code Webhooks
 
@@ -83,5 +78,8 @@ exact indexing and cannot replace exact facts.
 ## Knowledge Agent boundary
 
 Knowlega is an internal Go interface, not a public RPC. Use the QM HTTP API and
-control/runner gRPC for application integration. This keeps query, ingest,
+control/runner gRPC for application integration. File creation and project
+membership use `POST /v1/files/upload`, `POST /v1/projects/{project_id}/files`,
+`POST /v1/projects/{project_id}/files/{file_id}/retry`, and
+`DELETE /v1/projects/{project_id}/files/{file_id}`. This keeps ingest,
 writeback, version archives, queue state, and cleanup on one implementation.

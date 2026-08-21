@@ -8,7 +8,7 @@ For local development, start the backend with:
 
 ```bash
 env GOCACHE=/private/tmp/knowlega-gocache \
-  go run ./cmd/qm-backend --config qm-backend/configs/config.yaml
+  go run ./cmd/qm-backend --config configs/qm-config.yaml
 ```
 
 Agent-level behavior is covered by Go tests in

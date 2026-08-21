@@ -71,7 +71,9 @@ Return a concise markdown analysis with:
 - contradictions, duplicates, missing pages, or review items
 - an explicit Wiki Plan using exactly: - LABEL | wiki/path.md | durability=recurring|central|link-target | evidence=...
 - LABEL must be SOURCE SUMMARY, UPDATE EXISTING, CREATE NEW, or REVIEW ONLY; durability and evidence are required for CREATE NEW
-- never plan more CREATE NEW targets than the hard remaining new-page budget`
+- never plan more CREATE NEW targets than the hard remaining new-page budget
+- when the source contains explicitly central named actors, organizations, objects, concepts, or relationships and the remaining new-page budget is positive, plan their most durable canonical entity/concept pages; a source-summary-only plan is valid only when no durable candidate exists or the remaining budget is zero
+- explicitly plan a REVIEW ONLY item when the source identifies an unresolved contradiction, stale claim, source gap, or human judgment call`
 	system += `
 - Existing pages were selected deterministically from known titles and aliases mentioned by the source. For each supplied existing page, use UPDATE EXISTING when the source materially adds evidence, or REVIEW ONLY with a reason when it should remain unchanged. Never silently omit a materially changed canonical page.`
 	user := fmt.Sprintf(`Source title: %s
@@ -131,12 +133,14 @@ Rules:
 - Keep source provenance in sources.
 - The sources list must contain the current supplied raw source. Never invent, guess, copy from prose, or synthesize raw/sources paths; the compiler owns provenance unioning.
 - The first ---FILE block MUST be the current source's single source-summary under wiki/sources/. Emit it before every entity, concept, synthesis, or review block so it cannot be lost if output is truncated.
+- Emit every CREATE NEW and UPDATE EXISTING path from the analysis Wiki Plan. Do not collapse an analysis-approved durable page plan into a source-summary-only response.
 - When an existing page is supplied, merge the new evidence into it. Preserve prior claims, sections, aliases, and sources unless the new source explicitly supersedes them.
 - Treat each supplied ---EXISTING PAGE: wiki/path.md path as the canonical identity owner. If a proposed title or alias refers to that identity, update that exact path and do not create a competing page.
 - Never return two pages whose titles or aliases identify the same entity or concept; fold their evidence into one canonical page.
 - Existing-page sources must be unioned with the current source; never replace previous provenance.
 - Always include exactly one source-summary page under wiki/sources/ for the current source.
 - Prefer updating durable entity/concept/synthesis pages in addition to the source-summary when the source clearly belongs there.
+- When the analysis identifies an unresolved contradiction, stale claim, source gap, or judgment call, emit the corresponding ---REVIEW block; mentioning the issue only in prose is not sufficient.
 - Use aliases in frontmatter when useful for entity names, book chapter titles, or common user wording.
 - Aliases must be genuine alternate names or spellings for that exact page. Never use topical keywords, generic words, related entity names, or broad search terms as aliases.
 - If you use a label, alias, or alternate wording as a [[wikilink]], add that wording to the target page aliases or create/update a target page for it.

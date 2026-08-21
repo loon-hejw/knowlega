@@ -2,6 +2,7 @@ package data
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -23,9 +24,14 @@ func NewKnowledgeScopeRepository(pg *Postgres) *KnowledgeScopeRepository {
 
 func (r *KnowledgeScopeRepository) Ensure(ctx context.Context, scope KnowledgeScope) (KnowledgeScope, error) {
 	now := time.Now().UnixMilli()
+	status := strings.TrimSpace(scope.Status)
+	if status == "" {
+		status = "empty"
+	}
 	_, err := r.pg.Pool.Exec(ctx, `INSERT INTO knowledge_scopes(org_id,external_scope_id,scope_kind,project_id,project_name,root_path,status,created_at,updated_at)
-VALUES($1,$2,$3,$4,$5,$6,'active',$7,$7)
-ON CONFLICT(org_id,external_scope_id,scope_kind) DO UPDATE SET project_name=EXCLUDED.project_name,updated_at=EXCLUDED.updated_at`, scope.OrgID, scope.ExternalScopeID, scope.Kind, scope.ProjectID, scope.ProjectName, scope.RootPath, now)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8)
+ON CONFLICT(org_id,external_scope_id,scope_kind) DO UPDATE SET
+project_id=EXCLUDED.project_id,project_name=EXCLUDED.project_name,root_path=EXCLUDED.root_path,status=EXCLUDED.status,updated_at=EXCLUDED.updated_at`, scope.OrgID, scope.ExternalScopeID, scope.Kind, scope.ProjectID, scope.ProjectName, scope.RootPath, status, now)
 	if err != nil {
 		return KnowledgeScope{}, err
 	}

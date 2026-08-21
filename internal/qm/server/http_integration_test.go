@@ -61,7 +61,7 @@ func TestProjectRouteCompatibility(t *testing.T) {
 	if err := pg.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pg.Pool.Exec(ctx, "TRUNCATE projects,durable_map_versions,deactivated_principals,source_auth_replay,directory_members,directory_channels,directory_channel_members,directory_group_members,directory_sync,directory_meta,acl_grants,admin_grants,audit_log RESTART IDENTITY"); err != nil {
+	if _, err := pg.Pool.Exec(ctx, "TRUNCATE projects,durable_map_versions,deactivated_principals,source_auth_replay,directory_members,directory_channels,directory_channel_members,directory_group_members,directory_sync,directory_meta,acl_grants,admin_grants,audit_log,knowledge_scopes RESTART IDENTITY"); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.Default()
@@ -79,7 +79,7 @@ func TestProjectRouteCompatibility(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := &HTTPServer{config: cfg, projects: biz.NewProjectUsecase(repo), projectRepo: repo, knowledgeAgent: knowledgeAgent, directory: directory, acl: data.NewACLRepository(pg), environments: data.NewEnvironmentRepository(pg, cfg.QM.OrgID), channelPolicy: data.NewChannelPolicyRepository(pg, cfg.QM.OrgID), audit: data.NewAuditor(pg), auth: auth.Verifier{SourceSecret: cfg.Auth.SourceSigningSecret, CapabilitySecret: cfg.Auth.CapabilitySecret, ReplayWindow: time.Minute, DB: pg.Pool}, logger: slog.Default()}
+	h := &HTTPServer{config: cfg, projects: biz.NewProjectUsecase(repo), projectRepo: repo, knowledgeAgent: knowledgeAgent, knowledgeScopes: data.NewKnowledgeScopeRepository(pg), directory: directory, acl: data.NewACLRepository(pg), environments: data.NewEnvironmentRepository(pg, cfg.QM.OrgID), channelPolicy: data.NewChannelPolicyRepository(pg, cfg.QM.OrgID), audit: data.NewAuditor(pg), auth: auth.Verifier{SourceSecret: cfg.Auth.SourceSigningSecret, CapabilitySecret: cfg.Auth.CapabilitySecret, ReplayWindow: time.Minute, DB: pg.Pool}, logger: slog.Default()}
 	body := []byte(`{"name":"Roadmap"}`)
 	req := httptest.NewRequest(http.MethodPost, "/v1/projects", bytes.NewReader(body))
 	req.Header.Set(auth.CapabilityHeader, testCapabilityToken(t, cfg.Auth.CapabilitySecret, "alice", "personal:alice"))
@@ -119,6 +119,10 @@ func TestProjectRouteCompatibility(t *testing.T) {
 	}
 	if _, err := knowledgeAgent.Status(knowlega.ScopeRef{OrgID: "acme", ExternalScopeID: biz.ProjectScopeID(created.Project.ID), Kind: "project"}); err != nil {
 		t.Fatalf("project knowledge scope was not ensured: %v", err)
+	}
+	persistedScope, err := data.NewKnowledgeScopeRepository(pg).Get(ctx, "acme", biz.ProjectScopeID(created.Project.ID), "project")
+	if err != nil || persistedScope.ProjectName != "Roadmap" || persistedScope.RootPath == "" {
+		t.Fatalf("project knowledge scope was not persisted: scope=%+v err=%v", persistedScope, err)
 	}
 	addMemberBody := []byte(`{"memberId":"bob"}`)
 	addMember := httptest.NewRequest(http.MethodPost, "/v1/projects/"+created.Project.ID+"/members", bytes.NewReader(addMemberBody))
@@ -241,7 +245,7 @@ func TestSourceSkillCatalogCompatibility(t *testing.T) {
 	if err := pg.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pg.Pool.Exec(ctx, "TRUNCATE skills,sessions,projects,durable_map_versions,deactivated_principals,source_auth_replay,directory_members,directory_channels,directory_channel_members,directory_group_members,directory_sync,directory_meta,acl_grants,admin_grants,audit_log RESTART IDENTITY"); err != nil {
+	if _, err := pg.Pool.Exec(ctx, "TRUNCATE task_events,tasks,skills,sessions,projects,durable_map_versions,deactivated_principals,source_auth_replay,directory_members,directory_channels,directory_channel_members,directory_group_members,directory_sync,directory_meta,acl_grants,admin_grants,audit_log RESTART IDENTITY"); err != nil {
 		t.Fatal(err)
 	}
 	cfg := config.Default()
@@ -445,6 +449,21 @@ func TestLocalBlobTransferCompatibility(t *testing.T) {
 func TestRunDeliveryStateRouteOwnership(t *testing.T) {
 	h := &HTTPServer{}
 	h.config.QM.SlackEnvironmentState = "unknown"
+	for _, route := range []struct{ method, path string }{
+		{http.MethodGet, "/v1/admin/onboarding"},
+		{http.MethodGet, "/v1/admin/model-providers"},
+		{http.MethodGet, "/v1/admin/custom-providers"},
+		{http.MethodGet, "/v1/admin/slack-installation"},
+		{http.MethodPut, "/v1/admin/model-providers/openai"},
+		{http.MethodDelete, "/v1/admin/custom-providers/example"},
+		{http.MethodPut, "/v1/admin/slack-installation"},
+		{http.MethodPut, "/v1/admin/scopes/org:acme/base-model"},
+		{http.MethodPut, "/v1/admin/scopes/org:acme/connectors"},
+	} {
+		if !h.owns(route.method, route.path) || !h.yamlOnboardingRoute(route.method, route.path) {
+			t.Fatalf("YAML-managed onboarding route is not Go-owned: %s %s", route.method, route.path)
+		}
+	}
 	if !h.owns(http.MethodPost, "/v1/runs/run-1/delivery-state") {
 		t.Fatal("delivery-state route is not Go-owned")
 	}
@@ -553,12 +572,8 @@ func TestRunDeliveryStateRouteOwnership(t *testing.T) {
 		t.Fatal("admin sandbox route read is not Go-owned")
 	}
 	unknownSlack := httptest.NewRequest(http.MethodGet, "/v1/admin/slack-installation", nil)
-	if !h.proxySlackInstallationRoute(unknownSlack) {
-		t.Fatal("unknown Slack environment state must retain Node ownership")
-	}
-	h.config.QM.SlackEnvironmentState = "absent"
 	if h.proxySlackInstallationRoute(unknownSlack) {
-		t.Fatal("declared Slack environment state did not permit Go ownership")
+		t.Fatal("YAML-managed Slack status must be served by Go")
 	}
 	sandboxRoutes := httptest.NewRequest(http.MethodGet, "/v1/admin/sandbox-routes", nil)
 	if !h.proxySandboxRoutes(sandboxRoutes) {
@@ -603,13 +618,9 @@ func TestRunDeliveryStateRouteOwnership(t *testing.T) {
 			t.Fatalf("OAuth metadata route %s is not Go-owned", path)
 		}
 		request := httptest.NewRequest(http.MethodGet, path, nil)
-		if !h.proxyOAuthCatalogRoute(request) {
-			t.Fatalf("undeclared OAuth catalog ownership must proxy %s", path)
+		if h.proxyOAuthCatalogRoute(request) {
+			t.Fatalf("YAML-managed OAuth catalog must be served by Go: %s", path)
 		}
-	}
-	h.config.QM.OAuthCatalogEnabled = true
-	if h.proxyOAuthCatalogRoute(httptest.NewRequest(http.MethodGet, "/v1/connectors/catalog", nil)) || h.proxyOAuthCatalogRoute(httptest.NewRequest(http.MethodGet, "/v1/connectors/oauth/status", nil)) {
-		t.Fatal("declared OAuth catalog did not permit Go ownership")
 	}
 	for _, route := range []struct {
 		method string
@@ -648,6 +659,13 @@ func TestRunDeliveryStateRouteOwnership(t *testing.T) {
 	}
 	if !h.owns(http.MethodPost, "/v1/surface-context/context-1/result") {
 		t.Fatal("surface context result route is not Go-owned")
+	}
+	if !h.owns(http.MethodPost, "/v1/surface-context") || !h.owns(http.MethodPost, "/v1/surface-file") || !h.owns(http.MethodGet, "/v1/surface-context/pending") {
+		t.Fatal("surface context request routes are not implemented by Go")
+	}
+	pendingSurface := httptest.NewRequest(http.MethodGet, "/v1/surface-context/pending", nil)
+	if !h.proxySurfaceContextPendingRoute(pendingSurface) {
+		t.Fatal("surface context pending route must stay on Node until live-search viewer tokens move to Go")
 	}
 	if !h.owns(http.MethodGet, "/v1/deliveries") {
 		t.Fatal("pending deliveries route is not Go-owned")
@@ -712,6 +730,9 @@ func TestRunDeliveryStateRouteOwnership(t *testing.T) {
 	if !h.owns(http.MethodPost, "/v1/files/upload") {
 		t.Fatal("local staged file upload route is not Go-owned")
 	}
+	if !h.owns(http.MethodPost, "/v1/projects/p1/files") || !h.owns(http.MethodDelete, "/v1/projects/p1/files/file-1") || !h.owns(http.MethodPost, "/v1/projects/p1/files/file-1/retry") {
+		t.Fatal("project file lifecycle routes are not Go-owned")
+	}
 	if !h.owns(http.MethodGet, "/v1/admin/files/read") || !h.owns(http.MethodGet, "/v1/admin/files/download") || !h.owns(http.MethodPost, "/v1/admin/files/upload") {
 		t.Fatal("local administrator file byte routes are not Go-owned")
 	}
@@ -737,6 +758,18 @@ func TestRunDeliveryStateRouteOwnership(t *testing.T) {
 	contentWithStore.Header.Set(auth.CapabilityHeader, "capability")
 	if h.proxyFileContentRoute(contentWithStore) {
 		t.Fatal("configured local capability file content route did not cut over to Go")
+	}
+	if !h.localFileContentRoute(contentWithStore) {
+		t.Fatal("configured local capability file content route is not forced to Go in proxy mode")
+	}
+	signedContentWithStore := httptest.NewRequest(http.MethodGet, "/v1/files/file-1/content?viewer=U1", nil)
+	signedContentWithStore.Header.Set("x-signature", "signature")
+	if !h.localFileContentRoute(signedContentWithStore) {
+		t.Fatal("configured local signed file content route is not forced to Go in proxy mode")
+	}
+	unsignedContentWithStore := httptest.NewRequest(http.MethodGet, "/v1/files/file-1/content?viewer=U1", nil)
+	if h.localFileContentRoute(unsignedContentWithStore) {
+		t.Fatal("unsigned file content route must not bypass the proxy identity contract")
 	}
 	uploadWithoutTransfer := httptest.NewRequest(http.MethodPost, "/v1/files/upload", nil)
 	if !h.proxyFileUploadRoute(uploadWithoutTransfer) {
@@ -767,6 +800,10 @@ func TestRunDeliveryStateRouteOwnership(t *testing.T) {
 	teamScopeResources := httptest.NewRequest(http.MethodGet, "/v1/scope-resources?principalId=U1&scope=team:T1", nil)
 	if !h.proxyScopeResourcesRoute(teamScopeResources) {
 		t.Fatal("team scope resources must stay on Node until team membership is migrated")
+	}
+	projectScopeResources := httptest.NewRequest(http.MethodGet, "/v1/scope-resources?principalId=U1&scope=group:web-project-P1", nil)
+	if !projectScopeResourcesRoute(projectScopeResources) {
+		t.Fatal("project scope resources must expose Go-owned knowledge state even in proxy mode")
 	}
 	if !h.owns(http.MethodGet, "/v1/sessions/session-1/background") {
 		t.Fatal("session background route is not Go-owned")
@@ -961,7 +998,7 @@ func TestAdminDirectoryAndSlackMirrorReadRoutes(t *testing.T) {
 	if err := pg.Migrate(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pg.Pool.Exec(ctx, "TRUNCATE deliveries,turn_metrics,run_activity,run_signals,runs,session_llm_requests,session_entries,participants,sessions,projects,memory_revisions,error_events,credential_usage,egress_events,ambient_judgments,ack_emoji_picks,channel_messages,channel_files,channel_state,directory_members,directory_channels,directory_channel_members,directory_group_members,directory_sync,directory_meta,acl_grants,admin_grants,audit_log RESTART IDENTITY"); err != nil {
+	if _, err := pg.Pool.Exec(ctx, "TRUNCATE task_events,tasks,deliveries,turn_metrics,run_activity,run_signals,runs,session_llm_requests,session_entries,participants,sessions,projects,memory_revisions,error_events,credential_usage,egress_events,ambient_judgments,ack_emoji_picks,channel_messages,channel_files,channel_state,directory_members,directory_channels,directory_channel_members,directory_group_members,directory_sync,directory_meta,acl_grants,admin_grants,audit_log RESTART IDENTITY"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pg.Pool.Exec(ctx, "CREATE TABLE IF NOT EXISTS session_leases(session_id TEXT PRIMARY KEY,token TEXT NOT NULL,expires_at BIGINT NOT NULL)"); err != nil {
@@ -1293,11 +1330,18 @@ func TestAdminDirectoryAndSlackMirrorReadRoutes(t *testing.T) {
 		t.Fatal(err)
 	}
 	repo := data.NewProjectRepository(pg, cfg.QM.OrgID)
-	cfg.QM.SlackEnvironmentState = "absent"
+	cfg.QM.Models = config.ModelsConfig{
+		DefaultHarness: "pi",
+		Providers: []config.ModelProviderConfig{{
+			ID: "example-ai", Protocol: "openai", BaseURL: "https://models.example.test/v1", APIKey: "yaml-model-secret",
+			Models: []config.ModelDefinition{{ID: "example-1", Name: "Example One", ContextWindow: 64000}},
+		}},
+		Harnesses: []config.ModelHarnessConfig{{ID: "pi", Provider: "example-ai", ModelIDs: []string{"example-1"}, DefaultModel: "example-1"}},
+	}
+	cfg.QM.Slack = config.SlackConfig{BotToken: "xoxb-yaml-secret", AppToken: "xapp-yaml-secret", TeamID: "T1", TeamName: "Acme"}
+	cfg.QM.OAuth.Clients = []config.OAuthClientConfig{{Provider: "slack", ClientID: "yaml-client", ClientSecret: "yaml-client-secret"}}
 	cfg.QM.SandboxDefaultBackend = "local"
 	cfg.QM.SandboxBackends = []string{"local", "sprites"}
-	cfg.QM.OAuthCatalogEnabled = true
-	cfg.QM.OAuthConfiguredProviders = []string{"slack"}
 	h := &HTTPServer{config: cfg, projects: biz.NewProjectUsecase(repo), projectRepo: repo, directory: directory, acl: data.NewACLRepository(pg), environments: data.NewEnvironmentRepository(pg, cfg.QM.OrgID), channelPolicy: data.NewChannelPolicyRepository(pg, cfg.QM.OrgID), surfaceCache: data.NewSurfaceCacheRepository(pg, cfg.QM.OrgID), ambientJudgments: data.NewAmbientJudgmentRepository(pg, cfg.QM.OrgID), ackEmojiPicks: data.NewAckEmojiPickRepository(pg, cfg.QM.OrgID), egress: data.NewEgressRepository(pg), errors: data.NewErrorEventRepository(pg), runs: data.NewRunRepository(pg), deliveries: data.NewDeliveryRepository(pg), sessions: data.NewSessionRepository(pg), replay: data.NewReplayRepository(pg), metrics: data.NewMetricsRepository(pg), retention: data.NewRetentionRepository(pg), crons: data.NewCronRepository(pg), files: data.NewFileArtifactRepository(pg), deployments: data.NewDeploymentRepository(pg), memory: data.NewMemoryRepository(pg), skills: data.NewSkillRepository(pg), souls: data.NewSoulRepository(pg), userConfig: data.NewUserConfigRepository(pg), contextRequests: data.NewContextRequestRepository(pg), keychain: data.NewKeychainStatusRepository(pg), customProviders: data.NewCustomProviderRepository(pg), slackInstallation: data.NewSlackInstallationRepository(pg), sandboxRoutes: data.NewSandboxRouteRepository(pg), audit: data.NewAuditor(pg), auth: auth.Verifier{SourceSecret: cfg.Auth.SourceSigningSecret, CapabilitySecret: cfg.Auth.CapabilitySecret, ReplayWindow: time.Minute, DB: pg.Pool}, logger: slog.Default()}
 	shareCapability := testCapabilityToken(t, cfg.Auth.CapabilitySecret, "U1", "personal:U1")
 	for _, test := range []struct {
@@ -1533,7 +1577,7 @@ func TestAdminDirectoryAndSlackMirrorReadRoutes(t *testing.T) {
 	fileContentRequest.Header.Set(auth.CapabilityHeader, testCapabilityToken(t, cfg.Auth.CapabilitySecret, "U1", "personal:U1"))
 	fileContentResponse := httptest.NewRecorder()
 	h.serveOwned(fileContentResponse, fileContentRequest)
-	if fileContentResponse.Code != http.StatusOK || !bytes.Equal(fileContentResponse.Body.Bytes(), localBlobBytes) || fileContentResponse.Header().Get("content-type") != "text/plain" || fileContentResponse.Header().Get("content-disposition") != "inline; filename*=UTF-8''go%20read.txt" {
+	if fileContentResponse.Code != http.StatusOK || !bytes.Equal(fileContentResponse.Body.Bytes(), localBlobBytes) || fileContentResponse.Header().Get("content-type") != "text/plain; charset=utf-8" || fileContentResponse.Header().Get("content-disposition") != "inline; filename*=UTF-8''go%20read.txt" {
 		t.Fatalf("capability file content=%d headers=%v body=%q", fileContentResponse.Code, fileContentResponse.Header(), fileContentResponse.Body.Bytes())
 	}
 	stagedUploadID := strings.Repeat("b", 32)
@@ -1576,7 +1620,7 @@ func TestAdminDirectoryAndSlackMirrorReadRoutes(t *testing.T) {
 	uploadedContentRequest.Header.Set(auth.CapabilityHeader, testCapabilityToken(t, cfg.Auth.CapabilitySecret, "U1", "personal:U1"))
 	uploadedContentResponse := httptest.NewRecorder()
 	h.serveOwned(uploadedContentResponse, uploadedContentRequest)
-	if uploadedContentResponse.Code != http.StatusOK || !bytes.Equal(uploadedContentResponse.Body.Bytes(), stagedUploadBytes) || uploadedContentResponse.Header().Get("content-type") != "text/markdown" {
+	if uploadedContentResponse.Code != http.StatusOK || !bytes.Equal(uploadedContentResponse.Body.Bytes(), stagedUploadBytes) || uploadedContentResponse.Header().Get("content-type") != "text/markdown; charset=utf-8" {
 		t.Fatalf("uploaded Go file content=%d headers=%v body=%q", uploadedContentResponse.Code, uploadedContentResponse.Header(), uploadedContentResponse.Body.Bytes())
 	}
 	adminBlobID := strings.Repeat("c", 32)
@@ -1629,7 +1673,12 @@ func TestAdminDirectoryAndSlackMirrorReadRoutes(t *testing.T) {
 		t.Fatalf("grant=%d %s", grantResponse.Code, grantResponse.Body.String())
 	}
 	grants, err := h.acl.List(ctx, "personal:U1", "deployment:deployment-scope")
-	if err != nil || len(grants) != 1 || grants[0].GranteeScopeID != "personal:U2" || grants[0].Permission != "write" {
+	ownerRead, collaboratorWrite := false, false
+	for _, grant := range grants {
+		ownerRead = ownerRead || grant.GranteeScopeID == "personal:U1" && grant.Permission == "read"
+		collaboratorWrite = collaboratorWrite || grant.GranteeScopeID == "personal:U2" && grant.Permission == "write"
+	}
+	if err != nil || len(grants) != 2 || !ownerRead || !collaboratorWrite {
 		t.Fatalf("grants=%#v err=%v", grants, err)
 	}
 	grantDeniedBody := []byte(`{"ownerScopeId":"personal:U1","ref":"deployment:deployment-scope","granteeScopeId":"personal:U3","permission":"read","grantedBy":"U2"}`)
@@ -1649,7 +1698,7 @@ func TestAdminDirectoryAndSlackMirrorReadRoutes(t *testing.T) {
 		t.Fatalf("revoke=%d %s", revokeResponse.Code, revokeResponse.Body.String())
 	}
 	grants, err = h.acl.List(ctx, "personal:U1", "deployment:deployment-scope")
-	if err != nil || len(grants) != 0 {
+	if err != nil || len(grants) != 1 || grants[0].GranteeScopeID != "personal:U1" || grants[0].Permission != "read" {
 		t.Fatalf("grants after revoke=%#v err=%v", grants, err)
 	}
 	memoryGet := httptest.NewRequest(http.MethodGet, "/v1/memory?principalId=U1", nil)
@@ -1903,7 +1952,7 @@ func TestAdminDirectoryAndSlackMirrorReadRoutes(t *testing.T) {
 	signSourceRequest(t, adminCustomProviders, cfg.Auth.SourceSigningSecret, nil)
 	adminCustomProvidersResponse := httptest.NewRecorder()
 	h.serveOwned(adminCustomProvidersResponse, adminCustomProviders)
-	if adminCustomProvidersResponse.Code != http.StatusOK || !bytes.Contains(adminCustomProvidersResponse.Body.Bytes(), []byte(`"id":"example-ai"`)) || !bytes.Contains(adminCustomProvidersResponse.Body.Bytes(), []byte(`"hasKey":true`)) || !bytes.Contains(adminCustomProvidersResponse.Body.Bytes(), []byte(`"id":"disabled-ai"`)) || !bytes.Contains(adminCustomProvidersResponse.Body.Bytes(), []byte(`"disabled":true`)) || bytes.Contains(adminCustomProvidersResponse.Body.Bytes(), []byte(`must-not-leak`)) || bytes.Contains(adminCustomProvidersResponse.Body.Bytes(), []byte(`disabled-key`)) {
+	if adminCustomProvidersResponse.Code != http.StatusOK || !bytes.Contains(adminCustomProvidersResponse.Body.Bytes(), []byte(`"id":"example-ai"`)) || !bytes.Contains(adminCustomProvidersResponse.Body.Bytes(), []byte(`"hasKey":true`)) || !bytes.Contains(adminCustomProvidersResponse.Body.Bytes(), []byte(`"source":"yaml"`)) || bytes.Contains(adminCustomProvidersResponse.Body.Bytes(), []byte(`disabled-ai`)) || bytes.Contains(adminCustomProvidersResponse.Body.Bytes(), []byte(`yaml-model-secret`)) || bytes.Contains(adminCustomProvidersResponse.Body.Bytes(), []byte(`must-not-leak`)) {
 		t.Fatalf("admin custom providers=%d %s", adminCustomProvidersResponse.Code, adminCustomProvidersResponse.Body.String())
 	}
 	adminSlackInstallation := httptest.NewRequest(http.MethodGet, "/v1/admin/slack-installation", nil)
@@ -1911,7 +1960,7 @@ func TestAdminDirectoryAndSlackMirrorReadRoutes(t *testing.T) {
 	signSourceRequest(t, adminSlackInstallation, cfg.Auth.SourceSigningSecret, nil)
 	adminSlackInstallationResponse := httptest.NewRecorder()
 	h.serveOwned(adminSlackInstallationResponse, adminSlackInstallation)
-	if adminSlackInstallationResponse.Code != http.StatusOK || !bytes.Contains(adminSlackInstallationResponse.Body.Bytes(), []byte(`"configured":true`)) || !bytes.Contains(adminSlackInstallationResponse.Body.Bytes(), []byte(`"managed":true`)) || !bytes.Contains(adminSlackInstallationResponse.Body.Bytes(), []byte(`"source":"admin"`)) || !bytes.Contains(adminSlackInstallationResponse.Body.Bytes(), []byte(`"teamId":"T1"`)) || bytes.Contains(adminSlackInstallationResponse.Body.Bytes(), []byte(`must-not-leak`)) || bytes.Contains(adminSlackInstallationResponse.Body.Bytes(), []byte(`also-secret`)) {
+	if adminSlackInstallationResponse.Code != http.StatusOK || !bytes.Contains(adminSlackInstallationResponse.Body.Bytes(), []byte(`"configured":true`)) || !bytes.Contains(adminSlackInstallationResponse.Body.Bytes(), []byte(`"managed":true`)) || !bytes.Contains(adminSlackInstallationResponse.Body.Bytes(), []byte(`"source":"yaml"`)) || !bytes.Contains(adminSlackInstallationResponse.Body.Bytes(), []byte(`"teamId":"T1"`)) || bytes.Contains(adminSlackInstallationResponse.Body.Bytes(), []byte(`yaml-secret`)) || bytes.Contains(adminSlackInstallationResponse.Body.Bytes(), []byte(`must-not-leak`)) {
 		t.Fatalf("admin Slack installation=%d %s", adminSlackInstallationResponse.Code, adminSlackInstallationResponse.Body.String())
 	}
 	var slackResponse struct {
@@ -2276,11 +2325,16 @@ func TestAdminDirectoryAndSlackMirrorReadRoutes(t *testing.T) {
 	deploymentShareRequest.Header.Set(auth.CapabilityHeader, capBody.Token)
 	deploymentShareResponse := httptest.NewRecorder()
 	h.serveOwned(deploymentShareResponse, deploymentShareRequest)
-	if deploymentShareResponse.Code != http.StatusOK || !bytes.Contains(deploymentShareResponse.Body.Bytes(), []byte(`"scope":"personal:U2"`)) || !bytes.Contains(deploymentShareResponse.Body.Bytes(), []byte(`"label":"Bob"`)) || !bytes.Contains(deploymentShareResponse.Body.Bytes(), []byte(`"access":"manage"`)) || !bytes.Contains(deploymentShareResponse.Body.Bytes(), []byte(`"reach":"1 grantee"`)) || !bytes.Contains(deploymentShareResponse.Body.Bytes(), []byte(`"permission":"write"`)) {
+	if deploymentShareResponse.Code != http.StatusOK || !bytes.Contains(deploymentShareResponse.Body.Bytes(), []byte(`"scope":"personal:U2"`)) || !bytes.Contains(deploymentShareResponse.Body.Bytes(), []byte(`"label":"Bob"`)) || !bytes.Contains(deploymentShareResponse.Body.Bytes(), []byte(`"access":"manage"`)) || !bytes.Contains(deploymentShareResponse.Body.Bytes(), []byte(`"reach":"2 grantees"`)) || !bytes.Contains(deploymentShareResponse.Body.Bytes(), []byte(`"permission":"write"`)) {
 		t.Fatalf("deployment share=%d %s", deploymentShareResponse.Code, deploymentShareResponse.Body.String())
 	}
 	deploymentGrants, err := h.acl.List(ctx, "personal:U1", "deployment:deployment-scope")
-	if err != nil || len(deploymentGrants) != 1 || deploymentGrants[0].GranteeScopeID != "personal:U2" || deploymentGrants[0].Permission != "write" {
+	ownerRead, collaboratorWrite = false, false
+	for _, grant := range deploymentGrants {
+		ownerRead = ownerRead || grant.GranteeScopeID == "personal:U1" && grant.Permission == "read"
+		collaboratorWrite = collaboratorWrite || grant.GranteeScopeID == "personal:U2" && grant.Permission == "write"
+	}
+	if err != nil || len(deploymentGrants) != 2 || !ownerRead || !collaboratorWrite {
 		t.Fatalf("deployment share grants=%#v err=%v", deploymentGrants, err)
 	}
 	deploymentShareSource := httptest.NewRequest(http.MethodPost, "/v1/deployments/deployment-scope/share", bytes.NewReader(deploymentShareBody))

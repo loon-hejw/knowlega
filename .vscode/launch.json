@@ -2,17 +2,38 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "Backend: QM + Knowlega Agent",
+      "name": "QM: Full Stack (No Slack)",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npm run dev-instance:no-slack -- --force",
+      "cwd": "${workspaceFolder}/qm"
+    },
+    {
+      "name": "QM: Dev Status",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npm run dev-instance:status",
+      "cwd": "${workspaceFolder}/qm"
+    },
+    {
+      "name": "QM: Dev Doctor",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npm run dev-instance:doctor",
+      "cwd": "${workspaceFolder}/qm"
+    },
+    {
+      "name": "Backend: QM + Knowlega Agent (standalone)",
       "type": "go",
       "request": "launch",
       "mode": "debug",
       "program": "${workspaceFolder}/cmd/qm-backend",
       "args": [
         "--config",
-        "${workspaceFolder}/qm-backend/configs/config.yaml"
+        "${workspaceFolder}/configs/qm-config.yaml"
       ],
       "cwd": "${workspaceFolder}"
-    }
+    },
     {
       "name": "Tests: QM + Knowlega (Go)",
       "type": "node-terminal",
@@ -30,7 +51,7 @@
         "-test.v"
       ],
       "cwd": "${workspaceFolder}"
-    },
+    }
   ],
   "compounds": []
 }

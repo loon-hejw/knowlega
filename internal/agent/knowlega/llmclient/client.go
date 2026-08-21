@@ -1,6 +1,7 @@
 package llmclient
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -72,6 +73,7 @@ type ChatRequest struct {
 	MaxTokens       int
 	Temperature     float64
 	DisableThinking bool
+	Stream          bool
 }
 
 func (c Client) Chat(ctx context.Context, input ChatRequest) (string, bool, error) {
@@ -113,15 +115,22 @@ func (c Client) chatOpenAI(ctx context.Context, input ChatRequest) (string, bool
 		},
 		Temperature: input.Temperature,
 		MaxTokens:   input.MaxTokens,
+		Stream:      input.Stream,
 	}
 	if input.DisableThinking {
 		// Several OpenAI-compatible reasoning gateways otherwise spend the
 		// output budget in reasoning_content and return content=null.
+		disabled := false
+		payload.EnableThinking = &disabled
 		payload.ChatTemplateKwargs = map[string]any{"enable_thinking": false}
+		payload.ReasoningEffort = "low"
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return "", false, err
+	}
+	if input.Stream {
+		return c.chatOpenAIStream(ctx, body)
 	}
 	data, status, retryable, err := c.do(ctx, "/chat/completions", body, func(req *http.Request) {
 		req.Header.Set("Authorization", "Bearer "+c.APIKey)
@@ -132,6 +141,93 @@ func (c Client) chatOpenAI(ctx context.Context, input ChatRequest) (string, bool
 	if status < 200 || status >= 300 {
 		return "", retryableStatusResponse(status, data), requestStatusError(status, data)
 	}
+	return parseOpenAIChatResponse(c.Model, data)
+}
+
+func (c Client) chatOpenAIStream(ctx context.Context, body []byte) (string, bool, error) {
+	requestURL := protocolEndpoint(c.BaseURL, "/chat/completions")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(body))
+	if err != nil {
+		return "", false, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Authorization", "Bearer "+c.APIKey)
+	userAgent := strings.TrimSpace(c.UserAgent)
+	if userAgent == "" {
+		userAgent = DefaultUserAgent
+	}
+	req.Header.Set("User-Agent", userAgent)
+	client := c.HTTPClient
+	if client == nil {
+		client = &http.Client{Timeout: 180 * time.Second}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", ctx.Err() == nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return "", true, readErr
+		}
+		return "", retryableStatusResponse(resp.StatusCode, data), requestStatusError(resp.StatusCode, data)
+	}
+	if !strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		data, readErr := io.ReadAll(resp.Body)
+		if readErr != nil {
+			return "", true, readErr
+		}
+		return parseOpenAIChatResponse(c.Model, data)
+	}
+	var content strings.Builder
+	var reasoningFallback strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 64*1024), 2<<20)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var event struct {
+			Choices []struct {
+				Delta struct {
+					Content          json.RawMessage `json:"content"`
+					ReasoningContent json.RawMessage `json:"reasoning_content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			return "", true, fmt.Errorf("decode streaming llm response: %w: %s", err, responseSnippet([]byte(data)))
+		}
+		for _, choice := range event.Choices {
+			content.WriteString(openAIContentDelta(choice.Delta.Content))
+			reasoningFallback.WriteString(openAIContentDelta(choice.Delta.ReasoningContent))
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", true, err
+	}
+	result := strings.TrimSpace(content.String())
+	if result == "" {
+		// Some compatible reasoning gateways ignore enable_thinking=false and
+		// place their structured JSON exclusively in reasoning_content. Keep
+		// this as an internal parser fallback; it is never surfaced as UI
+		// chain-of-thought.
+		result = strings.TrimSpace(reasoningFallback.String())
+	}
+	if result == "" {
+		return "", true, emptyContentError(c.Model, nil)
+	}
+	return result, false, nil
+}
+
+func parseOpenAIChatResponse(model string, data []byte) (string, bool, error) {
 	var parsed openAIResponse
 	if err := json.Unmarshal(data, &parsed); err != nil {
 		return "", true, fmt.Errorf("decode llm response: %w: %s", err, responseSnippet(data))
@@ -144,9 +240,37 @@ func (c Client) chatOpenAI(ctx context.Context, input ChatRequest) (string, bool
 		content = strings.TrimSpace(parsed.Choices[0].Text)
 	}
 	if content == "" {
-		return "", true, emptyContentError(c.Model, data)
+		// A few gateways return an ordinary JSON response even when stream=true
+		// and ignore both supported thinking-disable hints. Match the streaming
+		// parser's internal fallback so structured maintenance output is not
+		// discarded solely because it arrived in reasoning_content.
+		content = openAIContentText(parsed.Choices[0].Message.ReasoningContent)
+	}
+	if content == "" {
+		return "", true, emptyContentError(model, data)
 	}
 	return content, false, nil
+}
+
+func openAIContentDelta(raw json.RawMessage) string {
+	var text string
+	if err := json.Unmarshal(raw, &text); err == nil {
+		return text
+	}
+	var parts []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	}
+	if json.Unmarshal(raw, &parts) != nil {
+		return ""
+	}
+	var content strings.Builder
+	for _, part := range parts {
+		if part.Type == "" || part.Type == "text" || part.Type == "output_text" {
+			content.WriteString(part.Text)
+		}
+	}
+	return content.String()
 }
 
 func (c Client) chatAnthropic(ctx context.Context, input ChatRequest) (string, bool, error) {
@@ -318,13 +442,17 @@ type openAIRequest struct {
 	Messages           []message      `json:"messages"`
 	Temperature        float64        `json:"temperature"`
 	MaxTokens          int            `json:"max_tokens"`
+	EnableThinking     *bool          `json:"enable_thinking,omitempty"`
+	ReasoningEffort    string         `json:"reasoning_effort,omitempty"`
 	ChatTemplateKwargs map[string]any `json:"chat_template_kwargs,omitempty"`
+	Stream             bool           `json:"stream,omitempty"`
 }
 
 type openAIResponse struct {
 	Choices []struct {
 		Message struct {
-			Content json.RawMessage `json:"content"`
+			Content          json.RawMessage `json:"content"`
+			ReasoningContent json.RawMessage `json:"reasoning_content"`
 		} `json:"message"`
 		Text string `json:"text"`
 	} `json:"choices"`

@@ -98,6 +98,10 @@ type WikiPageVersion struct {
 type SourceManifestEntry struct {
 	ID                       string
 	ProjectID                string
+	QMFileID                 string
+	QMProjectID              string
+	QMScopeID                string
+	QMSourceSHA256           string
 	OriginalPath             string
 	PipelineVersion          int
 	SHA256                   string
@@ -193,7 +197,7 @@ type ReviewOption struct {
 	Action string
 }
 
-type QueryResult struct {
+type KnowledgeSearchResult struct {
 	Path    string `json:"path"`
 	Title   string `json:"title"`
 	Snippet string `json:"snippet"`
@@ -201,120 +205,73 @@ type QueryResult struct {
 	Kind    string `json:"kind"`
 }
 
-type QuerySearch struct {
-	Text      string `json:"text"`
-	Weight    int    `json:"weight"`
-	Rationale string `json:"rationale"`
-}
-
-type QueryRequirement struct {
+type KnowledgeRequirement struct {
 	ID   string `json:"id"`
 	Text string `json:"text"`
 	Kind string `json:"kind,omitempty"`
 }
 
-type QueryHypothesis struct {
-	Candidate      string               `json:"candidate"`
-	Rationale      string               `json:"rationale,omitempty"`
-	Discriminators []string             `json:"discriminators,omitempty"`
-	SuggestedReads []string             `json:"suggested_reads,omitempty"`
-	Checks         []QueryEvidenceCheck `json:"evidence_checks,omitempty"`
-	Coverage       int                  `json:"coverage,omitempty"`
-}
-
-type QueryEvidenceCheck struct {
+type KnowledgeEvidenceCheck struct {
 	RequirementID string   `json:"requirement_id"`
 	Status        string   `json:"status"`
 	EvidencePaths []string `json:"evidence_paths,omitempty"`
 	Explanation   string   `json:"explanation,omitempty"`
 }
 
-type QueryCandidateAssessment struct {
-	Candidate                  string               `json:"candidate"`
-	Disposition                string               `json:"disposition"`
-	Checks                     []QueryEvidenceCheck `json:"evidence_checks,omitempty"`
-	UnresolvedRequirementIDs   []string             `json:"unresolved_requirement_ids,omitempty"`
-	ContradictedRequirementIDs []string             `json:"contradicted_requirement_ids,omitempty"`
-	Reason                     string               `json:"reason,omitempty"`
-	Step                       int                  `json:"step,omitempty"`
+type KnowledgeCandidate struct {
+	Path                   string   `json:"path"`
+	Title                  string   `json:"title"`
+	Kind                   string   `json:"kind"`
+	Score                  int      `json:"score"`
+	RecallRequirementIDs   []string `json:"recall_requirement_ids,omitempty"`
+	RecallRequirementCount int      `json:"recall_requirement_count,omitempty"`
 }
 
-type QueryVerification struct {
-	Pass           int      `json:"pass"`
-	Kind           string   `json:"kind"`
-	Accepted       bool     `json:"accepted"`
-	Summary        string   `json:"summary,omitempty"`
-	Unresolved     []string `json:"unresolved,omitempty"`
-	Contradictions []string `json:"contradictions,omitempty"`
-	NextQueries    []string `json:"next_queries,omitempty"`
+type KnowledgeCitation struct {
+	Path    string   `json:"path"`
+	Title   string   `json:"title"`
+	Kind    string   `json:"kind"`
+	Aliases []string `json:"aliases,omitempty"`
 }
 
-type QueryPlan struct {
-	Question            string             `json:"question"`
-	ResolvedQuestion    string             `json:"resolved_question,omitempty"`
-	Intent              string             `json:"intent"`
-	ReasoningMode       string             `json:"reasoning_mode,omitempty"`
-	Requirements        []QueryRequirement `json:"requirements,omitempty"`
-	Hypotheses          []QueryHypothesis  `json:"hypotheses,omitempty"`
-	RequireAll          bool               `json:"require_all_requirements,omitempty"`
-	RequireVerification bool               `json:"require_verification,omitempty"`
-	VerificationPasses  int                `json:"verification_passes,omitempty"`
-	ReadFirst           []string           `json:"read_first"`
-	Searches            []QuerySearch      `json:"searches"`
-	CandidateLimit      int                `json:"candidate_limit"`
-	AnswerMode          string             `json:"answer_mode"`
-	CanWriteBack        bool               `json:"can_write_back"`
+type KnowledgeActionRecord struct {
+	Action          string   `json:"action"`
+	Query           string   `json:"query,omitempty"`
+	Path            string   `json:"path,omitempty"`
+	Candidate       string   `json:"candidate,omitempty"`
+	RequirementID   string   `json:"requirement_id,omitempty"`
+	WorkspaceStatus string   `json:"workspace_status,omitempty"`
+	ResultCount     int      `json:"result_count,omitempty"`
+	Sequence        int      `json:"sequence,omitempty"`
+	ResultPaths     []string `json:"result_paths,omitempty"`
 }
 
-type QueryAction struct {
-	Action    string               `json:"action"`
-	Path      string               `json:"path,omitempty"`
-	Query     string               `json:"query,omitempty"`
-	Limit     int                  `json:"limit,omitempty"`
-	Title     string               `json:"title,omitempty"`
-	Answer    string               `json:"answer,omitempty"`
-	Rationale string               `json:"rationale,omitempty"`
-	Candidate string               `json:"candidate,omitempty"`
-	Checks    []QueryEvidenceCheck `json:"evidence_checks,omitempty"`
+type KnowledgeValidationIssue struct {
+	Code          string                 `json:"code"`
+	RequirementID string                 `json:"requirement_id,omitempty"`
+	Message       string                 `json:"message"`
+	Repair        *KnowledgeRepairAction `json:"repair,omitempty"`
 }
 
-type QueryTurnDecision struct {
-	Intent           string             `json:"intent,omitempty"`
-	ResolvedQuestion string             `json:"resolved_question,omitempty"`
-	ReasoningMode    string             `json:"reasoning_mode,omitempty"`
-	Requirements     []QueryRequirement `json:"requirements,omitempty"`
-	Hypotheses       []QueryHypothesis  `json:"hypotheses,omitempty"`
-	RequireAll       bool               `json:"require_all_requirements,omitempty"`
-	CanWriteBack     *bool              `json:"can_write_back,omitempty"`
-	Action           QueryAction        `json:"action"`
+// KnowledgeRepairAction describes the next deterministic tool call needed to
+// fix a validation protocol error.
+type KnowledgeRepairAction struct {
+	Action        string `json:"action"`
+	Query         string `json:"query,omitempty"`
+	Path          string `json:"path,omitempty"`
+	Candidate     string `json:"candidate,omitempty"`
+	RequirementID string `json:"requirement_id,omitempty"`
 }
 
-type QueryTraceStep struct {
-	Step        int         `json:"step"`
-	Action      QueryAction `json:"action"`
-	Observation string      `json:"observation"`
-}
-
-type QueryCitation struct {
-	Path  string `json:"path"`
-	Title string `json:"title"`
-	Kind  string `json:"kind"`
-}
-
-type QueryAnswer struct {
+type KnowledgeSubmission struct {
 	Question                 string                     `json:"question"`
-	Plan                     QueryPlan                  `json:"plan"`
-	Results                  []QueryResult              `json:"results"`
 	Answer                   string                     `json:"answer"`
-	Status                   string                     `json:"status,omitempty"`
+	Status                   string                     `json:"status"`
 	Candidate                string                     `json:"candidate,omitempty"`
-	EvidenceChecks           []QueryEvidenceCheck       `json:"evidence_checks,omitempty"`
-	CandidateAssessments     []QueryCandidateAssessment `json:"candidate_assessments,omitempty"`
+	Requirements             []KnowledgeRequirement     `json:"requirements,omitempty"`
+	Checks                   []KnowledgeEvidenceCheck   `json:"evidence_checks,omitempty"`
+	EvidencePaths            []string                   `json:"evidence_paths,omitempty"`
 	UnresolvedRequirementIDs []string                   `json:"unresolved_requirement_ids,omitempty"`
-	SuggestedWritebackTitle  string                     `json:"suggested_writeback_title,omitempty"`
-	Citations                []QueryCitation            `json:"citations"`
-	Trace                    []QueryTraceStep           `json:"trace,omitempty"`
-	Verification             []QueryVerification        `json:"verification,omitempty"`
-	IncompleteReason         string                     `json:"incomplete_reason,omitempty"`
-	Notes                    []string                   `json:"notes"`
+	Citations                []KnowledgeCitation        `json:"citations,omitempty"`
+	ValidationIssues         []KnowledgeValidationIssue `json:"validation_issues,omitempty"`
 }

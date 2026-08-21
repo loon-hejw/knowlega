@@ -6,6 +6,7 @@ import (
 	"errors"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -48,6 +49,11 @@ type RunSnapshot struct {
 }
 
 type RunRepository struct{ pg *Postgres }
+
+// ErrRuntimeRunNotActive indicates that a terminal run cannot be transitioned
+// again. Callers may treat this as an idempotent completion rather than a
+// transient database failure.
+var ErrRuntimeRunNotActive = errors.New("runtime run is not active")
 
 type AdminRun struct {
 	ID             string  `json:"id"`
@@ -160,15 +166,28 @@ ORDER BY CASE WHEN c.status IN ('pending','running') THEN 0 ELSE 1 END,c.created
 }
 
 func (r *RunRepository) Enqueue(ctx context.Context, sessionID string, payload json.RawMessage, idempotencyKey string, maxAttempts int) (string, bool, error) {
+	return r.enqueue(ctx, "", "node", sessionID, payload, idempotencyKey, maxAttempts)
+}
+
+func (r *RunRepository) EnqueueWithID(ctx context.Context, id, sessionID string, payload json.RawMessage, idempotencyKey string, maxAttempts int) (string, bool, error) {
+	if strings.TrimSpace(id) == "" {
+		return "", false, errors.New("run id is required")
+	}
+	return r.enqueue(ctx, id, "go", sessionID, payload, idempotencyKey, maxAttempts)
+}
+
+func (r *RunRepository) enqueue(ctx context.Context, id, runtimeOwner, sessionID string, payload json.RawMessage, idempotencyKey string, maxAttempts int) (string, bool, error) {
 	if sessionID == "" || !json.Valid(payload) {
 		return "", false, errors.New("session_id and JSON payload are required")
 	}
 	if maxAttempts <= 0 {
 		maxAttempts = 3
 	}
-	id := uuid.NewString()
-	row := r.pg.Pool.QueryRow(ctx, `INSERT INTO runs(id,session_id,status,request,idempotency_key,attempts,max_attempts,created_at)
-VALUES($1,$2,'pending',$3,$4,0,$5,$6) ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`, id, sessionID, string(payload), nullIfEmpty(idempotencyKey), maxAttempts, time.Now().UnixMilli())
+	if id == "" {
+		id = uuid.NewString()
+	}
+	row := r.pg.Pool.QueryRow(ctx, `INSERT INTO runs(id,session_id,status,request,idempotency_key,attempts,max_attempts,created_at,runtime_owner)
+VALUES($1,$2,'pending',$3,$4,0,$5,$6,$7) ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`, id, sessionID, string(payload), nullIfEmpty(idempotencyKey), maxAttempts, time.Now().UnixMilli(), runtimeOwner)
 	var inserted string
 	if err := row.Scan(&inserted); err == nil {
 		return inserted, false, nil
@@ -182,6 +201,49 @@ VALUES($1,$2,'pending',$3,$4,0,$5,$6) ON CONFLICT(idempotency_key) DO NOTHING RE
 		return "", false, err
 	}
 	return inserted, true, nil
+}
+
+func (r *RunRepository) StartRuntime(ctx context.Context, runID string) error {
+	tag, err := r.pg.Pool.Exec(ctx, `UPDATE runs SET status='running',started_at=COALESCE(started_at,$2),attempts=attempts+1 WHERE id=$1 AND status IN ('pending','running')`, runID, time.Now().UnixMilli())
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrRuntimeRunNotActive
+	}
+	return nil
+}
+
+func (r *RunRepository) CompleteRuntime(ctx context.Context, runID string, result json.RawMessage) error {
+	if !json.Valid(result) {
+		return errors.New("runtime run result must be JSON")
+	}
+	tag, err := r.pg.Pool.Exec(ctx, `UPDATE runs SET status='done',result=$2::jsonb,lease_token=NULL,lease_expires_at=NULL,worker_id=NULL,finished_at=$3 WHERE id=$1 AND status IN ('pending','running')`, runID, string(result), time.Now().UnixMilli())
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrRuntimeRunNotActive
+	}
+	return nil
+}
+
+func (r *RunRepository) FailRuntime(ctx context.Context, runID, reason string, terminal bool) error {
+	status := "pending"
+	var result any
+	var finished *int64
+	if terminal {
+		status = "failed"
+		result = map[string]any{"status": "error", "reason": reason}
+		now := time.Now().UnixMilli()
+		finished = &now
+	}
+	encoded, _ := json.Marshal(result)
+	tag, err := r.pg.Pool.Exec(ctx, `UPDATE runs SET status=$2,result=$3::jsonb,finished_at=$4,lease_token=NULL,lease_expires_at=NULL,worker_id=NULL,error_attempts=error_attempts+1 WHERE id=$1 AND status IN ('pending','running')`, runID, status, nullIfEmpty(string(encoded)), finished)
+	if err == nil && tag.RowsAffected() == 0 {
+		return ErrRuntimeRunNotActive
+	}
+	return err
 }
 
 func (r *RunRepository) Get(ctx context.Context, runID string) (*RunSnapshot, error) {
@@ -246,7 +308,7 @@ func (r *RunRepository) Claim(ctx context.Context, workerID string, ttl time.Dur
 	var run ClaimedRun
 	err := r.pg.Pool.QueryRow(ctx, `UPDATE runs SET status='running',lease_token=$1,lease_expires_at=$2,worker_id=$3,
 attempts=attempts+1,started_at=COALESCE(started_at,$4)
-WHERE id=(SELECT id FROM runs WHERE status='pending' AND session_id NOT IN (SELECT session_id FROM runs WHERE status='running') ORDER BY created_at ASC FOR UPDATE SKIP LOCKED LIMIT 1)
+WHERE id=(SELECT id FROM runs WHERE status='pending' AND runtime_owner='node' AND session_id NOT IN (SELECT session_id FROM runs WHERE status='running' AND runtime_owner='node') ORDER BY created_at ASC FOR UPDATE SKIP LOCKED LIMIT 1)
 RETURNING id,session_id,lease_token,request,attempts,lease_expires_at,max_attempts,error_attempts,created_at,started_at`, token, now+ttl.Milliseconds(), workerID, now).Scan(&run.ID, &run.SessionID, &run.LeaseToken, &run.Payload, &run.Attempt, &run.LeaseExpiresAt, &run.MaxAttempts, &run.ErrorAttempts, &run.CreatedAt, &run.StartedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
@@ -269,8 +331,8 @@ func (r *RunRepository) ClaimByID(ctx context.Context, runID, workerID string, t
 	var run ClaimedRun
 	err := r.pg.Pool.QueryRow(ctx, `UPDATE runs SET status='running',lease_token=$1,lease_expires_at=$2,worker_id=$3,
 attempts=attempts+1,started_at=COALESCE(started_at,$4)
-WHERE id=(SELECT id FROM runs WHERE id=$5 AND status='pending'
-  AND session_id NOT IN (SELECT session_id FROM runs WHERE status='running')
+WHERE id=(SELECT id FROM runs WHERE id=$5 AND status='pending' AND runtime_owner='node'
+  AND session_id NOT IN (SELECT session_id FROM runs WHERE status='running' AND runtime_owner='node')
   FOR UPDATE SKIP LOCKED)
 RETURNING id,session_id,lease_token,request,attempts,lease_expires_at,max_attempts,error_attempts,created_at,started_at`, token, now+ttl.Milliseconds(), workerID, now, runID).Scan(&run.ID, &run.SessionID, &run.LeaseToken, &run.Payload, &run.Attempt, &run.LeaseExpiresAt, &run.MaxAttempts, &run.ErrorAttempts, &run.CreatedAt, &run.StartedAt)
 	if errors.Is(err, pgx.ErrNoRows) {

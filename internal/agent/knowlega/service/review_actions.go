@@ -20,7 +20,7 @@ type ReviewActionOptions struct {
 	ProjectID   string
 	ReviewID    string
 	Action      string
-	Agent       QueryAgent
+	Agent       MaintenanceSynthesisAgent
 	Research    ResearchOptions
 	Context     context.Context
 }
@@ -40,7 +40,7 @@ type ReviewActionResult struct {
 type ReviewSweepOptions struct {
 	ProjectPath string
 	ProjectID   string
-	Agent       QueryAgent
+	Agent       MaintenanceSynthesisAgent
 	Context     context.Context
 }
 
@@ -211,25 +211,21 @@ func runDeepResearchReviewAction(ctx context.Context, opts ReviewActionOptions, 
 	}
 	agent := opts.Agent
 	if agent == nil {
-		agent = FallbackQueryAgent{}
+		return ReviewActionResult{}, fmt.Errorf("maintenance synthesis agent is required for deep research")
 	}
-	docs := make([]QueryReadDocument, 0, len(results))
+	docs := make([]MaintenanceDocument, 0, len(results))
 	for _, result := range results {
-		docs = append(docs, QueryReadDocument{
+		docs = append(docs, MaintenanceDocument{
 			Path:    result.URL,
 			Title:   result.Title,
 			Kind:    "web-research",
 			Content: result.Content,
 		})
 	}
-	answer, err := agent.SynthesizeQuery(QuerySynthesisInput{
-		Question: researchTopic(item),
-		Docs:     docs,
-		Plan: core.QueryPlan{
-			Question:   researchTopic(item),
-			Intent:     "deep_research_for_review",
-			AnswerMode: "research_synthesis",
-		},
+	answer, err := agent.SynthesizeMaintenance(ctx, MaintenanceSynthesisInput{
+		Task:        "deep_research_for_review",
+		Instruction: "Synthesize the supplied research into a concise, source-grounded wiki page about: " + researchTopic(item) + ". Cite source URLs inline.",
+		Documents:   docs,
 	})
 	if err != nil {
 		return ReviewActionResult{}, err
@@ -326,7 +322,7 @@ func pageNameExists(name string, index reviewWikiIndex) bool {
 	return index.IDs[name] || index.IDs[strings.ReplaceAll(name, " ", "-")] || index.Titles[name]
 }
 
-func llmResolvedReviewIDs(_ context.Context, agent QueryAgent, items []core.ReviewItem, index reviewWikiIndex) ([]string, error) {
+func llmResolvedReviewIDs(ctx context.Context, agent MaintenanceSynthesisAgent, items []core.ReviewItem, index reviewWikiIndex) ([]string, error) {
 	var list strings.Builder
 	limit := len(items)
 	if limit > 40 {
@@ -336,11 +332,12 @@ func llmResolvedReviewIDs(_ context.Context, agent QueryAgent, items []core.Revi
 		item := items[i]
 		fmt.Fprintf(&list, "- id=%s type=%s title=%q detail=%s\n", item.ID, item.Type, item.Title, promptSnippet(item.Description, 240))
 	}
-	answer, err := agent.SynthesizeQuery(QuerySynthesisInput{
-		Question: `Which review items are now resolved by the current wiki state?
+	answer, err := agent.SynthesizeMaintenance(ctx, MaintenanceSynthesisInput{
+		Task: "review_sweep",
+		Instruction: `Which review items are now resolved by the current wiki state?
 Return only JSON in this shape: {"resolved":["review-id"]}.
 Be conservative. Keep contradictions, confirmations, and human judgment items pending unless clearly resolved.`,
-		Docs: []QueryReadDocument{
+		Documents: []MaintenanceDocument{
 			{
 				Path:    "wiki/index",
 				Title:   "Current wiki index",

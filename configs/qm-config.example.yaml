@@ -1,31 +1,128 @@
 server:
-  http_addr: ":8080"
+  http_addr: ":18083"
   grpc_addr: "127.0.0.1:9090"
 
 database:
-  url: "postgres://postgres:postgres@127.0.0.1:5432/qm?sslmode=disable"
+  url: "postgres://kbcore:kbcore@127.0.0.1:55433/kbcore?sslmode=disable"
 
 qm:
   org_id: "local"
   node_core_url: "http://127.0.0.1:8081"
-  route_mode: "go"
+  route_mode: "proxy"
+  agent_workspace_root: "data/qm-workspaces"
+  models:
+    default_harness: "pi"
+    request:
+      timeout_seconds: 120
+      # Overall budget for one logical model operation, including retries.
+      # When omitted QM derives enough time for every configured attempt.
+      operation_timeout_seconds: 375
+      retries: 2
+      max_input_chars: 120000
+      max_output_tokens: 4096
+    providers:
+      - id: "modelgate-openai"
+        protocol: "openai"
+        base_url: "https://gateway.example/v1"
+        api_key: "replace-with-your-gateway-key"
+        models:
+          - id: "coding-model"
+            name: "Coding Model"
+            context_window: 128000
+            max_tokens: 8192
+            fast_mode: false
+      - id: "modelgate-anthropic"
+        protocol: "anthropic"
+        base_url: "https://gateway.example/anthropic"
+        api_key: "replace-with-your-gateway-key"
+        models:
+          - id: "reasoning-model"
+            name: "Reasoning Model"
+            context_window: 200000
+            max_tokens: 8192
+            adaptive_thinking: true
+    harnesses:
+      - id: "pi"
+        provider: "modelgate-anthropic"
+        model_ids: ["reasoning-model"]
+        default_model: "reasoning-model"
+        runtime:
+          detect_model: "reasoning-model"
+          title_model: "reasoning-model"
+          judge_model: "reasoning-model"
+          capture_requests: true
+          system_cache_split: true
+          turn_wall_clock_seconds: 900
+          soft_model_calls: 48
+          max_model_calls: 96
+          max_tool_calls: 128
+      - id: "opencode"
+        provider: "modelgate-openai"
+        model_ids: ["coding-model"]
+        default_model: "coding-model"
+        runtime:
+          startup_timeout_seconds: 90
+          turn_wall_clock_seconds: 900
+      - id: "codex"
+        provider: "modelgate-openai"
+        model_ids: ["coding-model"]
+        default_model: "coding-model"
+        runtime:
+          startup_timeout_seconds: 30
+          judge_model: "coding-model"
+          turn_wall_clock_seconds: 900
+      - id: "claude"
+        provider: "modelgate-anthropic"
+        model_ids: ["reasoning-model"]
+        default_model: "reasoning-model"
+        runtime:
+          judge_model: "reasoning-model"
+          turn_wall_clock_seconds: 900
+  slack: {}
+  oauth:
+    clients: []
 
 knowledge:
   root_dir: "data/knowledge"
-  worker: true
+  # QM project uploads/attachments are compiled asynchronously by default.
+  auto_process_project_files: true
+  # Optional generic scan of non-project raw/sources workspaces.
+  worker: false
   scan_interval_seconds: 30
-  llm:
-    base_url: "https://api.openai.com/v1"
-    api_key: "replace-with-your-key"
-    model: "replace-with-your-model"
-    timeout_seconds: 180
 
 runner:
   lease_ttl_seconds: 30
   max_claims: 8
 
+workers:
+  reap_interval_seconds: 10
+  pools:
+    turn:
+      concurrency: 8
+    slack_ingress:
+      concurrency: 8
+    slack_delivery:
+      concurrency: 4
+    oauth:
+      concurrency: 2
+    deploy:
+      concurrency: 2
+      lease_ttl_seconds: 120
+      heartbeat_interval_seconds: 20
+    sandbox:
+      concurrency: 4
+      lease_ttl_seconds: 120
+      heartbeat_interval_seconds: 20
+    skill:
+      concurrency: 2
+    maintenance:
+      concurrency: 1
+
 auth:
   source_signing_secret: "development-only-source-secret"
   capability_secret: "development-only-capability-secret"
+  portal_identity_secret: "development-only-portal-identity-secret"
+  connector_secret_key: "development-only-connector-secret-at-least-32-characters"
+  previous_connector_secret_keys: []
   grpc_internal_token: "development-only-internal-token"
   replay_window_seconds: 300

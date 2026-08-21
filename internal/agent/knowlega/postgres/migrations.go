@@ -17,9 +17,13 @@ CREATE TABLE IF NOT EXISTS scope_bindings (
   kind text NOT NULL,
   organization_id text NOT NULL DEFAULT '',
   project_id text NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  qm_file_id text NOT NULL DEFAULT '',
+  qm_project_id text NOT NULL DEFAULT '',
+  qm_scope_id text NOT NULL DEFAULT '',
+  qm_source_sha256 text NOT NULL DEFAULT '',
   project_name text NOT NULL DEFAULT '',
   root_path text NOT NULL,
-  status text NOT NULL DEFAULT 'active',
+  status text NOT NULL DEFAULT 'empty',
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (provider, external_scope_id),
@@ -27,6 +31,9 @@ CREATE TABLE IF NOT EXISTS scope_bindings (
 );
 
 CREATE INDEX IF NOT EXISTS scope_bindings_project_idx ON scope_bindings(project_id);
+
+ALTER TABLE scope_bindings ALTER COLUMN status SET DEFAULT 'empty';
+UPDATE scope_bindings SET status = 'empty' WHERE status = 'active';
 
 CREATE TABLE IF NOT EXISTS sources (
   id text PRIMARY KEY,
@@ -109,6 +116,10 @@ CREATE TABLE IF NOT EXISTS source_manifest (
 );
 
 ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS archive_path text NOT NULL DEFAULT '';
+ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS qm_file_id text NOT NULL DEFAULT '';
+ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS qm_project_id text NOT NULL DEFAULT '';
+ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS qm_scope_id text NOT NULL DEFAULT '';
+ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS qm_source_sha256 text NOT NULL DEFAULT '';
 ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS pipeline_version integer NOT NULL DEFAULT 0;
 ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS original_raw_path text NOT NULL DEFAULT '';
 ALTER TABLE source_manifest ADD COLUMN IF NOT EXISTS content_path text NOT NULL DEFAULT '';
@@ -211,4 +222,15 @@ CREATE TABLE IF NOT EXISTS query_logs (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 ALTER TABLE query_logs ADD COLUMN IF NOT EXISTS answer_payload jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE query_logs ADD COLUMN IF NOT EXISTS run_id text NOT NULL DEFAULT '';
+ALTER TABLE query_logs ADD COLUMN IF NOT EXISTS session_id text NOT NULL DEFAULT '';
+ALTER TABLE query_logs ADD COLUMN IF NOT EXISTS harness_id text NOT NULL DEFAULT '';
+ALTER TABLE query_logs ADD COLUMN IF NOT EXISTS model_id text NOT NULL DEFAULT '';
+ALTER TABLE query_logs ADD COLUMN IF NOT EXISTS provider_id text NOT NULL DEFAULT '';
+ALTER TABLE query_logs ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT '';
+ALTER TABLE query_logs ADD COLUMN IF NOT EXISTS error_code text NOT NULL DEFAULT '';
+ALTER TABLE query_logs ADD COLUMN IF NOT EXISTS failure_phase text NOT NULL DEFAULT '';
+ALTER TABLE query_logs ADD COLUMN IF NOT EXISTS retryable boolean NOT NULL DEFAULT false;
+ALTER TABLE query_logs ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0;
+ALTER TABLE query_logs ADD COLUMN IF NOT EXISTS duration_ms bigint NOT NULL DEFAULT 0;
 `

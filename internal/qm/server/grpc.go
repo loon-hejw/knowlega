@@ -26,7 +26,7 @@ func NewGRPCServer(cfg config.Config, projects *biz.ProjectUsecase, runs *data.R
 		options = append(options, kratosgrpc.UnaryInterceptor(internalTokenInterceptor(cfg.Auth.GRPCInternalToken)))
 	}
 	server := kratosgrpc.NewServer(options...)
-	controlv1.RegisterControlServiceServer(server, service.NewControlService(projects))
+	controlv1.RegisterControlServiceServer(server, service.NewControlService(projects, cfg))
 	runnerv1.RegisterRunnerServiceServer(server, service.NewRunnerService(runs, time.Duration(cfg.Runner.LeaseTTLSeconds)*time.Second, cfg.Runner.MaxClaims))
 	cronv1.RegisterCronServiceServer(server, service.NewCronService(crons))
 	deploymentv1.RegisterDeploymentLayerServiceServer(server, service.NewDeploymentLayerService(layers))

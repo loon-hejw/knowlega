@@ -33,7 +33,7 @@ vectors belong only in tests.
 
 ```bash
 env GOCACHE=/private/tmp/knowlega-gocache \
-  go test ./internal/agent/knowlega/compiler ./internal/agent/knowlega/service ./internal/agent/knowlega
+  go test ./internal/agent/knowlega/compiler ./internal/agent/knowlega/service ./internal/agent/knowlega ./internal/qm/agent
 ```
 
 The deterministic scaffold validates the accumulation shape:
@@ -42,21 +42,24 @@ The deterministic scaffold validates the accumulation shape:
 - 300 generated wiki pages;
 - 100 review items in the mock fixture;
 - no broken wikilinks;
-- navigation-first query actions and evidence auto-read;
-- graphify evidence use for a code relationship question.
+- deterministic navigation plus explicit read/graph evidence;
+- a nine-requirement Knowledge-tool submission; and
+- a temporary-project `VERIFY_REPORT.md` with source/page/link/lint/review and
+  evidence statistics.
 
 Mock/offline agents validate plumbing only. They must not be described as real
 semantic LLM reasoning and cannot write syntheses.
 
 ## Real-LLM Acceptance
 
-Copy `configs/qm-config.example.yaml` to the ignored
-`qm-backend/configs/config.yaml`, add credentials, and run the QM backend; then
-exercise file/memory/conversation writes through the QM HTTP API. The resulting
+Copy `configs/qm-config.example.yaml` to the ignored `configs/qm-config.yaml`, add
+credentials under `qm.models`, and start the full dev instance; then exercise
+file/memory/conversation writes through the QM HTTP API. The resulting
 raw artifacts and `.kbcore/ingest-queue.json` are the durable handoff to the
 Agent; maintenance consumes the queue and runs semantic review when configured.
 
-The package tests cover the deterministic compiler/query loop. A credentialed
+The package tests cover deterministic compilation and the Knowledge tool
+contract. A credentialed
 deployment must additionally verify source summaries, provenance, wikilinks,
 `wiki/overview.md`, `wiki/reviews.md`, structural lint, semantic review, and
 version archives.
@@ -64,3 +67,29 @@ version archives.
 Use the real provider for product acceptance. Use deterministic agents only
 when a test explicitly targets orchestration, parsing, validation, or storage
 plumbing. Keep the QM backend as the only runnable product entrypoint.
+
+For the full local portal, runtime, admin, and backend stack (the recommended
+人工测试入口):
+
+```bash
+cp configs/qm-config.example.yaml configs/qm-config.yaml
+$EDITOR configs/qm-config.yaml
+cd qm
+npm run dev-instance:no-slack -- --force
+```
+
+The supervisor provisions PostgreSQL, starts `qm-backend`, the QM runtime, and
+the unified frontend, then verifies readiness. Open `http://localhost:8129/`.
+Use the following lifecycle commands from `qm/`:
+
+```bash
+npm run dev-instance:status
+npm run dev-instance:doctor
+npm run dev-instance:down
+```
+
+Apply YAML or environment changes by running the start command again with
+`--force`; model configuration is intentionally loaded at process startup rather
+than hot-reloaded. The plain `npm run dev` command only starts the Node runtime
+and is not a supported full-stack entry point because `QM_BACKEND_*` settings
+are injected by the supervisor from the QM YAML.

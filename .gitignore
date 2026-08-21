@@ -2,7 +2,9 @@
 .env.local
 .env.*.local
 config.yaml
+/configs/qm-config.yaml
 config.local/
+/data/
 
 # Go
 *.test
@@ -16,6 +18,6 @@ wiki/
 
 # Local sibling workspaces and fixtures; QM frontend/OpenAgent are not part of
 # the Go backend repository.
-qm/
-openagent/
-kbcore-xiyouji-wiki-v1/
+/qm/
+/openagent/
+/kbcore-xiyouji-wiki-v1/

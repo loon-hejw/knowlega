@@ -65,7 +65,6 @@ type Config struct {
 	Server    ServerConfig    `yaml:"server"`
 	Research  ResearchConfig  `yaml:"research"`
 	Graph     GraphConfig     `yaml:"graph"`
-	Query     QueryConfig     `yaml:"query"`
 
 	Path string `yaml:"-"`
 }
@@ -148,15 +147,6 @@ type ResearchConfig struct {
 	Timeout    Duration `yaml:"timeout"`
 }
 
-type QueryConfig struct {
-	MaxSteps            int                 `yaml:"max_steps"`
-	InitialActionBudget int                 `yaml:"initial_action_budget"`
-	MaxActionBudget     int                 `yaml:"max_action_budget"`
-	VerificationPasses  int                 `yaml:"verification_passes"`
-	StagnationRounds    int                 `yaml:"stagnation_rounds"`
-	TotalTimeout        NonNegativeDuration `yaml:"total_timeout"`
-}
-
 type GraphConfig struct {
 	Enabled            bool                 `yaml:"enabled"`
 	Worker             bool                 `yaml:"worker"`
@@ -228,14 +218,6 @@ func Defaults() Config {
 			MaxResults: 10,
 			Timeout:    Duration{60 * time.Second},
 		},
-		Query: QueryConfig{
-			MaxSteps:            256,
-			InitialActionBudget: 8,
-			MaxActionBudget:     32,
-			VerificationPasses:  2,
-			StagnationRounds:    2,
-			TotalTimeout:        NonNegativeDuration{0},
-		},
 		Graph: GraphConfig{MaxParallelJobs: 2},
 	}
 }
@@ -277,19 +259,12 @@ func Load(path string) (Config, error) {
 		LLM struct {
 			OperationTimeout *Duration `yaml:"operation_timeout"`
 		} `yaml:"llm"`
-		Query struct {
-			MaxSteps        *int `yaml:"max_steps"`
-			MaxActionBudget *int `yaml:"max_action_budget"`
-		} `yaml:"query"`
 	}
 	if err := yaml.NewDecoder(file).Decode(&explicit); err != nil {
 		return Config{}, fmt.Errorf("inspect config %s: %w", absPath, err)
 	}
 	if explicit.LLM.OperationTimeout == nil {
 		cfg.LLM.OperationTimeout = cfg.LLM.Timeout
-	}
-	if explicit.Query.MaxSteps == nil && explicit.Query.MaxActionBudget != nil {
-		cfg.Query.MaxSteps = *explicit.Query.MaxActionBudget
 	}
 	cfg.Path = absPath
 	cfg.normalize()
@@ -501,18 +476,6 @@ func (c Config) Validate() error {
 	}
 	if c.Research.MaxResults <= 0 || c.Research.Timeout.Duration <= 0 {
 		return fmt.Errorf("research max_results and timeout must be positive")
-	}
-	if c.Query.MaxSteps <= 0 {
-		return fmt.Errorf("query.max_steps must be positive")
-	}
-	if c.Query.InitialActionBudget <= 0 || c.Query.MaxActionBudget < c.Query.InitialActionBudget {
-		return fmt.Errorf("query action budgets must be positive and max_action_budget must be greater than or equal to initial_action_budget")
-	}
-	if c.Query.VerificationPasses < 0 || c.Query.VerificationPasses > 2 {
-		return fmt.Errorf("query.verification_passes must be between 0 and 2")
-	}
-	if c.Query.StagnationRounds <= 0 || c.Query.TotalTimeout.Duration < 0 {
-		return fmt.Errorf("query stagnation_rounds must be positive and total_timeout must be non-negative")
 	}
 	return nil
 }

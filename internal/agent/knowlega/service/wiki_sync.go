@@ -405,6 +405,10 @@ func loadSourceManifestEntries(projectPath, projectID string) ([]core.SourceMani
 		entries = append(entries, core.SourceManifestEntry{
 			ID:                       core.StableID(projectID, "source-manifest", originalPath),
 			ProjectID:                projectID,
+			QMFileID:                 entry.QMFileID,
+			QMProjectID:              entry.QMProjectID,
+			QMScopeID:                entry.QMScopeID,
+			QMSourceSHA256:           entry.QMSourceSHA256,
 			OriginalPath:             originalPath,
 			PipelineVersion:          entry.PipelineVersion,
 			SHA256:                   entry.SHA256,

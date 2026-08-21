@@ -98,8 +98,60 @@ func TestClientUsesOpenAIChatCompletionsProtocol(t *testing.T) {
 		t.Fatalf("messages=%+v", messages)
 	}
 	thinking := requestBody["chat_template_kwargs"].(map[string]any)
-	if thinking["enable_thinking"] != false {
+	if requestBody["enable_thinking"] != false || requestBody["reasoning_effort"] != "low" || thinking["enable_thinking"] != false {
 		t.Fatalf("thinking=%+v", thinking)
+	}
+}
+
+func TestClientUsesNonStreamingReasoningContentAsInternalFallback(t *testing.T) {
+	client := Client{
+		BaseURL: "https://models.example/v1", APIKey: "key", Model: "k2.6", Protocol: ProtocolOpenAI,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return jsonResponse(http.StatusOK, `{"choices":[{"message":{"content":null,"reasoning_content":"{\"issues\":[]}"}}]}`), nil
+		})},
+	}
+	content, retryable, err := client.Chat(t.Context(), ChatRequest{System: "s", User: "u", MaxTokens: 32})
+	if err != nil || retryable || content != `{"issues":[]}` {
+		t.Fatalf("content=%q retryable=%v err=%v", content, retryable, err)
+	}
+}
+
+func TestClientStreamsOpenAICompatibleStructuredContent(t *testing.T) {
+	var requestBody map[string]any
+	client := Client{
+		BaseURL: "https://models.example/v1", APIKey: "key", Model: "Qwen3.6-27B-FP8", Protocol: ProtocolOpenAI,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			if err := json.NewDecoder(req.Body).Decode(&requestBody); err != nil {
+				t.Fatal(err)
+			}
+			body := "data: {\"choices\":[{\"delta\":{\"content\":\"{\\\"action\\\":\"}}]}\n\n" +
+				"data: {\"choices\":[{\"delta\":{\"content\":\"\\\"search\\\"}\"}}]}\n\n" +
+				"data: [DONE]\n\n"
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+		})},
+	}
+	content, retryable, err := client.Chat(t.Context(), ChatRequest{System: "s", User: "u", MaxTokens: 32, Stream: true})
+	if err != nil || retryable || content != `{"action":"search"}` {
+		t.Fatalf("content=%q retryable=%v err=%v", content, retryable, err)
+	}
+	if requestBody["stream"] != true {
+		t.Fatalf("request=%+v", requestBody)
+	}
+}
+
+func TestClientUsesStreamingReasoningContentOnlyAsStructuredFallback(t *testing.T) {
+	client := Client{
+		BaseURL: "https://models.example/v1", APIKey: "key", Model: "k2.6", Protocol: ProtocolOpenAI,
+		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			body := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"{\\\"action\\\":\"}}]}\n\n" +
+				"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"\\\"search\\\"}\"}}]}\n\n" +
+				"data: [DONE]\n\n"
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: io.NopCloser(strings.NewReader(body))}, nil
+		})},
+	}
+	content, retryable, err := client.Chat(t.Context(), ChatRequest{System: "s", User: "u", MaxTokens: 32, Stream: true})
+	if err != nil || retryable || content != `{"action":"search"}` {
+		t.Fatalf("content=%q retryable=%v err=%v", content, retryable, err)
 	}
 }
 

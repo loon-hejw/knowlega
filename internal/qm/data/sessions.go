@@ -4,13 +4,31 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
 
 type SessionRepository struct{ pg *Postgres }
+
+type SessionScopeMismatchError struct {
+	ThreadRef       string
+	ExpectedType    string
+	ReceivedType    string
+	ExpectedScopeID string
+	ReceivedScopeID string
+}
+
+func (e *SessionScopeMismatchError) Error() string {
+	if e == nil {
+		return "session scope mismatch"
+	}
+	return fmt.Sprintf("thread %s belongs to %s scope %s, not %s scope %s", e.ThreadRef, e.ExpectedType, e.ExpectedScopeID, e.ReceivedType, e.ReceivedScopeID)
+}
 
 type SessionSummary struct {
 	ID, Type, ScopeID, ThreadRef string
@@ -76,7 +94,7 @@ type SessionWatch struct {
 
 type PendingApproval struct {
 	ID, SessionID, Command, Reason, Matched, Purpose, Summary, Kind, ActorID string
-	ScopeVersion                                                             string
+	ScopeVersion, ApprovalKey                                                string
 	CreatedAt                                                                *int64
 	GrantModes                                                               json.RawMessage
 	Raw                                                                      json.RawMessage
@@ -94,12 +112,43 @@ type LLMRequest struct {
 	Request                                 json.RawMessage
 }
 
+type NewLLMRequest struct {
+	TurnSeq                                 *int
+	Step                                    int
+	Model, ScopeLabel                       string
+	Request                                 json.RawMessage
+	Truncated                               bool
+	TTFTMS, DurationMS, StepGapMS           *int
+	ToolWallMS, Usage, Transport, GapPhases json.RawMessage
+}
+
 type SessionEntry struct {
 	SessionID, Type, ScopeLabel string
 	Sequence                    int
 	ParentSequence              *int
 	Payload                     json.RawMessage
 	CreatedAt                   int64
+}
+
+type NewSessionEntry struct {
+	Type, ScopeLabel string
+	Payload          json.RawMessage
+}
+
+type NewTapeRecord struct {
+	Kind, Harness, ScopeLabel     string
+	Payload                       json.RawMessage
+	BareText, TS, ChangeTime      *string
+	Hidden, Overheard             *bool
+	Author                        *string
+	EntrySequence, CoversEntrySeq *int
+}
+
+type TapeRecord struct {
+	NewTapeRecord
+	SessionID string
+	Sequence  int
+	CreatedAt int64
 }
 
 type ParticipantWindow struct {
@@ -114,6 +163,216 @@ type AttributedTurn struct {
 }
 
 func NewSessionRepository(pg *Postgres) *SessionRepository { return &SessionRepository{pg: pg} }
+
+func (r *SessionRepository) GetOrCreateByThread(ctx context.Context, threadRef, sessionType, scopeID, channelName, surface string) (*SessionRecord, error) {
+	if strings.TrimSpace(threadRef) == "" || strings.TrimSpace(sessionType) == "" || strings.TrimSpace(scopeID) == "" {
+		return nil, errors.New("thread ref, session type, and scope id are required")
+	}
+	now := time.Now().UnixMilli()
+	id := uuid.NewString()
+	var item SessionRecord
+	err := r.pg.Pool.QueryRow(ctx, `INSERT INTO sessions(id,type,scope_id,thread_ref,created_at,channel_name,surface,last_activity,messages,turns)
+VALUES($1,$2,$3,$4,$5,NULLIF($6,''),NULLIF($7,''),$5,0,0)
+ON CONFLICT(thread_ref) DO UPDATE
+SET channel_name=COALESCE(NULLIF(EXCLUDED.channel_name,''),sessions.channel_name),surface=COALESCE(sessions.surface,NULLIF(EXCLUDED.surface,''))
+WHERE sessions.type=EXCLUDED.type AND sessions.scope_id=EXCLUDED.scope_id
+RETURNING id,type,scope_id,thread_ref,created_at,surface,title,channel_name`, id, sessionType, scopeID, threadRef, now, channelName, surface).
+		Scan(&item.ID, &item.Type, &item.ScopeID, &item.ThreadRef, &item.CreatedAt, &item.Surface, &item.Title, &item.ChannelName)
+	if errors.Is(err, pgx.ErrNoRows) {
+		existing, lookupErr := r.GetByThread(ctx, threadRef)
+		if lookupErr != nil {
+			return nil, lookupErr
+		}
+		if existing == nil {
+			return nil, errors.New("session disappeared while checking its scope")
+		}
+		return nil, &SessionScopeMismatchError{
+			ThreadRef: threadRef, ExpectedType: existing.Type, ReceivedType: sessionType,
+			ExpectedScopeID: existing.ScopeID, ReceivedScopeID: scopeID,
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+func (r *SessionRepository) AddParticipant(ctx context.Context, sessionID, principalID string) error {
+	if strings.TrimSpace(sessionID) == "" || strings.TrimSpace(principalID) == "" {
+		return errors.New("session id and principal id are required")
+	}
+	_, err := r.pg.Pool.Exec(ctx, `INSERT INTO participants(session_id,principal_id,valid_from) VALUES($1,$2,$3) ON CONFLICT(session_id,principal_id) DO UPDATE SET valid_to=NULL,valid_to_seq=NULL`, sessionID, principalID, time.Now().UnixMilli())
+	return err
+}
+
+func (r *SessionRepository) AppendEntry(ctx context.Context, sessionID string, entry NewSessionEntry) (SessionEntry, error) {
+	if r == nil || r.pg == nil || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(entry.Type) == "" || strings.TrimSpace(entry.ScopeLabel) == "" {
+		return SessionEntry{}, errors.New("session id, entry type, and scope label are required")
+	}
+	payload, err := normalizedJSON(entry.Payload)
+	if err != nil {
+		return SessionEntry{}, fmt.Errorf("session entry payload: %w", err)
+	}
+	tx, err := r.pg.Pool.Begin(ctx)
+	if err != nil {
+		return SessionEntry{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext('session-entry'),hashtext($1))", sessionID); err != nil {
+		return SessionEntry{}, err
+	}
+	var exists bool
+	if err := tx.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM sessions WHERE id=$1)", sessionID).Scan(&exists); err != nil {
+		return SessionEntry{}, err
+	}
+	if !exists {
+		return SessionEntry{}, fmt.Errorf("session %s does not exist", sessionID)
+	}
+	var sequence int
+	if err := tx.QueryRow(ctx, "SELECT COALESCE(MAX(seq),-1)+1 FROM session_entries WHERE session_id=$1", sessionID).Scan(&sequence); err != nil {
+		return SessionEntry{}, err
+	}
+	var parent *int
+	if sequence > 0 {
+		value := sequence - 1
+		parent = &value
+	}
+	createdAt := time.Now().UnixMilli()
+	if _, err := tx.Exec(ctx, `INSERT INTO session_entries(session_id,seq,parent_seq,type,payload,scope_label,created_at)
+VALUES($1,$2,$3,$4,$5,$6,$7)`, sessionID, sequence, parent, entry.Type, string(payload), entry.ScopeLabel, createdAt); err != nil {
+		return SessionEntry{}, err
+	}
+	userTurn := entry.Type == "user" && !strings.Contains(string(payload), `"overheard":true`)
+	turnIncrement := 0
+	if userTurn {
+		turnIncrement = 1
+	}
+	if _, err := tx.Exec(ctx, `UPDATE sessions
+SET last_activity=GREATEST(COALESCE(last_activity,0),$2),messages=$3,
+turns=CASE WHEN turns IS NULL OR messages IS DISTINCT FROM $5
+THEN (SELECT COUNT(*) FROM session_entries t WHERE t.session_id=$1 AND t.type='user' AND (t.payload IS NULL OR t.payload NOT LIKE '%"overheard":true%'))
+ELSE turns+$4 END WHERE id=$1`, sessionID, createdAt, sequence+1, turnIncrement, sequence); err != nil {
+		return SessionEntry{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return SessionEntry{}, err
+	}
+	return SessionEntry{SessionID: sessionID, Type: entry.Type, ScopeLabel: entry.ScopeLabel, Sequence: sequence, ParentSequence: parent, Payload: payload, CreatedAt: createdAt}, nil
+}
+
+func (r *SessionRepository) RecordLLMRequest(ctx context.Context, sessionID string, request NewLLMRequest) (LLMRequest, error) {
+	if r == nil || r.pg == nil || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(request.Model) == "" || strings.TrimSpace(request.ScopeLabel) == "" || request.Step < 0 {
+		return LLMRequest{}, errors.New("session id, model, scope label, and non-negative step are required")
+	}
+	requestJSON, err := normalizedJSON(request.Request)
+	if err != nil {
+		return LLMRequest{}, fmt.Errorf("llm request: %w", err)
+	}
+	optional := []json.RawMessage{request.ToolWallMS, request.Usage, request.Transport, request.GapPhases}
+	for index := range optional {
+		if len(optional[index]) != 0 && !json.Valid(optional[index]) {
+			return LLMRequest{}, fmt.Errorf("llm request metadata %d is invalid JSON", index)
+		}
+	}
+	stored := LLMRequest{
+		ID: uuid.NewString(), SessionID: sessionID, TurnSeq: request.TurnSeq, Step: request.Step,
+		Model: request.Model, ScopeLabel: request.ScopeLabel, Request: requestJSON, Truncated: request.Truncated,
+		CreatedAt: time.Now().UnixMilli(), TTFTMS: request.TTFTMS, DurationMS: request.DurationMS, StepGapMS: request.StepGapMS,
+		ToolWallMS: cloneJSON(request.ToolWallMS), Usage: cloneJSON(request.Usage), Transport: cloneJSON(request.Transport), GapPhases: cloneJSON(request.GapPhases),
+	}
+	_, err = r.pg.Pool.Exec(ctx, `INSERT INTO session_llm_requests(id,session_id,turn_seq,step,model,scope_label,request,truncated,created_at,ttft_ms,duration_ms,step_gap_ms,tool_wall_json,usage_json,transport_json,gap_phases_json)
+VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,NULLIF($13,''),NULLIF($14,''),NULLIF($15,''),NULLIF($16,''))`,
+		stored.ID, stored.SessionID, stored.TurnSeq, stored.Step, stored.Model, stored.ScopeLabel, string(stored.Request), stored.Truncated, stored.CreatedAt,
+		stored.TTFTMS, stored.DurationMS, stored.StepGapMS, string(stored.ToolWallMS), string(stored.Usage), string(stored.Transport), string(stored.GapPhases))
+	if err != nil {
+		return LLMRequest{}, err
+	}
+	return stored, nil
+}
+
+func (r *SessionRepository) AppendTape(ctx context.Context, sessionID string, record NewTapeRecord) (TapeRecord, error) {
+	if r == nil || r.pg == nil || strings.TrimSpace(sessionID) == "" || strings.TrimSpace(record.Kind) == "" || strings.TrimSpace(record.ScopeLabel) == "" {
+		return TapeRecord{}, errors.New("session id, tape kind, and scope label are required")
+	}
+	payload, err := normalizedJSON(record.Payload)
+	if err != nil {
+		return TapeRecord{}, fmt.Errorf("session tape payload: %w", err)
+	}
+	tx, err := r.pg.Pool.Begin(ctx)
+	if err != nil {
+		return TapeRecord{}, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtext('session-tape'),hashtext($1))", sessionID); err != nil {
+		return TapeRecord{}, err
+	}
+	var sequence int
+	if err := tx.QueryRow(ctx, "SELECT COALESCE(MAX(seq),-1)+1 FROM session_tape WHERE session_id=$1", sessionID).Scan(&sequence); err != nil {
+		return TapeRecord{}, err
+	}
+	createdAt := time.Now().UnixMilli()
+	if _, err := tx.Exec(ctx, `INSERT INTO session_tape(session_id,seq,kind,harness,payload,scope_label,bare_text,ts,change_time,hidden,overheard,author,entry_seq,covers_entry_seq,created_at)
+VALUES($1,$2,$3,NULLIF($4,''),$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+		sessionID, sequence, record.Kind, record.Harness, string(payload), record.ScopeLabel, record.BareText, record.TS, record.ChangeTime,
+		record.Hidden, record.Overheard, record.Author, record.EntrySequence, record.CoversEntrySeq, createdAt); err != nil {
+		return TapeRecord{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return TapeRecord{}, err
+	}
+	record.Payload = payload
+	return TapeRecord{NewTapeRecord: record, SessionID: sessionID, Sequence: sequence, CreatedAt: createdAt}, nil
+}
+
+func (r *SessionRepository) Tape(ctx context.Context, sessionID string, since int) ([]TapeRecord, error) {
+	rows, err := r.pg.Pool.Query(ctx, `SELECT session_id,seq,kind,COALESCE(harness,''),payload,scope_label,bare_text,ts,change_time,hidden,overheard,author,entry_seq,covers_entry_seq,created_at
+FROM session_tape WHERE session_id=$1 AND seq>$2 ORDER BY seq`, sessionID, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := []TapeRecord{}
+	for rows.Next() {
+		var record TapeRecord
+		if err := rows.Scan(&record.SessionID, &record.Sequence, &record.Kind, &record.Harness, &record.Payload, &record.ScopeLabel,
+			&record.BareText, &record.TS, &record.ChangeTime, &record.Hidden, &record.Overheard, &record.Author,
+			&record.EntrySequence, &record.CoversEntrySeq, &record.CreatedAt); err != nil {
+			return nil, err
+		}
+		result = append(result, record)
+	}
+	return result, rows.Err()
+}
+
+func (r *SessionRepository) TapeCoverage(ctx context.Context, sessionID string) (int, error) {
+	if r == nil || r.pg == nil || strings.TrimSpace(sessionID) == "" {
+		return -1, errors.New("session id is required")
+	}
+	var coverage int
+	err := r.pg.Pool.QueryRow(ctx, `SELECT GREATEST(
+  COALESCE(MAX(entry_seq) FILTER (
+    WHERE kind='annotation' AND payload::jsonb->>'turnEnd'='true'
+  ),-1),
+  COALESCE(MAX(covers_entry_seq) FILTER (
+    WHERE kind='context_event' AND payload::jsonb->>'event'='legacy_import'
+  ),-1)
+) FROM session_tape WHERE session_id=$1`, sessionID).Scan(&coverage)
+	return coverage, err
+}
+
+func normalizedJSON(raw json.RawMessage) (json.RawMessage, error) {
+	if len(raw) == 0 {
+		return json.RawMessage("null"), nil
+	}
+	if !json.Valid(raw) {
+		return nil, errors.New("invalid JSON")
+	}
+	return cloneJSON(raw), nil
+}
+
+func cloneJSON(raw json.RawMessage) json.RawMessage {
+	return append(json.RawMessage(nil), raw...)
+}
 
 // DistinctScopes and ParticipantPrincipalIDs support administrative scope
 // discovery without reading session content.
@@ -528,6 +787,7 @@ func (r *SessionRepository) PendingApprovals(ctx context.Context, sessionID stri
 		var item struct {
 			SessionID                                        string `json:"sessionId"`
 			Command, Reason, Matched, Purpose, Summary, Kind string
+			ApprovalKey                                      string          `json:"approvalKey"`
 			CreatedAt                                        *int64          `json:"createdAt"`
 			GrantModes                                       json.RawMessage `json:"grantModes"`
 			BlocksInput                                      *bool           `json:"blocksInput"`
@@ -542,7 +802,7 @@ func (r *SessionRepository) PendingApprovals(ctx context.Context, sessionID stri
 			continue
 		}
 		blocks := item.BlocksInput == nil || *item.BlocksInput
-		result = append(result, PendingApproval{ID: id, SessionID: item.SessionID, Command: item.Command, Reason: item.Reason, Matched: item.Matched, Purpose: item.Purpose, Summary: item.Summary, Kind: item.Kind, ActorID: item.Request.Actor.ExternalID, ScopeVersion: item.Request.ScopeVersion, CreatedAt: item.CreatedAt, GrantModes: item.GrantModes, Raw: append(json.RawMessage(nil), raw...), BlocksInput: blocks})
+		result = append(result, PendingApproval{ID: id, SessionID: item.SessionID, Command: item.Command, Reason: item.Reason, Matched: item.Matched, Purpose: item.Purpose, Summary: item.Summary, Kind: item.Kind, ActorID: item.Request.Actor.ExternalID, ScopeVersion: item.Request.ScopeVersion, ApprovalKey: item.ApprovalKey, CreatedAt: item.CreatedAt, GrantModes: item.GrantModes, Raw: append(json.RawMessage(nil), raw...), BlocksInput: blocks})
 	}
 	return result, rows.Err()
 }
@@ -564,6 +824,7 @@ func (r *SessionRepository) Approval(ctx context.Context, id string) (*PendingAp
 	var item struct {
 		SessionID                                        string `json:"sessionId"`
 		Command, Reason, Matched, Purpose, Summary, Kind string
+		ApprovalKey                                      string          `json:"approvalKey"`
 		CreatedAt                                        *int64          `json:"createdAt"`
 		GrantModes                                       json.RawMessage `json:"grantModes"`
 		BlocksInput                                      *bool           `json:"blocksInput"`
@@ -578,7 +839,7 @@ func (r *SessionRepository) Approval(ctx context.Context, id string) (*PendingAp
 		return nil, nil
 	}
 	blocks := item.BlocksInput == nil || *item.BlocksInput
-	return &PendingApproval{ID: id, SessionID: item.SessionID, Command: item.Command, Reason: item.Reason, Matched: item.Matched, Purpose: item.Purpose, Summary: item.Summary, Kind: item.Kind, ActorID: item.Request.Actor.ExternalID, ScopeVersion: item.Request.ScopeVersion, CreatedAt: item.CreatedAt, GrantModes: item.GrantModes, Raw: append(json.RawMessage(nil), raw...), BlocksInput: blocks}, nil
+	return &PendingApproval{ID: id, SessionID: item.SessionID, Command: item.Command, Reason: item.Reason, Matched: item.Matched, Purpose: item.Purpose, Summary: item.Summary, Kind: item.Kind, ActorID: item.Request.Actor.ExternalID, ScopeVersion: item.Request.ScopeVersion, ApprovalKey: item.ApprovalKey, CreatedAt: item.CreatedAt, GrantModes: item.GrantModes, Raw: append(json.RawMessage(nil), raw...), BlocksInput: blocks}, nil
 }
 
 func (r *SessionRepository) ParticipantWindow(ctx context.Context, sessionID, principalID string) (*ParticipantWindow, error) {

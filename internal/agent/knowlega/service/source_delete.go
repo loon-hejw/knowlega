@@ -3,6 +3,7 @@ package service
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,6 +16,8 @@ import (
 	"github.com/loon-hejw/knowlega/internal/agent/knowlega/sourcearchive"
 	"github.com/loon-hejw/knowlega/internal/agent/knowlega/wiki"
 )
+
+var ErrSourceNotFound = errors.New("source not found in manifest")
 
 type DeleteSourceOptions struct {
 	ProjectPath string `json:"project_path"`
@@ -57,7 +60,7 @@ func DeleteSource(opts DeleteSourceOptions) (DeleteSourceResult, error) {
 	}
 	key, entry, ok := findSourceManifestEntry(manifest, opts.SourcePath)
 	if !ok {
-		return DeleteSourceResult{}, fmt.Errorf("source not found in manifest: %s", opts.SourcePath)
+		return DeleteSourceResult{}, fmt.Errorf("%w: %s", ErrSourceNotFound, opts.SourcePath)
 	}
 	result := DeleteSourceResult{
 		MatchedKey:   key,
@@ -148,6 +151,28 @@ type sourceDeletePageAction struct {
 	Delete        bool
 	UpdateSources bool
 	RemoveSources []string
+}
+
+func BindQMSource(projectPath, sourcePath, fileID, qmProjectID, scopeID, sha256 string) error {
+	release, err := acquireServiceProjectLock(projectPath)
+	if err != nil {
+		return err
+	}
+	defer release()
+	manifest, err := loadSourceManifestFile(projectPath)
+	if err != nil {
+		return err
+	}
+	key, entry, ok := findSourceManifestEntry(manifest, sourcePath)
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrSourceNotFound, sourcePath)
+	}
+	entry.QMFileID = strings.TrimSpace(fileID)
+	entry.QMProjectID = strings.TrimSpace(qmProjectID)
+	entry.QMScopeID = strings.TrimSpace(scopeID)
+	entry.QMSourceSHA256 = strings.TrimSpace(sha256)
+	manifest.Sources[key] = entry
+	return saveSourceManifestFile(projectPath, manifest)
 }
 
 func loadSourceManifestFile(projectPath string) (sourceManifestFile, error) {

@@ -97,6 +97,24 @@ func TestAuthenticateCapabilityDestinationClaimMatchesNodeShapeValidation(t *tes
 	}
 }
 
+func TestAuthenticateCapabilityCopiesCurrentDestinationAndScopeVersion(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	claims := Claims{
+		ActorID:      "alice",
+		ScopeID:      "channel:C123456",
+		ScopeVersion: "42",
+		Audience:     "control-plane",
+		Destination:  &Destination{Type: "slack", Target: "C123456", AudienceScopeID: "channel:C123456"},
+		ExpiresAt:    now.Add(time.Minute).UnixMilli(),
+	}
+	req := httptest.NewRequest("POST", "http://qm.test/v1/surface-context", nil)
+	req.Header.Set(CapabilityHeader, capabilityToken(t, "cap-secret", claims))
+	identity, err := (Verifier{CapabilitySecret: "cap-secret", Now: func() time.Time { return now }}).Authenticate(context.Background(), req, nil, "either")
+	if err != nil || identity.ScopeVersion != "42" || identity.Destination == nil || identity.Destination.Target != "C123456" {
+		t.Fatalf("identity=%#v err=%v", identity, err)
+	}
+}
+
 func TestAuthenticateCapabilityProjectsKeychainMembers(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	claims := Claims{

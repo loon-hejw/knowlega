@@ -25,7 +25,7 @@ type WikiGraph struct {
 	Nodes map[string]*WikiGraphNode
 }
 
-func SearchWikiGraphDocuments(projectPath, q string, seedPaths []string, limit int, maxRunes int) ([]QueryReadDocument, error) {
+func SearchWikiGraphDocuments(projectPath, q string, seedPaths []string, limit int, maxRunes int) ([]KnowledgeDocument, error) {
 	if limit <= 0 {
 		limit = 5
 	}
@@ -55,12 +55,12 @@ func SearchWikiGraphDocuments(projectPath, q string, seedPaths []string, limit i
 		}
 	}
 	if len(scores) == 0 && strings.TrimSpace(q) != "" {
-		terms := queryTerms(q)
+		terms := knowledgeQueryTerms(q)
 		for path, node := range graph.Nodes {
 			if isAggregateWikiPath(path) {
 				continue
 			}
-			score := scoreContent(strings.Join([]string{node.Path, node.Title, node.Type, node.Body}, "\n"), terms, node.Path, "wiki-graph")
+			score := scoreKnowledgeContent(strings.Join([]string{node.Path, node.Title, node.Type, node.Body}, "\n"), terms, node.Path, "wiki-graph")
 			if score > 0 {
 				scores[path] = float64(score)
 			}
@@ -79,7 +79,7 @@ func SearchWikiGraphDocuments(projectPath, q string, seedPaths []string, limit i
 	if len(ranked) > limit {
 		ranked = ranked[:limit]
 	}
-	docs := make([]QueryReadDocument, 0, len(ranked))
+	docs := make([]KnowledgeDocument, 0, len(ranked))
 	for _, item := range ranked {
 		node := graph.Nodes[item.path]
 		content, err := readProjectText(projectPath, item.path)
@@ -89,10 +89,11 @@ func SearchWikiGraphDocuments(projectPath, q string, seedPaths []string, limit i
 			}
 			return nil, err
 		}
-		docs = append(docs, QueryReadDocument{
+		docs = append(docs, KnowledgeDocument{
 			Path:    item.path,
 			Title:   node.Title,
 			Kind:    "wiki-graph",
+			Aliases: aliasesFromMarkdown(content),
 			Content: tailRunes(content, maxRunes),
 		})
 	}
@@ -159,14 +160,14 @@ func graphSeedNodes(graph WikiGraph, q string, seedPaths []string) []*WikiGraphN
 	if len(seeds) > 0 || strings.TrimSpace(q) == "" {
 		return seeds
 	}
-	terms := queryTerms(q)
+	terms := knowledgeQueryTerms(q)
 	type scored struct {
 		node  *WikiGraphNode
 		score int
 	}
 	var ranked []scored
 	for _, node := range graph.Nodes {
-		score := scoreContent(strings.Join([]string{node.Path, node.Title, node.Type, node.Body}, "\n"), terms, node.Path, "wiki-graph")
+		score := scoreKnowledgeContent(strings.Join([]string{node.Path, node.Title, node.Type, node.Body}, "\n"), terms, node.Path, "wiki-graph")
 		if score > 0 {
 			ranked = append(ranked, scored{node: node, score: score})
 		}
@@ -326,7 +327,7 @@ func canonicalWikiGraphKey(value string) string {
 	return value
 }
 
-func formatWikiGraphObservation(docs []QueryReadDocument) string {
+func formatWikiGraphObservation(docs []KnowledgeDocument) string {
 	if len(docs) == 0 {
 		return "wiki graph returned 0 related page(s)"
 	}

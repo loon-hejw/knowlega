@@ -124,6 +124,9 @@ func ImportReader(opts ImportOptions) (Archive, error) {
 		if archive.Metadata.OriginalSHA256 != hash {
 			return Archive{}, fmt.Errorf("existing source archive hash mismatch: %s", archiveRel)
 		}
+		if err := os.Chmod(filepath.Join(projectAbs, filepath.FromSlash(archive.Metadata.OriginalRawPath)), 0o444); err != nil {
+			return Archive{}, err
+		}
 		return archive, nil
 	} else if statErr != nil && !os.IsNotExist(statErr) {
 		return Archive{}, statErr
@@ -140,6 +143,9 @@ func ImportReader(opts ImportOptions) (Archive, error) {
 	}
 	originalAbs := filepath.Join(originalDir, originalName)
 	if err := renameOrCopy(tmpFileName, originalAbs); err != nil {
+		return Archive{}, err
+	}
+	if err := os.Chmod(originalAbs, 0o444); err != nil {
 		return Archive{}, err
 	}
 	originalRel := slashJoin(archiveRel, "original", originalName)

@@ -635,6 +635,10 @@ Regenerate the complete output from scratch and obey these absolute rules:
 		allFiles = sortedUniqueStrings(append(previous.Files, written...))
 	}
 	entry := SourceManifestEntry{
+		QMFileID:                 previous.QMFileID,
+		QMProjectID:              previous.QMProjectID,
+		QMScopeID:                previous.QMScopeID,
+		QMSourceSHA256:           previous.QMSourceSHA256,
 		OriginalPath:             sourceManifestKey(opts.SourcePath),
 		PipelineVersion:          core.SourceManifestPipelineVersion,
 		SHA256:                   work.hash,
@@ -1012,6 +1016,22 @@ func validateGeneratedBlocksForPolicy(opts ValidateOptions, blocks ParsedBlocks,
 	maxNewPages := policy.RemainingNewPages
 	newPages := 0
 	plannedNew, structuredPlan := plannedNewPagePaths(opts.AnalysisPlan)
+	if structuredPlan {
+		emitted := map[string]bool{}
+		for _, file := range blocks.Files {
+			emitted[file.Path] = true
+		}
+		var missing []string
+		for path := range plannedNew {
+			if !emitted[path] {
+				missing = append(missing, path)
+			}
+		}
+		if len(missing) > 0 {
+			sort.Strings(missing)
+			return fmt.Errorf("generation omitted analysis-planned new page(s): %s", strings.Join(missing, ", "))
+		}
+	}
 	for _, file := range blocks.Files {
 		frontmatter, err := parseGeneratedFrontmatter(file.Content)
 		if err != nil || strings.TrimSpace(fmt.Sprint(frontmatter["type"])) == "source-summary" {
@@ -1416,9 +1436,17 @@ func skippedCount(result ValidateResult) int {
 }
 
 func inferSourceTitle(path, content string) string {
+	var lines []string
 	for _, line := range strings.Split(content, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || line == "《西游记》" {
+		if line = strings.TrimSpace(line); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	for index, line := range lines {
+		// Split document corpora commonly repeat a standalone work title before
+		// the per-file heading. Recognize that shape without corpus-specific
+		// titles or aliases in the compiler.
+		if index == 0 && len(lines) > 1 && isStandaloneWorkTitle(line) {
 			continue
 		}
 		if strings.HasPrefix(line, "《》目录 ") {
@@ -1430,6 +1458,11 @@ func inferSourceTitle(path, content string) string {
 		break
 	}
 	return strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+}
+
+func isStandaloneWorkTitle(line string) bool {
+	runes := []rune(strings.TrimSpace(line))
+	return len(runes) > 2 && runes[0] == '《' && runes[len(runes)-1] == '》'
 }
 
 func copyRawSource(projectPath, sourcePath string, data []byte) (string, error) {
@@ -1445,8 +1478,11 @@ func copyRawSourceWithName(projectPath, sourcePath string, data []byte, rawName 
 	if err != nil {
 		return "", err
 	}
-	if filepath.Base(rawName) == filepath.Base(sourcePath) {
-		if rel, err := filepath.Rel(projectRawRoot, sourceAbs); err == nil && rel != "." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".." {
+	if rel, err := filepath.Rel(projectRawRoot, sourceAbs); err == nil && rel != "." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != ".." {
+		if err := os.Chmod(sourceAbs, 0o444); err != nil {
+			return "", err
+		}
+		if filepath.Base(rawName) == filepath.Base(sourcePath) {
 			projectAbs, err := filepath.Abs(projectPath)
 			if err != nil {
 				return "", err
@@ -1467,10 +1503,16 @@ func copyRawSourceWithName(projectPath, sourcePath string, data []byte, rawName 
 	if err := os.MkdirAll(filepath.Dir(abs), 0o755); err != nil {
 		return "", err
 	}
-	if _, err := os.Stat(abs); os.IsNotExist(err) {
-		if err := os.WriteFile(abs, data, 0o644); err != nil {
+	if existing, err := os.ReadFile(abs); os.IsNotExist(err) {
+		if err := os.WriteFile(abs, data, 0o444); err != nil {
 			return "", err
 		}
+	} else if err != nil {
+		return "", err
+	} else if string(existing) != string(data) {
+		return "", fmt.Errorf("immutable raw source collision at %s", rel)
+	} else if err := os.Chmod(abs, 0o444); err != nil {
+		return "", err
 	}
 	return rel, nil
 }
@@ -1526,6 +1568,10 @@ func LoadSourceManifestEntries(projectPath, projectID string) ([]core.SourceMani
 		entries = append(entries, core.SourceManifestEntry{
 			ID:                       core.StableID(projectID, "source-manifest", originalPath),
 			ProjectID:                projectID,
+			QMFileID:                 entry.QMFileID,
+			QMProjectID:              entry.QMProjectID,
+			QMScopeID:                entry.QMScopeID,
+			QMSourceSHA256:           entry.QMSourceSHA256,
 			OriginalPath:             originalPath,
 			PipelineVersion:          entry.PipelineVersion,
 			SHA256:                   entry.SHA256,

@@ -102,6 +102,11 @@ func (r *ACLRepository) Revoke(ctx context.Context, ownerScopeID, path, granteeS
 	return err
 }
 
+func (r *ACLRepository) DeleteResource(ctx context.Context, ownerScopeID, path string) error {
+	_, err := r.pg.Pool.Exec(ctx, "DELETE FROM acl_grants WHERE owner_scope_id=$1 AND path=$2", ownerScopeID, path)
+	return err
+}
+
 // FileHandlesFor implements the Node ACL store's handlesFor projection. A
 // resource path with no known typed-resource prefix is a file path.
 func (r *ACLRepository) FileHandlesFor(ctx context.Context, scopes []string) ([]FileHandle, error) {

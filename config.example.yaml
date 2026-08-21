@@ -1,110 +1,12 @@
-project:
-  name: xiyouji
-  path: /private/tmp/kbcore-xiyouji-wiki
-  bootstrap:
-    source: ./tst/xiyouji-chapters
-    agent: llm
-    reuse_existing: true
-    retry_initial_delay: 15s
-    retry_max_delay: 5m
-    concurrency: 4
-    # Bound per-source retries so a conflicted source cannot expand forever.
-    max_task_attempts: 4
-    # Optimistic commit conflicts have a separate convergence allowance.
-    max_conflict_attempts: 8
-    # Semantic impact invalidation has its own budget and does not consume the
-    # ordinary generation/conflict retry allowance.
-    max_impact_attempts: 2
-    # Guard against one source fragmenting into dozens of one-off pages.
-    max_files_per_task: 12
-    # Lifetime budget per source + generation contract. Existing-page updates
-    # do not consume it; impact re-integration is update-only.
-    max_new_pages_per_source: 3
-
-llm:
-  concurrency: 0 # 0 inherits project.bootstrap.concurrency; lower this to the provider's stable request capacity
-  # openai uses /chat/completions; anthropic uses /messages.
-  protocol: openai
-  # A provider root, /v1 base, or full operation URL is accepted.
-  base_url: https://api.openai.com/v1
-  api_key: "replace-with-your-key"
-  model: "replace-with-your-model"
-  # Override when a gateway routes by client User-Agent.
-  user_agent: "knowledge-core/0.1"
-  anthropic_version: "2023-06-01"
-  timeout: 180s
-  # Total wall-clock budget for one logical LLM call including retries.
-  operation_timeout: 180s
-  retries: 2
-  retry_base_delay: 800ms
-  retry_max_delay: 5s
-  max_input_chars: 120000
-  max_output_tokens: 4096
-  disable_thinking: true
-
-embedding:
-  base_url: ""
-  api_key: ""
-  model: ""
-  timeout: 60s
-  max_input_chars: 6000
-
-database:
-  dsn: ""
-  project_id: local
-
-server:
-  addr: 127.0.0.1:19829
-  agent: llm
-  worker: false
-  scan_interval: 30s
-  api_token: ""
-  api_require_token: false
-  grpc:
-    enabled: false
-    addr: 127.0.0.1:19830
-    auth_token: ""
-    require_auth: false
-    # Required when enabled. New QM scopes are created below this directory.
-    scope_root: ""
-    # Optional TLS/mTLS files for non-loopback deployments.
-    tls_cert_file: ""
-    tls_key_file: ""
-    tls_client_ca_file: ""
-
-research:
-  searxng_url: ""
-  max_results: 10
-  timeout: 60s
-
-query:
-  # Hard limit across tool actions and verification turns. The query has no
-  # total wall-clock deadline unless total_timeout is set to a positive value.
-  max_steps: 256
-  total_timeout: 0s
-  # Deprecated adaptive-budget settings retained for older configurations.
-  initial_action_budget: 8
-  max_action_budget: 32
-  verification_passes: 2
-  stagnation_rounds: 2
-
-# Optional native Go/Wiki graph indexing. Repositories are an explicit
-# allowlist; credentials are loaded from environment variables and are never
-# embedded in Git remote URLs or returned by the API.
-graph:
-  enabled: false
-  worker: false
-  checkout_root: .kbcore/repos
-  max_parallel_jobs: 2
-  semantic_enrichment: false
-  registries:
-    - id: corp-gitlab
-      provider: gitlab # github, gitlab, or gitea
-      base_url: https://gitlab.example.com
-      api_token_env: KB_CORE_GITLAB_TOKEN
-      webhook_secret_env: KB_CORE_GITLAB_WEBHOOK_SECRET
-      directory: corp-gitlab
-      repositories:
-        - id: knowledge-core
-          full_name: platform/knowledge-core
-          branch: main
+# Deprecated: the standalone Knowledge Core runtime configuration is no longer
+# a product entrypoint. Configure the merged QM backend from:
+#
+#   configs/qm-config.example.yaml
+#
+# Create the ignored local file with:
+#
+#   cp configs/qm-config.example.yaml configs/qm-config.yaml
+#
+# Then start:
+#
+#   go run ./cmd/qm-backend --config configs/qm-config.yaml

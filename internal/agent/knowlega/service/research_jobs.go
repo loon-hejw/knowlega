@@ -91,7 +91,7 @@ func CreateResearchJob(projectPath, projectID string, req ResearchJobRequest) (R
 	return job, false, nil
 }
 
-func RunResearchJob(job ResearchJob, agent QueryAgent, research ResearchOptions) {
+func RunResearchJob(job ResearchJob, agent MaintenanceSynthesisAgent, research ResearchOptions) {
 	key := core.StableID("research-job-active", job.ProjectPath, job.Request.ReviewID, job.Request.Topic, job.Request.Query)
 	defer func() {
 		researchJobMu.Lock()
@@ -138,7 +138,7 @@ func GetResearchJob(projectPath, id string) (ResearchJob, error) {
 	return ResearchJob{}, fmt.Errorf("research job not found: %s", id)
 }
 
-func runResearchJobWork(ctx context.Context, req ResearchJobRequest, agent QueryAgent, research ResearchOptions) (core.ReviewItem, []string, error) {
+func runResearchJobWork(ctx context.Context, req ResearchJobRequest, agent MaintenanceSynthesisAgent, research ResearchOptions) (core.ReviewItem, []string, error) {
 	if strings.TrimSpace(req.ReviewID) != "" {
 		result, err := RunReviewAction(ReviewActionOptions{
 			ProjectPath: req.ProjectPath,
@@ -165,7 +165,7 @@ func runResearchJobWork(ctx context.Context, req ResearchJobRequest, agent Query
 		CreatedAt:     time.Now().UTC(),
 	}
 	if agent == nil {
-		agent = FallbackQueryAgent{}
+		return core.ReviewItem{}, nil, fmt.Errorf("maintenance synthesis agent is required")
 	}
 	results, err := collectSearXNGResearch(ctx, item, research)
 	if err != nil {
@@ -174,23 +174,19 @@ func runResearchJobWork(ctx context.Context, req ResearchJobRequest, agent Query
 	if len(results) == 0 {
 		return core.ReviewItem{}, nil, fmt.Errorf("deep research found no sources")
 	}
-	docs := make([]QueryReadDocument, 0, len(results))
+	docs := make([]MaintenanceDocument, 0, len(results))
 	for _, result := range results {
-		docs = append(docs, QueryReadDocument{
+		docs = append(docs, MaintenanceDocument{
 			Path:    result.URL,
 			Title:   result.Title,
 			Kind:    "web-research",
 			Content: result.Content,
 		})
 	}
-	answer, err := agent.SynthesizeQuery(QuerySynthesisInput{
-		Question: researchTopic(item),
-		Docs:     docs,
-		Plan: core.QueryPlan{
-			Question:   researchTopic(item),
-			Intent:     "deep_research",
-			AnswerMode: "research_synthesis",
-		},
+	answer, err := agent.SynthesizeMaintenance(ctx, MaintenanceSynthesisInput{
+		Task:        "deep_research",
+		Instruction: "Synthesize the supplied research into a concise, source-grounded wiki page about: " + researchTopic(item) + ". Cite source URLs inline.",
+		Documents:   docs,
 	})
 	if err != nil {
 		return core.ReviewItem{}, nil, err

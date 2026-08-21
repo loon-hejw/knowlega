@@ -13,9 +13,10 @@ The design draws from three reference systems:
 - **GitNexus** for exact code-symbol, call, route, impact, and process graphs.
 - **graphify** for portable graph snapshots and readable graph reports.
 
-Knowledge Core is deliberately not ordinary RAG: search retrieves candidates,
-but an LLM planner navigates and reads durable wiki/raw evidence before it can
-answer or write a synthesis back to the wiki.
+Knowledge Core is deliberately not ordinary RAG. QM's outer Pi loop is the
+only user-facing reasoning agent. It uses one deterministic `knowledge` tool
+to navigate, read durable wiki/raw/graph evidence, validate a submission, and
+explicitly write a useful synthesis when requested.
 
 ## Documentation
 
@@ -23,7 +24,7 @@ answer or write a synthesis back to the wiki.
   graph, and PostgreSQL boundaries.
 - [QM integration direction](docs/adr/0001-qm-platform-knowledge-core-plugin.md):
   QM as the product host and Knowlega as its internal Agent.
-- [Configuration](docs/configuration.md): every `config.yaml` section,
+- [Configuration](docs/configuration.md): every QM backend YAML section,
   provider setup, paths, security, and precedence.
 - [Service API](docs/service-api.md): QM backend lifecycle, authentication, and
   route groups.
@@ -34,20 +35,48 @@ answer or write a synthesis back to the wiki.
 
 ## Quick Start
 
-Prerequisites: Go 1.25+, PostgreSQL with pgvector, and an OpenAI-compatible or
-Anthropic-compatible LLM for semantic ingest/query work. The Agent falls back
-to deterministic mock behavior for local plumbing tests only.
+Prerequisites: Go 1.25+, Node.js/npm, Docker (or Colima), and an
+OpenAI-compatible or Anthropic-compatible model for QM plus semantic ingest and
+maintenance. The development supervisor provisions the local pgvector
+PostgreSQL container automatically. Mock providers are local plumbing fixtures
+only.
 
 ```bash
-cp configs/qm-config.example.yaml qm-backend/configs/config.yaml
-$EDITOR qm-backend/configs/config.yaml
+cp configs/qm-config.example.yaml configs/qm-config.yaml
+$EDITOR configs/qm-config.yaml
 
-env GOCACHE=/private/tmp/knowlega-gocache \
-  go run ./cmd/qm-backend --config qm-backend/configs/config.yaml
+cd qm
+npm run dev-instance:no-slack -- --force
 ```
 
-Runtime settings come from the QM YAML file passed to `cmd/qm-backend`; local
-configs and credentials remain ignored and must not be committed.
+This starts and verifies the complete browser stack: PostgreSQL, `qm-backend`,
+the QM runtime, and the unified user/admin frontend. Open
+`http://localhost:8129/` when the command reports success. Runtime settings
+come from the QM YAML generated for the development instance; local configs and
+credentials remain ignored and must not be committed.
+
+```bash
+npm run dev-instance:status   # inspect child health and ports
+npm run dev-instance:doctor   # diagnose local prerequisites
+npm run dev-instance:down     # stop the instance
+```
+
+After changing `configs/qm-config.yaml`, run
+`npm run dev-instance:no-slack -- --force` again to reload the YAML and restart
+the affected children. Configuration is loaded at process startup and is not
+hot-reloaded by `npm run dev`.
+
+For backend-only Go debugging, use the VS Code configuration
+`Backend: QM + Knowlega Agent (standalone)` or run:
+
+```bash
+env GOCACHE=/private/tmp/knowlega-gocache \
+  go run ./cmd/qm-backend --config configs/qm-config.yaml
+```
+
+That standalone command expects the database and listener configuration in the
+YAML to be reachable; it does not replace the full-stack `dev-instance` entry
+point.
 
 ## Run the Local Application
 
@@ -56,7 +85,8 @@ public Knowledge gRPC service or standalone server; it is invoked internally
 after QM writes succeed:
 
 ```bash
-go run ./cmd/qm-backend --config qm-backend/configs/config.yaml
+env GOCACHE=/private/tmp/knowlega-gocache \
+  go run ./cmd/qm-backend --config configs/qm-config.yaml
 ```
 
 The service is consumed through QM's HTTP API and control/runner gRPC. There is

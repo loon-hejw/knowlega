@@ -2,10 +2,14 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 
 	controlv1 "github.com/loon-hejw/knowlega/api/qm/control/v1"
 	"github.com/loon-hejw/knowlega/internal/qm/biz"
+	"github.com/loon-hejw/knowlega/internal/qm/config"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -13,10 +17,62 @@ import (
 type ControlService struct {
 	controlv1.UnimplementedControlServiceServer
 	projects *biz.ProjectUsecase
+	config   config.Config
 }
 
-func NewControlService(projects *biz.ProjectUsecase) *ControlService {
-	return &ControlService{projects: projects}
+func NewControlService(projects *biz.ProjectUsecase, cfg ...config.Config) *ControlService {
+	service := &ControlService{projects: projects}
+	if len(cfg) > 0 {
+		service.config = cfg[0]
+	}
+	return service
+}
+
+func (s *ControlService) GetRuntimeConfiguration(context.Context, *controlv1.RuntimeConfigurationRequest) (*controlv1.RuntimeConfigurationReply, error) {
+	models := s.config.QM.Models
+	reply := &controlv1.RuntimeConfigurationReply{
+		DefaultHarness: models.DefaultHarness,
+		Request: &controlv1.ModelRequestConfig{
+			TimeoutSeconds: int32(models.Request.TimeoutSeconds), Retries: int32(models.Request.Retries),
+			MaxInputChars: int32(models.Request.MaxInputChars), MaxOutputTokens: int32(models.Request.MaxOutputTokens),
+			DisableThinking: models.Request.DisableThinking,
+		},
+		Slack: &controlv1.SlackRuntimeConfig{
+			BotToken: s.config.QM.Slack.BotToken, AppToken: s.config.QM.Slack.AppToken,
+			TeamId: s.config.QM.Slack.TeamID, TeamName: s.config.QM.Slack.TeamName,
+		},
+	}
+	for _, harness := range models.Harnesses {
+		reply.Harnesses = append(reply.Harnesses, &controlv1.RuntimeHarness{
+			Id: harness.ID, Provider: harness.Provider, ModelIds: harness.ModelIDs, DefaultModel: harness.DefaultModel,
+		})
+	}
+	for _, provider := range models.Providers {
+		item := &controlv1.ModelProvider{
+			Id: provider.ID, Protocol: provider.Protocol, BaseUrl: provider.BaseURL, ApiKey: provider.APIKey,
+			UserAgent: provider.UserAgent, AnthropicVersion: provider.AnthropicVersion,
+		}
+		for _, model := range provider.Models {
+			item.Models = append(item.Models, &controlv1.RuntimeModel{
+				Id: model.ID, Name: model.Name, ContextWindow: int32(model.ContextWindow), MaxTokens: int32(model.MaxTokens),
+			})
+		}
+		reply.Providers = append(reply.Providers, item)
+	}
+	for _, client := range s.config.QM.OAuth.Clients {
+		reply.OauthClients = append(reply.OauthClients, &controlv1.OAuthClientConfig{
+			Provider: client.Provider, ClientId: client.ClientID, ClientSecret: client.ClientSecret,
+			Scopes: client.Scopes, RedirectAllowlist: client.RedirectAllowlist,
+			ConsentMode: client.ConsentMode, HostedDomain: client.HostedDomain,
+		})
+	}
+	// Hash the runtime payload itself so secret-only YAML changes also trigger
+	// Node adapter reconciliation. Public config types intentionally omit secrets
+	// from JSON, so hashing those structs would miss credential rotation.
+	revisionJSON, _ := json.Marshal(reply)
+	revisionHash := sha256.Sum256(revisionJSON)
+	reply.Revision = hex.EncodeToString(revisionHash[:])
+	return reply, nil
 }
 
 func (s *ControlService) Health(context.Context, *controlv1.HealthRequest) (*controlv1.HealthReply, error) {
