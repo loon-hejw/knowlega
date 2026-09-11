@@ -122,7 +122,6 @@ type legacyKnowledgeLLMConfig struct {
 type Config struct {
 	Server struct {
 		HTTPAddr string `yaml:"http_addr"`
-		GRPCAddr string `yaml:"grpc_addr"`
 	} `yaml:"server"`
 	Database struct {
 		URL string `yaml:"url"`
@@ -164,7 +163,6 @@ type Config struct {
 		PortalIdentitySecret     string   `yaml:"portal_identity_secret"`
 		ConnectorSecretKey       string   `yaml:"connector_secret_key"`
 		PreviousConnectorSecrets []string `yaml:"previous_connector_secret_keys"`
-		GRPCInternalToken        string   `yaml:"grpc_internal_token"`
 		ReplayWindowSeconds      int      `yaml:"replay_window_seconds"`
 	} `yaml:"auth"`
 }
@@ -174,7 +172,6 @@ func Default() Config {
 	// Keep the QM Go backend off the legacy modelgate port. Managed
 	// dev instances override this with their slot-specific port at bootstrap.
 	c.Server.HTTPAddr = ":18083"
-	c.Server.GRPCAddr = "127.0.0.1:9090"
 	c.QM.OrgID = "local"
 	c.QM.NodeCoreURL = "http://127.0.0.1:8081"
 	c.QM.RouteMode = "proxy"
@@ -244,9 +241,6 @@ func Load(path string) (Config, error) {
 		if len(key) < 32 {
 			return Config{}, fmt.Errorf("auth.previous_connector_secret_keys[%d] must be at least 32 characters", i)
 		}
-	}
-	if (len(c.QM.Models.Providers) != 0 || c.QM.Slack.BotToken != "" || len(c.QM.OAuth.Clients) != 0) && strings.TrimSpace(c.Auth.GRPCInternalToken) == "" {
-		return Config{}, errors.New("auth.grpc_internal_token is required when qm.models, qm.slack, or qm.oauth is configured")
 	}
 	if c.QM.SandboxDefaultBackend != "" {
 		if !validSandboxBackend(c.QM.SandboxDefaultBackend) {
@@ -726,7 +720,6 @@ func (c *Config) applyLegacyQMEnv(lookup func(string) (string, bool)) {
 	set("CORE_SIGNING_SECRET", &c.Auth.SourceSigningSecret)
 	set("CAPABILITY_SECRET", &c.Auth.CapabilitySecret)
 	set("PORTAL_IDENTITY_SECRET", &c.Auth.PortalIdentitySecret)
-	set("QM_BACKEND_GRPC_INTERNAL_TOKEN", &c.Auth.GRPCInternalToken)
 	if value, ok := lookup("QM_ROUTE_MODE"); ok && value != "" {
 		c.QM.RouteMode = value
 	}

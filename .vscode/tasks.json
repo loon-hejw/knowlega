@@ -2,6 +2,40 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "ide: frontend prelaunch",
+      "dependsOrder": "sequence",
+      "dependsOn": [
+        "ide: build web-ui",
+        "ide: wait for core readyz"
+      ],
+      "problemMatcher": []
+    },
+    {
+      "label": "ide: wait for core readyz",
+      "type": "shell",
+      "command": "for i in $(seq 1 120); do curl -fsS http://127.0.0.1:18085/readyz >/dev/null 2>&1 && exit 0; sleep 0.5; done; echo 'core did not become ready in 60s'; exit 1",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "ide: build web-ui",
+      "type": "process",
+      "command": "npm",
+      "args": [
+        "run",
+        "build"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}/qm/plugins/web-ui",
+        "env": {
+          "WEB_UI_BASE": "/"
+        }
+      },
+      "problemMatcher": []
+    },
+    {
       "label": "qm: start full stack (no Slack)",
       "type": "process",
       "command": "npm",

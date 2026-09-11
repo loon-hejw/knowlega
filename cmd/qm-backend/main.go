@@ -3,11 +3,9 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
 	"flag"
 	"log/slog"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -21,7 +19,6 @@ import (
 	knowlegapostgres "github.com/loon-hejw/knowlega/internal/agent/knowlega/postgres"
 	agentservice "github.com/loon-hejw/knowlega/internal/agent/knowlega/service"
 	qmagent "github.com/loon-hejw/knowlega/internal/qm/agent"
-	"github.com/loon-hejw/knowlega/internal/qm/biz"
 	"github.com/loon-hejw/knowlega/internal/qm/config"
 	"github.com/loon-hejw/knowlega/internal/qm/data"
 	"github.com/loon-hejw/knowlega/internal/qm/server"
@@ -50,10 +47,9 @@ func main() {
 		slog.Error("migrate PostgreSQL", "error", err)
 		os.Exit(1)
 	}
-	projects := biz.NewProjectUsecase(data.NewProjectRepository(pg, cfg.QM.OrgID))
 	scopeRepo := data.NewKnowledgeScopeRepository(pg)
 	projectFiles := data.NewProjectFileMembershipRepository(pg)
-	knowledgeStore, closeKnowledgeStore, err := openKnowledgeStore(ctx, pg, cfg.Database.URL)
+	knowledgeStore, closeKnowledgeStore, err := openKnowledgeStore(ctx, cfg.Database.URL)
 	if err != nil {
 		slog.Error("build knowledge postgres store", "error", err)
 		os.Exit(1)
@@ -82,10 +78,6 @@ func main() {
 		slog.Error("build HTTP server", "error", err)
 		os.Exit(1)
 	}
-	// The compatibility gRPC service now delegates to the internal Agent through
-	// the engine. Keep its legacy extension points nil so no simplified engine
-	// can accidentally become the production path.
-	grpcServer := server.NewGRPCServer(cfg, projects, data.NewRunRepository(pg), data.NewCronRepository(pg), data.NewDeploymentLayerRepository(pg))
 	workerCtx, cancelWorker := context.WithCancel(ctx)
 	var workerWait sync.WaitGroup
 	startWorker := func(run func(context.Context)) {
@@ -197,7 +189,7 @@ func main() {
 			runKnowledgeWorker(ctx, cfg, scopeRepo, projectFiles, fullAgent)
 		})
 	}
-	app := kratos.New(kratos.Name("qm-backend"), kratos.Server(httpServer, grpcServer))
+	app := kratos.New(kratos.Name("qm-backend"), kratos.Server(httpServer))
 	if err := app.Run(); err != nil {
 		slog.Error("run", "error", err)
 		os.Exit(1)
@@ -336,39 +328,10 @@ func buildKnowledgeAgent(cfg config.Config, store *knowlegapostgres.Store) (*kno
 	})
 }
 
-func openKnowledgeStore(ctx context.Context, pg *data.Postgres, dsn string) (*knowlegapostgres.Store, func(), error) {
-	if _, err := pg.Pool.Exec(ctx, "CREATE SCHEMA IF NOT EXISTS knowledge_core"); err != nil {
-		return nil, func() {}, err
-	}
-	knowledgeDSN := withKnowledgeSearchPath(dsn)
-	db, err := sql.Open("pgx", knowledgeDSN)
-	if err != nil {
-		return nil, func() {}, err
-	}
-	if err := db.PingContext(ctx); err != nil {
-		db.Close()
-		return nil, func() {}, err
-	}
-	store := knowlegapostgres.NewStore(db)
-	if err := store.Migrate(ctx); err != nil {
-		db.Close()
-		return nil, func() {}, err
-	}
-	return store, func() { _ = db.Close() }, nil
+func openKnowledgeStore(ctx context.Context, dsn string) (*knowlegapostgres.Store, func(), error) {
+	return knowlegapostgres.OpenStore(ctx, dsn)
 }
 
 func withKnowledgeSearchPath(dsn string) string {
-	const knowledgeSearchPath = "knowledge_core,public"
-	parsed, err := url.Parse(dsn)
-	if err == nil && parsed.Scheme != "" {
-		query := parsed.Query()
-		query.Set("search_path", knowledgeSearchPath)
-		parsed.RawQuery = query.Encode()
-		return parsed.String()
-	}
-	separator := "?"
-	if strings.Contains(dsn, "?") {
-		separator = "&"
-	}
-	return dsn + separator + "search_path=" + knowledgeSearchPath
+	return knowlegapostgres.SearchPathDSN(dsn)
 }

@@ -23,14 +23,11 @@ func TestXiyoujiCorpusSynchronizesCompletePostgresProjection(t *testing.T) {
 	if strings.TrimSpace(dsn) == "" {
 		t.Skip("KBCORE_TEST_POSTGRES_DSN is not set")
 	}
-	db, err := sql.Open("pgx", dsn)
+	db, err := knowlegapostgres.Open(t.Context(), dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	if err := db.PingContext(t.Context()); err != nil {
-		t.Fatal(err)
-	}
 	store := knowlegapostgres.NewStore(db)
 	if err := store.Migrate(t.Context()); err != nil {
 		t.Fatal(err)

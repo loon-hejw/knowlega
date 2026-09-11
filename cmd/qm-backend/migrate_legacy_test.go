@@ -39,7 +39,7 @@ func TestImportLegacyKnowledgeProjectRegistersQMAndPostgresState(t *testing.T) {
 	if _, err := pg.Pool.Exec(ctx, "TRUNCATE project_file_memberships,file_artifacts,knowledge_scopes,projects,durable_map_versions,deactivated_principals,source_auth_replay,directory_members,directory_channels,directory_channel_members,directory_group_members,directory_sync,directory_meta,acl_grants,audit_log RESTART IDENTITY CASCADE"); err != nil {
 		t.Fatal(err)
 	}
-	knowledgeStore, closeKnowledgeStore, err := openKnowledgeStore(ctx, pg, databaseURL)
+	knowledgeStore, closeKnowledgeStore, err := openKnowledgeStore(ctx, databaseURL)
 	if err != nil {
 		t.Fatal(err)
 	}

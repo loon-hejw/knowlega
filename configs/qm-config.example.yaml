@@ -1,6 +1,5 @@
 server:
   http_addr: ":18083"
-  grpc_addr: "127.0.0.1:9090"
 
 database:
   url: "postgres://kbcore:kbcore@127.0.0.1:55433/kbcore?sslmode=disable"
@@ -8,7 +7,7 @@ database:
 qm:
   org_id: "local"
   node_core_url: "http://127.0.0.1:8081"
-  route_mode: "proxy"
+  route_mode: "go"
   agent_workspace_root: "data/qm-workspaces"
   models:
     default_harness: "pi"
@@ -119,10 +118,9 @@ workers:
       concurrency: 1
 
 auth:
-  source_signing_secret: "development-only-source-secret"
+  source_signing_secret: "development-only-source-signing-secret"
   capability_secret: "development-only-capability-secret"
   portal_identity_secret: "development-only-portal-identity-secret"
   connector_secret_key: "development-only-connector-secret-at-least-32-characters"
   previous_connector_secret_keys: []
-  grpc_internal_token: "development-only-internal-token"
   replay_window_seconds: 300

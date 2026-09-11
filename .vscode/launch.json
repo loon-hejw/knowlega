@@ -2,6 +2,54 @@
   "version": "0.2.0",
   "configurations": [
     {
+      "name": "IDE Core (Go)",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${workspaceFolder}/cmd/qm-backend",
+      "args": [
+        "--config",
+        "${workspaceFolder}/configs/qm-config.yaml"
+      ],
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "GOCACHE": "/private/tmp/knowlega-gocache"
+      }
+    },
+    {
+      "name": "IDE Frontend (Node)",
+      "type": "node",
+      "request": "launch",
+      "program": "${workspaceFolder}/qm/plugins/web-ui/server/unified.ts",
+      "cwd": "${workspaceFolder}/qm/plugins/web-ui",
+      "runtimeArgs": [
+        "--env-file-if-exists=${workspaceFolder}/qm/.env"
+      ],
+      "console": "integratedTerminal",
+      "preLaunchTask": "ide: frontend prelaunch",
+      "env": {
+        "PORT": "18129",
+        "PORTAL_PUBLIC_URL": "http://localhost:18129",
+        "WEB_UI_PUBLIC_URL": "http://localhost:18129",
+        "CORE_API_URL": "http://localhost:18085",
+        "CORE_ORG_ID": "local",
+        "WEB_UI_BASE": "/",
+        "WEB_UI_PRINCIPALS": "",
+        "ADMIN_BASE_PATH": "/admin",
+        "NODE_ENV": "development",
+        "PORTAL_LOCAL_AUTH_BYPASS": "1",
+        "PORTAL_DEV_PRINCIPAL": "hejw",
+        "ANTHROPIC_API_KEY": null,
+        "ANTHROPIC_BASE_URL": null,
+        "OPENAI_API_KEY": null,
+        "OPENAI_BASE_URL": null,
+        "OPENROUTER_API_KEY": null,
+        "OPENROUTER_BASE_URL": null,
+        "SLACK_BOT_TOKEN": null,
+        "SLACK_APP_TOKEN": null
+      }
+    },
+    {
       "name": "QM: Full Stack (No Slack)",
       "type": "node-terminal",
       "request": "launch",
@@ -12,46 +60,18 @@
       "name": "QM: Dev Status",
       "type": "node-terminal",
       "request": "launch",
-      "command": "npm run dev-instance:status",
+      "command": "npm run dev-status",
       "cwd": "${workspaceFolder}/qm"
-    },
-    {
-      "name": "QM: Dev Doctor",
-      "type": "node-terminal",
-      "request": "launch",
-      "command": "npm run dev-instance:doctor",
-      "cwd": "${workspaceFolder}/qm"
-    },
-    {
-      "name": "Backend: QM + Knowlega Agent (standalone)",
-      "type": "go",
-      "request": "launch",
-      "mode": "debug",
-      "program": "${workspaceFolder}/cmd/qm-backend",
-      "args": [
-        "--config",
-        "${workspaceFolder}/configs/qm-config.yaml"
-      ],
-      "cwd": "${workspaceFolder}"
-    },
-    {
-      "name": "Tests: QM + Knowlega (Go)",
-      "type": "node-terminal",
-      "request": "launch",
-      "command": "env GOCACHE=/private/tmp/knowlega-gocache go test ./...",
-      "cwd": "${workspaceFolder}"
-    },
-    {
-      "name": "Tests: Go package (debug current)",
-      "type": "go",
-      "request": "launch",
-      "mode": "test",
-      "program": "${fileDirname}",
-      "args": [
-        "-test.v"
-      ],
-      "cwd": "${workspaceFolder}"
     }
   ],
-  "compounds": []
+  "compounds": [
+    {
+      "name": "IDE: Full Stack (Go backend + Frontend)",
+      "configurations": [
+        "IDE Core (Go)",
+        "IDE Frontend (Node)"
+      ],
+      "stopAll": true
+    }
+  ]
 }

@@ -102,7 +102,7 @@ func TestRealLLMQMKnowledgePiAcceptance(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	knowledgeStore, closeKnowledgeStore, err := openKnowledgeStore(ctx, pg, databaseURL)
+	knowledgeStore, closeKnowledgeStore, err := openKnowledgeStore(ctx, databaseURL)
 	if err != nil {
 		t.Fatal(err)
 	}

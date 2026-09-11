@@ -181,7 +181,7 @@ func (*knowledgeCompleteTools) Definitions(context.Context, ToolOptions) ([]Tool
 
 func (t *knowledgeCompleteTools) Execute(context.Context, ToolCall) (ToolResult, error) {
 	t.calls++
-	return toolTextWithDetails(`{"status":"complete","candidate":"唐太宗"}`, json.RawMessage(`{"kind":"knowledge","action":"submit","status":"complete","sources":[]}`)), nil
+	return toolTextWithDetails(`{"status":"complete","answer":"答案：唐太宗。","candidate":"唐太宗"}`, json.RawMessage(`{"kind":"knowledge","action":"submit","status":"complete","sources":[]}`)), nil
 }
 
 type knowledgeReadTools struct {
@@ -211,7 +211,7 @@ func (t *knowledgeNavigationTools) Execute(_ context.Context, call ToolCall) (To
 	case "read":
 		return toolTextWithDetails(`{"path":"wiki/evidence.md"}`, json.RawMessage(`{"kind":"knowledge","action":"read","sources":[{"path":"wiki/evidence.md","evidence":true}]}`)), nil
 	case "submit":
-		return toolTextWithDetails(`{"status":"complete","candidate":"候选"}`, json.RawMessage(`{"kind":"knowledge","action":"submit","status":"complete","sources":[]}`)), nil
+		return toolTextWithDetails(`{"status":"complete","answer":"答案：候选。","candidate":"候选"}`, json.RawMessage(`{"kind":"knowledge","action":"submit","status":"complete","sources":[]}`)), nil
 	default:
 		return toolTextWithDetails(`[]`, json.RawMessage(`{"kind":"knowledge","action":"search","sources":[]}`)), nil
 	}
@@ -579,7 +579,7 @@ func TestPiAdapterEvaluatesKnowledgeProgressAfterEntireToolBatch(t *testing.T) {
 	if err != nil || result.Status == "incomplete" || result.Reply != "答案：候选。" {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if tools.calls != knowledgeNoProgressLimit+2 || len(transport.requests) != 3 {
+	if tools.calls != knowledgeNoProgressLimit+2 || len(transport.requests) != 2 {
 		t.Fatalf("calls=%d requests=%d", tools.calls, len(transport.requests))
 	}
 	for _, message := range transport.requests[1].Messages {
@@ -608,7 +608,7 @@ func TestPiAdapterPromptsForSubmitBeforeStoppingStalledKnowledgeNavigation(t *te
 	if err != nil || result.Status == "incomplete" || result.Reply != "答案：候选。" {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if tools.calls != knowledgeNoProgressLimit+1 || len(transport.requests) != 3 {
+	if tools.calls != knowledgeNoProgressLimit+1 || len(transport.requests) != 2 {
 		t.Fatalf("calls=%d requests=%d", tools.calls, len(transport.requests))
 	}
 	lastMessage := transport.requests[1].Messages[len(transport.requests[1].Messages)-1]
@@ -641,7 +641,7 @@ func TestPiAdapterPromptsForSubmitAfterBoundedPreSubmitEvidenceCollection(t *tes
 	if err != nil || result.Status == "incomplete" || result.Reply != "答案：候选。" {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if tools.calls != knowledgePreSubmitLimit+1 || len(transport.requests) != 3 {
+	if tools.calls != knowledgePreSubmitLimit+1 || len(transport.requests) != 2 {
 		t.Fatalf("calls=%d requests=%d", tools.calls, len(transport.requests))
 	}
 	lastMessage := transport.requests[1].Messages[len(transport.requests[1].Messages)-1]
@@ -676,7 +676,7 @@ func TestPiAdapterCandidateSearchesAdvanceIncompleteSubmitRepair(t *testing.T) {
 			return SessionEntry{Sequence: 1, Type: entry.Type}, nil
 		},
 	})
-	if err != nil || result.Status == "incomplete" || result.Reply != "答案：候选。" || len(transport.requests) != 4 {
+	if err != nil || result.Status == "incomplete" || result.Reply != "答案：候选。" || len(transport.requests) != 3 {
 		t.Fatalf("candidate repair did not converge: result=%+v requests=%d err=%v", result, len(transport.requests), err)
 	}
 }
@@ -693,7 +693,7 @@ func (t *knowledgeRepairSequenceTools) Execute(_ context.Context, call ToolCall)
 		if t.submits == 1 {
 			return toolTextWithDetails(`{"status":"incomplete","unresolved_requirement_ids":["r1"]}`, json.RawMessage(`{"kind":"knowledge","action":"submit","status":"incomplete","sources":[]}`)), nil
 		}
-		return toolTextWithDetails(`{"status":"complete","candidate":"候选"}`, json.RawMessage(`{"kind":"knowledge","action":"submit","status":"complete","sources":[]}`)), nil
+		return toolTextWithDetails(`{"status":"complete","answer":"答案：候选。","candidate":"候选"}`, json.RawMessage(`{"kind":"knowledge","action":"submit","status":"complete","sources":[]}`)), nil
 	}
 	return toolTextWithDetails(`[]`, json.RawMessage(`{"kind":"knowledge","action":"search","sources":[]}`)), nil
 }
@@ -820,7 +820,7 @@ func TestPiAdapterRedirectsPrematureKnowledgeAnswerToSubmit(t *testing.T) {
 			return SessionEntry{Sequence: 1, Type: entry.Type}, nil
 		},
 	})
-	if err != nil || result.Status == "incomplete" || result.Reply != "答案：候选。" || len(transport.requests) != 4 {
+	if err != nil || result.Status == "incomplete" || result.Reply != "答案：候选。" || len(transport.requests) != 3 {
 		t.Fatalf("result=%+v requests=%d err=%v", result, len(transport.requests), err)
 	}
 }
@@ -971,7 +971,7 @@ func TestPiAdapterSkipsLaterToolsAfterKnowledgeHaltInSameCompletion(t *testing.T
 func TestPiAdapterAllowsCandidateAfterCompleteKnowledgeSubmit(t *testing.T) {
 	transport := &fakePiTransport{completions: []PiCompletion{
 		{ToolCalls: []ToolCall{{ID: "submit-1", Name: "knowledge", Arguments: json.RawMessage(`{"action":"submit","question":"q"}`)}}},
-		{Text: "答案：唐太宗。"},
+		{ToolCalls: []ToolCall{{ID: "submit-duplicate", Name: "knowledge", Arguments: json.RawMessage(`{"action":"submit","question":"q"}`)}}},
 	}}
 	adapter, _ := NewPiAdapter(piTestModels(), transport)
 	tools := &knowledgeCompleteTools{}
@@ -981,8 +981,49 @@ func TestPiAdapterAllowsCandidateAfterCompleteKnowledgeSubmit(t *testing.T) {
 			return SessionEntry{Sequence: 1, Type: entry.Type}, nil
 		},
 	})
-	if err != nil || result.Status == "incomplete" || result.CompletionStatus != "ok" || result.Reply != "答案：唐太宗。" || tools.calls != 1 {
+	if err != nil || result.Status == "incomplete" || result.CompletionStatus != "ok" || result.Reply != "答案：唐太宗。" || tools.calls != 1 || len(transport.requests) != 1 {
 		t.Fatalf("result=%+v calls=%d err=%v", result, tools.calls, err)
+	}
+}
+
+func TestPiAdapterSkipsCallsAfterCompleteKnowledgeSubmitInSameBatch(t *testing.T) {
+	transport := &fakePiTransport{completions: []PiCompletion{{ToolCalls: []ToolCall{
+		{ID: "submit-1", Name: "knowledge", Arguments: json.RawMessage(`{"action":"submit","answer":"答案：唐太宗。","question":"q"}`)},
+		{ID: "search-after-submit", Name: "knowledge", Arguments: json.RawMessage(`{"action":"search","query":"唐太宗"}`)},
+	}}}}
+	adapter, _ := NewPiAdapter(piTestModels(), transport)
+	tools := &knowledgeCompleteTools{}
+	entries := []NewEntry{}
+	result, err := adapter.RunTurn(context.Background(), TurnInput{
+		SessionID: "session-knowledge-complete-batch", Input: "核验", SystemPrompt: "system", ScopeLabel: "group:web-project-p1", OrgScopeID: "org:acme", Model: "model-pi", Tools: tools,
+		Emit: func(_ context.Context, entry NewEntry) (SessionEntry, error) {
+			entries = append(entries, entry)
+			return SessionEntry{Sequence: len(entries) - 1, Type: entry.Type, Payload: entry.Payload}, nil
+		},
+	})
+	if err != nil || result.CompletionStatus != "ok" || result.Reply != "答案：唐太宗。" || tools.calls != 1 || len(transport.requests) != 1 {
+		t.Fatalf("result=%+v calls=%d requests=%d err=%v", result, tools.calls, len(transport.requests), err)
+	}
+	if len(entries) != 6 || entries[3].Type != "tool_call" || entries[4].Type != "tool_result" {
+		t.Fatalf("entries=%#v", entries)
+	}
+	var skipped struct {
+		IsError bool `json:"isError"`
+		Details struct {
+			ErrorCode string `json:"errorCode"`
+		} `json:"details"`
+	}
+	if json.Unmarshal(entries[4].Payload, &skipped) != nil || !skipped.IsError || skipped.Details.ErrorCode != "post_validation_call_skipped" {
+		t.Fatalf("skipped result=%s", entries[4].Payload)
+	}
+}
+
+func TestPiKnowledgeValidationCompleteSubmitIsTerminal(t *testing.T) {
+	state := piKnowledgeValidation{}
+	state.observe("submit", toolText(`{"status":"complete","answer":"答案：唐太宗。"}`))
+	state.noteCall("search")
+	if !state.submitComplete || state.needsSubmit() || state.answer != "答案：唐太宗。" {
+		t.Fatalf("state=%+v", state)
 	}
 }
 

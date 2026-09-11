@@ -17,7 +17,7 @@ func writeConfig(t *testing.T, contents string) string {
 	return path
 }
 
-const baseConfig = "database:\n  url: postgres://example/qm\nauth:\n  grpc_internal_token: test-internal-token\nqm:\n  org_id: acme\n"
+const baseConfig = "database:\n  url: postgres://example/qm\nqm:\n  org_id: acme\n"
 
 func TestDefaultUsesNonLegacyHTTPPort(t *testing.T) {
 	if got := Default().Server.HTTPAddr; got != ":18083" {
@@ -231,26 +231,6 @@ func TestModelSlackAndOAuthIgnoreEnvironmentVariables(t *testing.T) {
 	}
 }
 
-func TestSharedYAMLConfigRequiresProtectedRuntimeGRPC(t *testing.T) {
-	contents := strings.Replace(baseConfig, "auth:\n  grpc_internal_token: test-internal-token\n", "", 1) + `  models:
-    default_harness: mock
-    providers:
-      - id: mock
-        protocol: mock
-        models:
-          - id: mock
-    harnesses:
-      - id: mock
-        provider: mock
-        model_ids: [mock]
-        default_model: mock
-`
-	_, err := Load(writeConfig(t, contents))
-	if err == nil || !strings.Contains(err.Error(), "auth.grpc_internal_token") {
-		t.Fatalf("err=%v", err)
-	}
-}
-
 func TestSharedYAMLHarnessValidation(t *testing.T) {
 	modelConfig := `  models:
     default_harness: %s
@@ -371,7 +351,7 @@ func TestWorkerPoolValidation(t *testing.T) {
 
 func TestConnectorSecretKeyValidation(t *testing.T) {
 	withAuth := func(extra string) string {
-		return strings.Replace(baseConfig, "  grpc_internal_token: test-internal-token\n", "  grpc_internal_token: test-internal-token\n"+extra, 1)
+		return baseConfig + "auth:\n" + extra
 	}
 	_, err := Load(writeConfig(t, withAuth("  connector_secret_key: short\n")))
 	if err == nil || !strings.Contains(err.Error(), "at least 32 characters") {

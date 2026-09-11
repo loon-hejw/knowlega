@@ -4,14 +4,12 @@ package postgres
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"testing"
 	"time"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/loon-hejw/knowlega/internal/agent/knowlega/core"
 )
 
@@ -22,13 +20,13 @@ func TestStoreTransactionManifestReviewAndPruneIntegration(t *testing.T) {
 	if dsn == "" {
 		t.Skip("KBCORE_TEST_POSTGRES_DSN is not set")
 	}
-	db, err := sql.Open("pgx", dsn)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	db, err := Open(ctx, dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	store := NewStore(db)
 	if err := store.Migrate(ctx); err != nil {
 		t.Fatal(err)

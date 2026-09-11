@@ -61,8 +61,31 @@ func (s *Store) WithCodeGraphStoreTx(ctx context.Context, fn func(core.CodeGraph
 }
 
 func (s *Store) Migrate(ctx context.Context) error {
+	if err := s.checkSchema(ctx); err != nil {
+		return err
+	}
 	_, err := s.db.ExecContext(ctx, BootstrapSQL)
 	return err
+}
+
+// checkSchema fails loudly when the connection would create Knowlega's tables
+// somewhere other than the dedicated schema. Knowlega's `projects` table
+// collides with the QM control plane's, and `CREATE TABLE IF NOT EXISTS`
+// resolves that collision silently — the loser gets no table and only fails
+// later at query time. Build the Store with OpenStore (or apply SearchPathDSN)
+// so the connection carries the right search_path.
+func (s *Store) checkSchema(ctx context.Context) error {
+	var current sql.NullString
+	if err := s.db.QueryRowContext(ctx, "SELECT current_schema()").Scan(&current); err != nil {
+		return fmt.Errorf("resolve current schema: %w", err)
+	}
+	if current.String != Schema {
+		return fmt.Errorf(
+			"knowlega postgres: refusing to migrate into schema %q, want %q; open the connection with postgres.SearchPathDSN or postgres.OpenStore",
+			current.String, Schema,
+		)
+	}
+	return nil
 }
 
 func (s *Store) UpsertProject(ctx context.Context, p core.Project) error {
