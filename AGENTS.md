@@ -183,8 +183,9 @@ Borrow these behaviors:
   and manifest writes are made concurrency-safe; PostgreSQL and embedding sync
   must be idempotently completed before the project is marked ready.
 - The standalone Knowledge Core `web/` frontend has been removed. User-facing
-  browser work belongs to QM's `qm/plugins/web-ui`, which remains an API client
-  over the Knowledge Core/QM services; do not duplicate LLM Wiki compile,
+  browser work belongs to `plugins/web-ui`, which remains an API client
+  over the Knowledge Core/QM services. The original TS implementation in `qm/`
+  is preserved as reference only; do not duplicate LLM Wiki compile,
   query, review, or persistence logic in the browser.
 - Wiki page sync should run inside `WithWikiPageStoreTx` when the backing store
   supports it, so page rows and embedding metadata do not partially commit on

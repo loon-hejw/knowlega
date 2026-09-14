@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -23,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/google/uuid"
 	khttp "github.com/go-kratos/kratos/v2/transport/http"
 	knowlega "github.com/loon-hejw/knowlega/internal/agent/knowlega"
 	agentservice "github.com/loon-hejw/knowlega/internal/agent/knowlega/service"
@@ -70,6 +72,8 @@ type HTTPServer struct {
 	customProviders   *data.CustomProviderRepository
 	slackInstallation *data.SlackInstallationRepository
 	sandboxRoutes     *data.SandboxRouteRepository
+	runtimeConfig     *data.RuntimeConfigRepository
+	secretDrops       *data.SecretDropRepository
 	audit             *data.Auditor
 	auth              auth.Verifier
 	readiness         func(context.Context) error
@@ -139,7 +143,9 @@ func NewHTTPServer(cfg config.Config, pg *data.Postgres, knowledgeAgent *knowleg
 		customProviders:   data.NewCustomProviderRepository(pg),
 		slackInstallation: data.NewSlackInstallationRepository(pg),
 		sandboxRoutes:     data.NewSandboxRouteRepository(pg),
+		runtimeConfig:     data.NewRuntimeConfigRepository(pg),
 		auth:              auth.Verifier{SourceSecret: cfg.Auth.SourceSigningSecret, CapabilitySecret: cfg.Auth.CapabilitySecret, ReplayWindow: time.Duration(cfg.Auth.ReplayWindowSeconds) * time.Second, DB: pg.Pool},
+		secretDrops:       data.NewSecretDropRepository(pg),
 		readiness: func(ctx context.Context) error {
 			probeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 			defer cancel()
@@ -348,6 +354,24 @@ func (h *HTTPServer) owns(method, path string) bool {
 		return method == http.MethodGet
 	}
 	if path == "/v1/memory/restore" {
+		return method == http.MethodPost
+	}
+	if path == "/v1/runtime-config" {
+		return method == http.MethodGet || method == http.MethodPut
+	}
+	if path == "/v1/surface-config" {
+		return method == http.MethodGet
+	}
+	if path == "/v1/session-state/events" {
+		return method == http.MethodGet
+	}
+	if path == "/v1/keychain/drops" {
+		return method == http.MethodPost
+	}
+	if strings.HasPrefix(path, "/v1/keychain/drops/") && strings.HasSuffix(path, "/form") {
+		return method == http.MethodGet
+	}
+	if strings.HasPrefix(path, "/v1/keychain/drops/") && !strings.Contains(path[len("/v1/keychain/drops/"):], "/") {
 		return method == http.MethodPost
 	}
 	if path == "/v1/sessions" {
@@ -811,7 +835,7 @@ func (h *HTTPServer) serveOwned(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	routeAuth := "either"
-	if r.URL.Path == "/v1/directory" || r.URL.Path == "/v1/directory/meta" || r.URL.Path == "/v1/runs" || r.URL.Path == "/v1/turns" || runRecordID(r.URL.Path) != "" || r.URL.Path == "/v1/approvals/pending" || approvalID(r.URL.Path) != "" || r.URL.Path == "/v1/contexts" || r.URL.Path == "/v1/scope-resources" || r.URL.Path == "/v1/skills" || r.URL.Path == "/v1/grants" || r.URL.Path == "/v1/grants/revoke" || r.URL.Path == "/v1/session-cap" || r.URL.Path == "/v1/memory" || r.URL.Path == "/v1/sessions" || sessionBackgroundID(r.URL.Path) != "" || sessionApprovalsID(r.URL.Path) != "" || sessionEntryPath(r.URL.Path) || sessionID(r.URL.Path) != "" || runDeliveryStateID(r.URL.Path) != "" || runSignalID(r.URL.Path) != "" || r.URL.Path == "/v1/deliveries" || r.URL.Path == "/v1/deliveries/ack-by-key" || deliveryAckID(r.URL.Path) != "" || r.URL.Path == "/v1/egress-audit" || r.URL.Path == "/v1/auth/broker/claim" || turnMetricsRunID(r.URL.Path) != "" || surfaceContextResultID(r.URL.Path) != "" || r.URL.Path == "/v1/surface-context/pending" || r.URL.Path == "/v1/files/upload" || r.URL.Path == "/v1/connectors/catalog" || r.URL.Path == "/v1/connectors/oauth/status" || projectKnowledgeDocumentID(r.URL.Path) != "" || r.Method == http.MethodPost && r.URL.Path == "/v1/crons" || strings.HasPrefix(r.URL.Path, "/v1/principals/") || strings.HasPrefix(r.URL.Path, "/v1/surface-cache/") || strings.HasPrefix(r.URL.Path, "/v1/contexts/") {
+	if r.URL.Path == "/v1/directory" || r.URL.Path == "/v1/directory/meta" || r.URL.Path == "/v1/runs" || r.URL.Path == "/v1/turns" || runRecordID(r.URL.Path) != "" || r.URL.Path == "/v1/approvals/pending" || approvalID(r.URL.Path) != "" || r.URL.Path == "/v1/contexts" || r.URL.Path == "/v1/scope-resources" || r.URL.Path == "/v1/skills" || r.URL.Path == "/v1/grants" || r.URL.Path == "/v1/grants/revoke" || r.URL.Path == "/v1/session-cap" || r.URL.Path == "/v1/memory" || r.URL.Path == "/v1/sessions" || sessionBackgroundID(r.URL.Path) != "" || sessionApprovalsID(r.URL.Path) != "" || sessionEntryPath(r.URL.Path) || sessionID(r.URL.Path) != "" || runDeliveryStateID(r.URL.Path) != "" || runSignalID(r.URL.Path) != "" || r.URL.Path == "/v1/deliveries" || r.URL.Path == "/v1/deliveries/ack-by-key" || deliveryAckID(r.URL.Path) != "" || r.URL.Path == "/v1/egress-audit" || r.URL.Path == "/v1/auth/broker/claim" || turnMetricsRunID(r.URL.Path) != "" || surfaceContextResultID(r.URL.Path) != "" || r.URL.Path == "/v1/surface-context/pending" || r.URL.Path == "/v1/surface-config" || r.URL.Path == "/v1/session-state/events" || r.URL.Path == "/v1/files/upload" || r.URL.Path == "/v1/connectors/catalog" || r.URL.Path == "/v1/connectors/oauth/status" || projectKnowledgeDocumentID(r.URL.Path) != "" || r.Method == http.MethodPost && r.URL.Path == "/v1/crons" || strings.HasPrefix(r.URL.Path, "/v1/principals/") || strings.HasPrefix(r.URL.Path, "/v1/surface-cache/") || strings.HasPrefix(r.URL.Path, "/v1/contexts/") || strings.HasPrefix(r.URL.Path, "/v1/keychain/drops/") {
 		routeAuth = "source"
 	}
 	identity, err := h.auth.Authenticate(r.Context(), r, body, routeAuth)
@@ -883,6 +907,20 @@ func (h *HTTPServer) serveOwned(w http.ResponseWriter, r *http.Request) {
 		h.memoryHistory(w, r, identity)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/memory/restore":
 		h.restoreMemory(w, r, body, identity)
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/runtime-config":
+		h.getRuntimeConfig(w, r, identity)
+	case r.Method == http.MethodPut && r.URL.Path == "/v1/runtime-config":
+		h.putRuntimeConfig(w, r, body, identity)
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/surface-config":
+		h.getSurfaceConfig(w, r, identity)
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/session-state/events":
+		h.sessionStateEvents(w, r, identity)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/keychain/drops":
+		h.mintSecretDrop(w, r, body, identity)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/keychain/drops/") && strings.HasSuffix(r.URL.Path, "/form"):
+		h.secretDropForm(w, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/keychain/drops/") && !strings.Contains(r.URL.Path[len("/v1/keychain/drops/"):], "/"):
+		h.redeemSecretDrop(w, r, body)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/deployments":
 		h.listDeployments(w, r)
 	case r.Method == http.MethodGet && deploymentID(r.URL.Path) != "":
@@ -10336,4 +10374,833 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("content-type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+var thinkingLevels = []string{"auto", "low", "medium", "high", "xhigh", "max", "ultracode"}
+
+func (h *HTTPServer) getRuntimeConfig(w http.ResponseWriter, r *http.Request, identity auth.Identity) {
+	scopeID := r.URL.Query().Get("scopeId")
+	if scopeID == "" && identity.ScopeID != "" {
+		scopeID = identity.ScopeID
+	}
+	if scopeID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_request", "message": "scopeId required"})
+		return
+	}
+	
+	orgScopeID := "org:" + h.config.QM.OrgID
+	
+	// 构建 approvedHarnesses
+	approvedHarnesses := []string{}
+	for _, harness := range h.config.QM.Models.Harnesses {
+		approvedHarnesses = append(approvedHarnesses, harness.ID)
+	}
+	
+	// 构建 modelsByHarness
+	modelsByHarness := map[string][]string{}
+	for _, harness := range h.config.QM.Models.Harnesses {
+		modelsByHarness[harness.ID] = harness.ModelIDs
+	}
+	
+	// 构建 modelCatalog
+	modelCatalog := []map[string]interface{}{}
+	providerMap := map[string]config.ModelProviderConfig{}
+	for _, provider := range h.config.QM.Models.Providers {
+		providerMap[provider.ID] = provider
+	}
+	for _, harness := range h.config.QM.Models.Harnesses {
+		provider, ok := providerMap[harness.Provider]
+		if !ok {
+			continue
+		}
+		for _, modelID := range harness.ModelIDs {
+			var modelDef *config.ModelDefinition
+			for i := range provider.Models {
+				if provider.Models[i].ID == modelID {
+					modelDef = &provider.Models[i]
+					break
+				}
+			}
+			if modelDef == nil {
+				continue
+			}
+			modelCatalog = append(modelCatalog, map[string]interface{}{
+				"harnessId":        harness.ID,
+				"modelId":          modelID,
+				"name":             modelDef.Name,
+				"contextWindow":    modelDef.ContextWindow,
+				"maxTokens":        modelDef.MaxTokens,
+				"adaptiveThinking": modelDef.AdaptiveThinking,
+			})
+		}
+	}
+	
+	// 读取 org default
+	orgSelection, err := h.runtimeConfig.Selection(r.Context(), orgScopeID)
+	if err != nil {
+		h.logger.Error("get org runtime selection", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	
+	var orgDefault map[string]interface{}
+	if orgSelection != nil && h.isValidSelection(orgSelection, approvedHarnesses, modelsByHarness) {
+		orgDefault = h.serializeSelection(orgSelection, false)
+	} else {
+		// fallback to config default
+		defaultModel := h.config.QM.Models.DefaultModel()
+		defaultHarness := h.config.QM.Models.DefaultHarness
+		orgDefault = map[string]interface{}{
+			"harnessId": defaultHarness,
+			"modelId":   defaultModel,
+			"revision":  int64(0),
+		}
+	}
+	
+	// 读取 scope override
+	var scopeOverride map[string]interface{}
+	if scopeID != orgScopeID {
+		scopeSelection, err := h.runtimeConfig.Selection(r.Context(), scopeID)
+		if err != nil {
+			h.logger.Error("get scope runtime selection", "scope", scopeID, "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+			return
+		}
+		if scopeSelection != nil && h.isValidSelection(scopeSelection, approvedHarnesses, modelsByHarness) {
+			scopeOverride = h.serializeSelection(scopeSelection, true)
+		}
+	}
+	
+	// 计算 effective 和 upgradeAvailable
+	effective := orgDefault
+	if scopeOverride != nil {
+		effective = scopeOverride
+	}
+	
+	upgradeAvailable := false
+	if scopeOverride != nil {
+		scopeOrgRev, _ := scopeOverride["orgRevision"].(int64)
+		orgRev, _ := orgDefault["revision"].(int64)
+		upgradeAvailable = scopeOrgRev != orgRev
+	}
+	
+	// 构建 fastModeModelIds
+	fastModeModelIds := []string{}
+	for _, harness := range h.config.QM.Models.Harnesses {
+		provider, ok := providerMap[harness.Provider]
+		if !ok {
+			continue
+		}
+		for _, modelID := range harness.ModelIDs {
+			for _, modelDef := range provider.Models {
+				if modelDef.ID == modelID && modelDef.FastMode {
+					fastModeModelIds = append(fastModeModelIds, modelID)
+					break
+				}
+			}
+		}
+	}
+
+	response := map[string]interface{}{
+		"scopeId":             scopeID,
+		"approvedHarnesses":   approvedHarnesses,
+		"modelsByHarness":     modelsByHarness,
+		"modelCatalog":        modelCatalog,
+		"orgDefault":          orgDefault,
+		"effective":           effective,
+		"upgradeAvailable":    upgradeAvailable,
+		"fastModeModelIds":    fastModeModelIds,
+		"interactiveFastMode": false,
+	}
+	if scopeOverride != nil {
+		response["scopeOverride"] = scopeOverride
+	}
+	
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (h *HTTPServer) isValidSelection(sel *data.RuntimeSelection, approved []string, models map[string][]string) bool {
+	harnessFound := false
+	for _, h := range approved {
+		if h == sel.HarnessID {
+			harnessFound = true
+			break
+		}
+	}
+	if !harnessFound {
+		return false
+	}
+	modelIDs, ok := models[sel.HarnessID]
+	if !ok {
+		return false
+	}
+	for _, m := range modelIDs {
+		if m == sel.ModelID {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *HTTPServer) serializeSelection(sel *data.RuntimeSelection, includeOrgRevision bool) map[string]interface{} {
+	result := map[string]interface{}{
+		"harnessId": sel.HarnessID,
+		"modelId":   sel.ModelID,
+		"revision":  sel.Revision,
+	}
+	if includeOrgRevision {
+		result["orgRevision"] = sel.OrgRevision
+	}
+	if sel.EffortLevel != "" {
+		result["effortLevel"] = sel.EffortLevel
+	}
+	if sel.FastMode != nil {
+		result["fastMode"] = *sel.FastMode
+	}
+	return result
+}
+
+func (h *HTTPServer) putRuntimeConfig(w http.ResponseWriter, r *http.Request, body []byte, identity auth.Identity) {
+	if len(body) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_request", "message": "request body required"})
+		return
+	}
+	
+	var req struct {
+		ScopeID     string  `json:"scopeId"`
+		HarnessID   string  `json:"harnessId"`
+		ModelID     string  `json:"modelId"`
+		EffortLevel string  `json:"effortLevel"`
+		FastMode    *bool   `json:"fastMode"`
+		Inherit     bool    `json:"inherit"`
+		Keep        bool    `json:"keep"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_request", "message": "invalid JSON"})
+		return
+	}
+	
+	// capability check
+	if identity.ActorID != "" && !identity.LiveActor {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "live_actor_required", "message": "runtime config changes require live actor capability"})
+		return
+	}
+	
+	scopeID := req.ScopeID
+	if scopeID == "" && identity.ScopeID != "" {
+		scopeID = identity.ScopeID
+	}
+	if scopeID == "" {
+		scopeID = r.URL.Query().Get("scopeId")
+	}
+	
+	// target check
+	if scopeID == "" {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden", "message": "no target scope"})
+		return
+	}
+
+	orgScopeID := "org:" + h.config.QM.OrgID
+	if scopeID == orgScopeID {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden", "message": "org scope cannot be modified via this endpoint"})
+		return
+	}
+
+	// belongsToScope check for non-capability requests
+	if identity.ActorID == "" {
+		belongs, err := h.belongsToScope(r.Context(), h.requestActor(r, identity), scopeID)
+		if err != nil {
+			h.logger.Error("belongsToScope check", "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+			return
+		}
+		if !belongs {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden", "message": "scope access denied"})
+			return
+		}
+	}
+	
+	// inherit → delete
+	if req.Inherit {
+		if err := h.runtimeConfig.DeleteSelection(r.Context(), scopeID); err != nil {
+			h.logger.Error("delete runtime selection", "scope", scopeID, "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+			return
+		}
+		if err := h.audit.Record(r.Context(), data.AuditEvent{
+			PrincipalID: h.requestActor(r, identity),
+			Action:      "runtime-config.update",
+			Resource:    "runtime-config",
+			ScopeLabel:  scopeID,
+			Status:      "success",
+		}); err != nil {
+			h.logger.Error("audit runtime-config inherit", "error", err)
+		}
+		// re-read and return
+		h.getRuntimeConfig(w, r, identity)
+		return
+	}
+	
+	// keep → acknowledge
+	if req.Keep {
+		if err := h.runtimeConfig.AcknowledgeSelection(r.Context(), scopeID, orgScopeID); err != nil {
+			h.logger.Error("acknowledge runtime selection", "scope", scopeID, "error", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+			return
+		}
+		if err := h.audit.Record(r.Context(), data.AuditEvent{
+			PrincipalID: h.requestActor(r, identity),
+			Action:      "runtime-config.update",
+			Resource:    "runtime-config",
+			ScopeLabel:  scopeID,
+			Status:      "success",
+		}); err != nil {
+			h.logger.Error("audit runtime-config keep", "error", err)
+		}
+		h.getRuntimeConfig(w, r, identity)
+		return
+	}
+	
+	// explicit selection validation
+	approvedHarnesses := []string{}
+	modelsByHarness := map[string][]string{}
+	for _, harness := range h.config.QM.Models.Harnesses {
+		approvedHarnesses = append(approvedHarnesses, harness.ID)
+		modelsByHarness[harness.ID] = harness.ModelIDs
+	}
+	
+	harnessFound := false
+	for _, h := range approvedHarnesses {
+		if h == req.HarnessID {
+			harnessFound = true
+			break
+		}
+	}
+	if !harnessFound {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "harness_not_approved", "message": "harness not approved"})
+		return
+	}
+	
+	modelIDs, ok := modelsByHarness[req.HarnessID]
+	if !ok {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "model_not_supported", "message": "model not supported by harness"})
+		return
+	}
+	modelFound := false
+	for _, m := range modelIDs {
+		if m == req.ModelID {
+			modelFound = true
+			break
+		}
+	}
+	if !modelFound {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "model_not_supported", "message": "model not supported by harness"})
+		return
+	}
+	
+	// effort validation
+	effortLevel := req.EffortLevel
+	if effortLevel == "" {
+		effortLevel = "auto"
+	}
+	effortValid := false
+	for _, level := range thinkingLevels {
+		if level == effortLevel {
+			effortValid = true
+			break
+		}
+	}
+	if !effortValid {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "effort_not_supported", "message": "effort level not supported"})
+		return
+	}
+	
+	// fastMode validation
+	fastMode := req.FastMode
+	if fastMode == nil {
+		f := false
+		fastMode = &f
+	}
+	
+	// fastMode silent downgrade if model doesn't support it
+	if *fastMode {
+		providerMap := map[string]config.ModelProviderConfig{}
+		for _, provider := range h.config.QM.Models.Providers {
+			providerMap[provider.ID] = provider
+		}
+		var harness *config.ModelHarnessConfig
+		for i := range h.config.QM.Models.Harnesses {
+			if h.config.QM.Models.Harnesses[i].ID == req.HarnessID {
+				harness = &h.config.QM.Models.Harnesses[i]
+				break
+			}
+		}
+		if harness != nil {
+			provider, ok := providerMap[harness.Provider]
+			if ok {
+				supported := false
+				for _, modelDef := range provider.Models {
+					if modelDef.ID == req.ModelID && modelDef.FastMode {
+						supported = true
+						break
+					}
+				}
+				if !supported {
+					f := false
+					fastMode = &f
+				}
+			}
+		}
+	}
+	
+	selection := data.RuntimeSelection{
+		HarnessID:   req.HarnessID,
+		ModelID:     req.ModelID,
+		EffortLevel: effortLevel,
+		FastMode:    fastMode,
+	}
+	if effortLevel == "auto" {
+		selection.EffortLevel = ""
+	}
+	
+	if err := h.runtimeConfig.SetSelection(r.Context(), scopeID, orgScopeID, selection); err != nil {
+		h.logger.Error("set runtime selection", "scope", scopeID, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	
+	if err := h.audit.Record(r.Context(), data.AuditEvent{
+		PrincipalID: h.requestActor(r, identity),
+		Action:      "runtime-config.update",
+		Resource:    "runtime-config",
+		ScopeLabel:  scopeID,
+		Status:      "success",
+	}); err != nil {
+		h.logger.Error("audit runtime-config set", "error", err)
+	}
+	
+	h.getRuntimeConfig(w, r, identity)
+}
+
+func (h *HTTPServer) belongsToScope(ctx context.Context, principalID, scopeID string) (bool, error) {
+	kind, ref := splitScopeID(scopeID)
+	switch kind {
+	case "personal":
+		return sameSoulPerson(ref, principalID), nil
+	case "org":
+		return true, nil
+	case "group":
+		if strings.HasPrefix(scopeID, "group:web-project-") {
+			return h.projectRepo.HasScopeMembership(ctx, scopeID, principalID)
+		}
+		return h.directory.IsScopeMember(ctx, "group", ref, principalID)
+	case "channel":
+		channel, err := h.directory.Channel(ctx, ref)
+		if err != nil {
+			return false, err
+		}
+		if channel == nil {
+			return false, nil
+		}
+		if !channel.IsPrivate {
+			return true, nil
+		}
+		return h.directory.IsScopeMember(ctx, "channel", ref, principalID)
+	default:
+		return false, nil
+	}
+}
+
+func (h *HTTPServer) getSurfaceConfig(w http.ResponseWriter, r *http.Request, identity auth.Identity) {
+	scopeID := r.URL.Query().Get("scopeId")
+	if scopeID == "" && identity.ScopeID != "" {
+		scopeID = identity.ScopeID
+	}
+	if scopeID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "bad_request", "message": "scopeId required"})
+		return
+	}
+	
+	webuiModels, err := h.runtimeConfig.WebuiModels(r.Context(), scopeID)
+	if err != nil {
+		h.logger.Error("read webui models", "scope", scopeID, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	
+	baseModel, err := h.runtimeConfig.LegacyModel(r.Context(), scopeID)
+	if err != nil {
+		h.logger.Error("read base model", "scope", scopeID, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	if baseModel == "" && len(h.config.QM.Models.Harnesses) > 0 {
+		baseModel = h.config.QM.Models.Harnesses[0].DefaultModel
+	}
+	
+	externalSlack, err := h.runtimeConfig.ExternalSlackParticipants(r.Context(), scopeID)
+	if err != nil {
+		h.logger.Error("read external slack participants", "scope", scopeID, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	
+	brandingRaw, err := h.runtimeConfig.Branding(r.Context(), scopeID)
+	if err != nil {
+		h.logger.Error("read branding", "scope", scopeID, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal_error"})
+		return
+	}
+	
+	harnessID := ""
+	if len(h.config.QM.Models.Harnesses) > 0 {
+		harnessID = h.config.QM.Models.Harnesses[0].ID
+	}
+	
+	resp := map[string]interface{}{
+		"webuiModels":               webuiModels,
+		"baseModel":                 baseModel,
+		"harnessId":                 harnessID,
+		"externalSlackParticipants": externalSlack,
+	}
+	
+	if brandingRaw != nil {
+		branding := make(map[string]string)
+		hasAny := false
+		
+		if brandingRaw.Accent != "" {
+			matched := false
+			for _, pattern := range []string{
+				`^#[0-9a-fA-F]{3}$`, `^#[0-9a-fA-F]{4}$`,
+				`^#[0-9a-fA-F]{6}$`, `^#[0-9a-fA-F]{8}$`,
+			} {
+				if matched, _ = regexp.MatchString(pattern, brandingRaw.Accent); matched {
+					break
+				}
+			}
+			if matched {
+				branding["accent"] = brandingRaw.Accent
+				hasAny = true
+			}
+		}
+		
+		if brandingRaw.Mark != "" {
+			mark := regexp.MustCompile(`[\x00-\x1F\x7F-\x9F  "\\<>{}]`).ReplaceAllString(brandingRaw.Mark, "")
+			if len(mark) > 2 {
+				mark = mark[:2]
+			}
+			if mark != "" {
+				branding["mark"] = mark
+				hasAny = true
+			}
+		}
+		
+		if brandingRaw.SelfLabel != "" {
+			label := regexp.MustCompile(`[\x00-\x1F\x7F-\x9F  ]`).ReplaceAllString(brandingRaw.SelfLabel, "")
+			if len(label) > 40 {
+				label = label[:40]
+			}
+			if label != "" {
+				branding["selfLabel"] = label
+				hasAny = true
+			}
+		}
+		
+		if hasAny {
+			resp["branding"] = branding
+		}
+	}
+	
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *HTTPServer) sessionStateEvents(w http.ResponseWriter, r *http.Request, identity auth.Identity) {
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		h.logger.Error("responsewriter does not support flushing")
+		return
+	}
+	
+	if _, err := w.Write([]byte(": open\n\n")); err != nil {
+		return
+	}
+	flusher.Flush()
+	
+	ticker := time.NewTicker(25 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case <-ticker.C:
+			if _, err := w.Write([]byte(": ping\n\n")); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
+}
+
+const SECRET_DROP_AUD = "secret-drop"
+
+func (h *HTTPServer) mintSecretDrop(w http.ResponseWriter, r *http.Request, body []byte, identity auth.Identity) {
+	if h.auth.CapabilitySecret == "" {
+		http.Error(w, `{"code":"not_found","message":"Secret drops not configured"}`, http.StatusNotFound)
+		return
+	}
+
+	if identity.ActorID == "" {
+		http.Error(w, `{"code":"unauthorized","message":"secret-drop mint requires an agent capability token"}`, http.StatusUnauthorized)
+		return
+	}
+
+	if identity.Triggered {
+		http.Error(w, `{"code":"forbidden","message":"capability already triggered"}`, http.StatusForbidden)
+		return
+	}
+
+	var req struct {
+		Service   string                 `json:"service"`
+		EnvKey    string                 `json:"envKey"`
+		Host      string                 `json:"host"`
+		Fields    []data.SecretDropField `json:"fields"`
+		Purpose   string                 `json:"purpose"`
+		GrantMode string                 `json:"grantMode"`
+	}
+
+	if err := json.Unmarshal(body, &req); err != nil || req.Service == "" || req.Purpose == "" {
+		http.Error(w, `{"code":"bad_request","message":"service and purpose are required"}`, http.StatusBadRequest)
+		return
+	}
+
+	if req.GrantMode != "once" && req.GrantMode != "standing" {
+		http.Error(w, `{"code":"bad_request","message":"grantMode must be once or standing"}`, http.StatusBadRequest)
+		return
+	}
+
+	if len(req.Fields) < 1 || len(req.Fields) > 8 {
+		http.Error(w, `{"code":"bad_request","message":"fields must contain 1-8 items"}`, http.StatusBadRequest)
+		return
+	}
+
+	dropID := uuid.New().String() + strings.ReplaceAll(uuid.New().String(), "-", "")
+
+	drop := data.SecretDrop{
+		ID:              dropID,
+		OwnerID:         identity.ActorID,
+		OrgID:           extractOrgID(identity.ScopeID),
+		Service:         req.Service,
+		EnvKey:          req.EnvKey,
+		Host:            req.Host,
+		Fields:          req.Fields,
+		Purpose:         req.Purpose,
+		RequestedBy:     identity.ActorID,
+		AudienceScopeID: identity.ScopeID,
+		ScopeVersion:    identity.ScopeVersion,
+		GrantMode:       req.GrantMode,
+		ThreadRef:       "",
+		RequiresToken:   true,
+		CreatedAt:       time.Now().Unix(),
+	}
+
+	if err := h.secretDrops.Mint(r.Context(), drop); err != nil {
+		h.logger.Error("failed to mint secret drop", "error", err)
+		http.Error(w, `{"code":"internal_error","message":"failed to create drop"}`, http.StatusInternalServerError)
+		return
+	}
+
+	token, err := auth.MintCapability(auth.Claims{
+		ActorID:   identity.ActorID,
+		ScopeID:   identity.ScopeID,
+		Audience:  SECRET_DROP_AUD,
+		Drop:      dropID,
+		ExpiresAt: time.Now().Add(data.SecretDropTTL).Unix(),
+	}, h.auth.CapabilitySecret)
+	if err != nil {
+		h.logger.Error("failed to mint drop token", "error", err)
+		http.Error(w, `{"code":"internal_error","message":"failed to create token"}`, http.StatusInternalServerError)
+		return
+	}
+
+	h.audit.Record(r.Context(), data.AuditEvent{
+		PrincipalID: identity.ActorID,
+		Action:      "keychain.drop.mint",
+		Resource:    req.Service + ":" + dropID,
+		ScopeLabel:  identity.ScopeID,
+	})
+
+	formPath := "/drop/" + dropID + "/form?t=" + token
+	publicURL := "http://localhost:18129"
+
+	resp := map[string]string{
+		"dropId":   dropID,
+		"formPath": formPath,
+		"url":      publicURL + formPath,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (h *HTTPServer) secretDropForm(w http.ResponseWriter, r *http.Request) {
+	dropID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/keychain/drops/"), "/form")
+
+	drop, err := h.secretDrops.Peek(r.Context(), dropID)
+	if err != nil {
+		h.logger.Error("failed to peek drop", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	if drop == nil {
+		http.Error(w, "Drop not found or expired", http.StatusNotFound)
+		return
+	}
+
+	var fieldInputs string
+	for _, field := range drop.Fields {
+		inputType := "text"
+		if field.IsSecret {
+			inputType = "password"
+		}
+		fieldInputs += fmt.Sprintf(`
+			<div style="margin-bottom: 1rem;">
+				<label style="display: block; margin-bottom: 0.25rem; font-weight: 500;">%s</label>
+				<input type="%s" name="%s" required style="width: 100%%; padding: 0.5rem; border: 1px solid #d1d5db; border-radius: 0.375rem;">
+			</div>
+		`, field.Label, inputType, field.Key)
+	}
+
+	html := fmt.Sprintf(`<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<title>Secret Drop - %s</title>
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<style>
+		body { font-family: system-ui, -apple-system, sans-serif; max-width: 32rem; margin: 2rem auto; padding: 1rem; }
+		h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
+		.meta { color: #6b7280; margin-bottom: 2rem; font-size: 0.875rem; }
+		button { background: #2563eb; color: white; padding: 0.5rem 1rem; border: none; border-radius: 0.375rem; cursor: pointer; }
+		button:hover { background: #1d4ed8; }
+	</style>
+</head>
+<body>
+	<h1>%s</h1>
+	<div class="meta">Purpose: %s<br>Requested by: %s</div>
+	<form method="POST" action="/v1/keychain/drops/%s">
+		%s
+		<button type="submit">Submit</button>
+	</form>
+</body>
+</html>`, drop.Service, drop.Service, drop.Purpose, drop.RequestedBy, dropID, fieldInputs)
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(html))
+}
+
+func (h *HTTPServer) redeemSecretDrop(w http.ResponseWriter, r *http.Request, body []byte) {
+	dropID := strings.TrimPrefix(r.URL.Path, "/v1/keychain/drops/")
+
+	drop, err := h.secretDrops.Redeem(r.Context(), dropID)
+	if err != nil {
+		h.logger.Error("failed to redeem drop", "error", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	if drop == nil {
+		http.Error(w, "Drop not found or expired", http.StatusNotFound)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "Invalid form data", http.StatusBadRequest)
+		return
+	}
+
+	values := make(map[string]string)
+	for _, field := range drop.Fields {
+		val := r.FormValue(field.Key)
+		if val == "" {
+			http.Error(w, fmt.Sprintf("Missing required field: %s", field.Label), http.StatusBadRequest)
+			return
+		}
+		values[field.Key] = val
+	}
+
+	var credentialKey strings.Builder
+	if drop.EnvKey != "" {
+		credentialKey.WriteString(drop.EnvKey)
+	} else {
+		credentialKey.WriteString(drop.Service)
+		if drop.Host != "" {
+			credentialKey.WriteString(":")
+			credentialKey.WriteString(drop.Host)
+		}
+	}
+
+	payload, _ := json.Marshal(values)
+
+	credential := data.Credential{
+		ID:          generateCredentialID(),
+		OwnerID:     drop.OwnerID,
+		OrgID:       drop.OrgID,
+		Service:     drop.Service,
+		Key:         credentialKey.String(),
+		Values:      payload,
+		GrantedBy:   drop.OwnerID,
+		GrantedAt:   time.Now().Unix(),
+		Destination: drop.Destination,
+	}
+
+	if err := h.keychain.CreateCredential(r.Context(), credential); err != nil {
+		h.logger.Error("failed to store credential", "error", err)
+		http.Error(w, "Failed to store credential", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Write([]byte(`<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<title>Success</title>
+	<style>body { font-family: system-ui; max-width: 32rem; margin: 2rem auto; padding: 1rem; }</style>
+</head>
+<body>
+	<h1>Credential stored</h1>
+	<p>The credential has been securely stored and is now available to the agent.</p>
+</body>
+</html>`))
+}
+
+func extractOrgID(scopeID string) string {
+	if strings.HasPrefix(scopeID, "org:") {
+		return scopeID
+	}
+	if strings.HasPrefix(scopeID, "personal:") {
+		return "org:default"
+	}
+	parts := strings.SplitN(scopeID, ":", 2)
+	if len(parts) != 2 {
+		return "org:default"
+	}
+	if parts[0] == "group" || parts[0] == "channel" {
+		orgParts := strings.SplitN(parts[1], "_", 2)
+		if len(orgParts) > 0 {
+			return "org:" + orgParts[0]
+		}
+	}
+	return "org:default"
+}
+
+func generateCredentialID() string {
+	var b [16]byte
+	rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }

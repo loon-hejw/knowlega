@@ -36,6 +36,7 @@ type Claims struct {
 	KeychainMembers []KeychainMember      `json:"keychainMembers,omitempty"`
 	Destination     *Destination          `json:"destination,omitempty"`
 	Destinations    DestinationCandidates `json:"destinations,omitempty"`
+	Drop            string                `json:"drop,omitempty"`
 	ExpiresAt       int64                 `json:"exp"`
 }
 

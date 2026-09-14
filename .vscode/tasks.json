@@ -28,7 +28,7 @@
         "build"
       ],
       "options": {
-        "cwd": "${workspaceFolder}/qm/plugins/web-ui",
+        "cwd": "${workspaceFolder}/plugins/web-ui",
         "env": {
           "WEB_UI_BASE": "/"
         }

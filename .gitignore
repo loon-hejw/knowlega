@@ -23,3 +23,7 @@ wiki/
 /qm/
 /openagent/
 /kbcore-xiyouji-wiki-v1/
+
+# Frontend dependencies and build artifacts
+/plugins/*/node_modules/
+/plugins/web-ui/dist-web/
