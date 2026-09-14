@@ -331,11 +331,15 @@ func (a *Agent) Ingest(ctx context.Context, ref ScopeRef, sourceName string, con
 }
 
 func (a *Agent) Search(ctx context.Context, ref ScopeRef, query string, limit int) ([]core.KnowledgeSearchResult, error) {
+	return a.SearchScoped(ctx, ref, query, limit, "all")
+}
+
+func (a *Agent) SearchScoped(ctx context.Context, ref ScopeRef, query string, limit int, scope string) ([]core.KnowledgeSearchResult, error) {
 	status, err := a.EnsureScope(ctx, ref)
 	if err != nil {
 		return nil, err
 	}
-	return service.SearchProjectDocuments(ctx, status.ProjectPath, status.ProjectID, query, limit, a.searchStore, a.embedding)
+	return service.SearchProjectDocumentsScoped(ctx, status.ProjectPath, status.ProjectID, query, limit, scope, a.searchStore, a.embedding)
 }
 
 func (a *Agent) Read(ref ScopeRef, path string) (service.KnowledgeDocument, error) {

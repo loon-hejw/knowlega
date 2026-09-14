@@ -437,3 +437,21 @@ func containsKnowledgeDocumentPath(results []KnowledgeDocument, path string) boo
 	}
 	return false
 }
+
+func TestScopedKnowledgeSearchSelectsCorpusBeforeRanking(t *testing.T) {
+	root := t.TempDir()
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	writeKnowledgeFixture(t, root, "wiki/entities/ruler.md", "---\ntitle: Ruler\ntype: entity\n---\n\nThe ruler offers wine.")
+	writeKnowledgeFixture(t, root, "raw/sources/chapter.txt", "The ruler insists on wine and the traveller accepts.")
+	for _, scope := range []string{"raw", "wiki"} {
+		results, err := SearchProjectDocumentsScoped(t.Context(), root, "", "wine", 1, scope, nil, nil)
+		if err != nil || len(results) != 1 || !strings.HasPrefix(results[0].Path, scope+"/") {
+			t.Fatalf("scope=%s results=%+v err=%v", scope, results, err)
+		}
+	}
+	if _, err := SearchProjectDocumentsScoped(t.Context(), root, "", "wine", 1, "invalid", nil, nil); err == nil {
+		t.Fatal("invalid scope accepted")
+	}
+}

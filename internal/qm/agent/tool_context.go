@@ -303,6 +303,7 @@ func (t *coreToolContext) executeKnowledge(ctx context.Context, call ToolCall, r
 	}
 	var input struct {
 		Action       string                                 `json:"action"`
+		SearchScope  string                                 `json:"scope"`
 		Query        string                                 `json:"query"`
 		Path         string                                 `json:"path"`
 		Limit        int                                    `json:"limit"`
@@ -345,30 +346,39 @@ func (t *coreToolContext) executeKnowledge(ctx context.Context, call ToolCall, r
 		if strings.TrimSpace(input.Query) == "" {
 			return toolError("[error] knowledge search requires `query`."), nil
 		}
-		if (input.Candidate == "") != (input.Requirement == "") {
-			return toolError("[error] candidate-specific knowledge search requires both `candidate` and `requirement_id`."), nil
-		}
 		requestedLimit := boundedLimit(input.Limit, 10, 50)
 		searchQuery := input.Query
-		var candidateContext knowledgeCandidateSearchContext
+		var candidateNames []string
 		if input.Candidate != "" {
-			candidateContext, err = t.resolveKnowledgeCandidateSearchContext(ref, input.Candidate)
-			if err != nil {
-				return toolError("[error] candidate-specific knowledge search could not resolve the candidate page: " + err.Error()), nil
+			// Candidate identity improves recall; a missing entity page must not prevent retrieval.
+			names := []string{input.Candidate}
+			if document, readErr := t.knowledge.Read(ref, input.Candidate); readErr == nil {
+				names = mergeKnowledgeAliases(names, append([]string{document.Title}, document.Aliases...))
 			}
-			searchQuery = knowledgeCandidateConditionQuery(searchQuery, candidateContext.Names)
-			if searchQuery == "" {
-				return toolError("[error] candidate-specific knowledge search query must include the requirement condition, not only the candidate name."), nil
-			}
+			candidateNames = names
 		}
 		var results []knowledgecore.KnowledgeSearchResult
-		searchLimit := requestedLimit
-		if input.Candidate != "" {
-			searchLimit = 50
+		if scoped, ok := t.knowledge.(interface {
+			SearchScoped(context.Context, knowlega.ScopeRef, string, int, string) ([]knowledgecore.KnowledgeSearchResult, error)
+		}); ok {
+			results, err = scoped.SearchScoped(ctx, ref, searchQuery, requestedLimit, input.SearchScope)
+		} else if input.SearchScope == "" || input.SearchScope == "all" {
+			results, err = t.knowledge.Search(ctx, ref, searchQuery, requestedLimit)
+		} else {
+			return toolError("knowledge provider does not support scoped search"), nil
 		}
-		results, err = t.knowledge.Search(ctx, ref, searchQuery, searchLimit)
-		if err == nil && input.Candidate != "" {
-			results, err = t.filterKnowledgeSearchResultsForCandidate(ref, results, candidateContext, searchQuery, requestedLimit)
+
+		if len(candidateNames) > 0 {
+			matchesCandidate := func(result knowledgecore.KnowledgeSearchResult) bool {
+				text := strings.ToLower(result.Title + " " + result.Snippet + " " + result.Path)
+				for _, name := range candidateNames {
+					if strings.Contains(text, strings.ToLower(name)) {
+						return true
+					}
+				}
+				return false
+			}
+			sort.SliceStable(results, func(i, j int) bool { return matchesCandidate(results[i]) && !matchesCandidate(results[j]) })
 		}
 		value = results
 		if err == nil {
@@ -376,8 +386,12 @@ func (t *coreToolContext) executeKnowledge(ctx context.Context, call ToolCall, r
 			status, err = t.knowledge.Status(ref)
 			if err == nil {
 				state := knowledgeScopeState(status)
-				detail := knowledgeDetails("search", searchQuery, "", input.Candidate, input.Requirement, searchSources(results, false))
+				detail := knowledgeDetails("search", input.Query, "", input.Candidate, input.Requirement, searchSources(results, false))
 				detail["workspace_status"] = state
+				detail["scope"] = input.SearchScope
+				if input.SearchScope == "" {
+					detail["scope"] = "all"
+				}
 				details = detail
 				if len(results) == 0 {
 					switch state {
@@ -883,104 +897,6 @@ func knowledgeCandidateConditionQuery(query string, candidateNames []string) str
 	return strings.Join(strings.Fields(condition), " ")
 }
 
-type knowledgeCandidateSearchContext struct {
-	Path    string
-	Names   []string
-	Sources map[string]bool
-}
-
-func (t *coreToolContext) resolveKnowledgeCandidateSearchContext(ref knowlega.ScopeRef, candidate string) (knowledgeCandidateSearchContext, error) {
-	document, err := t.knowledge.Read(ref, candidate)
-	if err != nil {
-		return knowledgeCandidateSearchContext{}, err
-	}
-	names := knowledgeCandidateIdentityNames(candidate)
-	names = mergeKnowledgeAliases(names, append([]string{document.Title}, document.Aliases...))
-	if len(names) == 0 {
-		return knowledgeCandidateSearchContext{}, errors.New("candidate page has no usable title or aliases")
-	}
-	sources := make(map[string]bool, len(document.Sources))
-	for _, source := range document.Sources {
-		if source = normalizeKnowledgeLedgerPath(source); source != "" {
-			sources[source] = true
-		}
-	}
-	return knowledgeCandidateSearchContext{Path: normalizeKnowledgeLedgerPath(document.Path), Names: names, Sources: sources}, nil
-}
-
-func (t *coreToolContext) filterKnowledgeSearchResultsForCandidate(ref knowlega.ScopeRef, results []knowledgecore.KnowledgeSearchResult, candidate knowledgeCandidateSearchContext, query string, limit int) ([]knowledgecore.KnowledgeSearchResult, error) {
-	filtered := make([]knowledgecore.KnowledgeSearchResult, 0, min(limit, len(results)))
-	for _, result := range results {
-		document, err := t.knowledge.Read(ref, result.Path)
-		if err != nil {
-			return nil, err
-		}
-		path := normalizeKnowledgeLedgerPath(document.Path)
-		matched := path == candidate.Path || candidate.Sources[path]
-		if !matched {
-			for _, source := range document.Sources {
-				if candidate.Sources[normalizeKnowledgeLedgerPath(source)] {
-					matched = true
-					break
-				}
-			}
-		}
-		if !matched || !knowledgeDocumentMatchesCandidateCondition(document, candidate, query, path == candidate.Path) {
-			continue
-		}
-		filtered = append(filtered, result)
-		if len(filtered) >= limit {
-			break
-		}
-	}
-	return filtered, nil
-}
-
-func knowledgeDocumentMatchesCandidateCondition(document knowledgeservice.KnowledgeDocument, candidate knowledgeCandidateSearchContext, query string, candidatePage bool) bool {
-	fields := knowledgeCandidateConditionFields(query)
-	if len(fields) == 0 {
-		return false
-	}
-	content := strings.ToLower(document.Content)
-	anchor := fields[0]
-	for _, field := range fields[1:] {
-		if len([]rune(field)) > len([]rune(anchor)) {
-			anchor = field
-		}
-	}
-	for offset := 0; offset < len(content); {
-		index := strings.Index(content[offset:], anchor)
-		if index < 0 {
-			break
-		}
-		index += offset
-		start := max(0, index-1200)
-		end := min(len(content), index+len(anchor)+1200)
-		window := content[start:end]
-		matches := true
-		for _, field := range fields {
-			if !strings.Contains(window, field) {
-				matches = false
-				break
-			}
-		}
-		if matches && (candidatePage || knowledgeWindowContainsCandidate(window, candidate.Names)) {
-			return true
-		}
-		offset = index + len(anchor)
-	}
-	return false
-}
-
-func knowledgeWindowContainsCandidate(window string, names []string) bool {
-	for _, name := range names {
-		if name = strings.ToLower(strings.TrimSpace(name)); name != "" && strings.Contains(window, name) {
-			return true
-		}
-	}
-	return false
-}
-
 func knowledgeCandidateConditionFields(query string) []string {
 	var fields []string
 	for _, field := range strings.FieldsFunc(strings.ToLower(query), func(r rune) bool {
@@ -1282,7 +1198,7 @@ func coreToolDefinitions(knowledge bool) []ToolDefinition {
 	}
 	if knowledge {
 		definitions = append(definitions,
-			toolDefinition("knowledge", "Use deterministic project knowledge facts. Status distinguishes empty/queued/processing/ready/failed; a pending search is not proof of absence. Search/discover/list are navigation only; read/follow_links/graph return evidence. For multi-constraint identity questions, discover with the full requirements ranks common-subject entity candidates and should be preferred over repeated search paraphrases; preserve subject/object roles. Choose evidence actions freely; a current-turn read or graph result may support multiple requirements without a preceding search. A dedicated candidate page is not required. Every submit call requires non-empty question, answer, candidate, the full requirements array, and exactly one check per requirement. A candidate-specific search must provide both candidate and requirement_id; keep candidate only as filtering metadata and use only the requirement's event terms in query. For a negative requirement, search the positive event that would disprove it, for example 到过 花果山. Explicit negative evidence may resolve a supported check. Otherwise use not_found_in_corpus only after a current-turn relevant zero-result candidate-specific search in a ready workspace; omission in citations and pending searches cannot prove absence. A matching hit conflicts with absence and must be read or refined before submission. Submit validates only the current turn's evidence ledger and returns validation_issues when incomplete; writeback explicitly saves a validated submission.", `{"type":"object","properties":{"action":{"enum":["status","search","discover","read","list","follow_links","graph","submit","writeback"]},"query":{"type":"string","description":"For candidate-specific searches, use only the matching requirement event terms and do not repeat candidate. For a negative requirement, use the positive disproof event terms and do not add unrelated terms."},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":50},"seed_paths":{"type":"array","items":{"type":"string"}},"requirements":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"kind":{"enum":["positive","negative"]}},"required":["id","text"]}},"question":{"type":"string","description":"Required and non-empty for action=submit."},"answer":{"type":"string","description":"Required and non-empty for action=submit."},"candidate":{"type":"string","description":"Required for action=submit; identify the candidate supported by current-turn evidence; a dedicated wiki page is not required. For candidate-specific searches, pass it only as filtering metadata."},"checks":{"type":"array","description":"Required for action=submit; provide exactly one check for every requirement. Supported checks must cite current-turn read, follow_links, or graph evidence. Negative supported checks need explicit negative evidence; omission only permits not_found_in_corpus after a relevant search.","items":{"type":"object","properties":{"requirement_id":{"type":"string"},"status":{"enum":["supported","contradicted","unknown","not_found_in_corpus"]},"evidence_paths":{"type":"array","items":{"type":"string"}},"explanation":{"type":"string"}},"required":["requirement_id","status"]}},"evidence_paths":{"type":"array","items":{"type":"string"}},"status":{"enum":["complete","incomplete"]},"requirement_id":{"type":"string","description":"Required together with candidate on every candidate-specific positive or negative search; must match the submitted requirement id."},"title":{"type":"string"},"submission":{"type":"object"}},"required":["action"]}`),
+			toolDefinition("knowledge", "Use deterministic project knowledge facts. Status distinguishes empty/queued/processing/ready/failed; a pending search is not proof of absence. Search/discover/list are navigation only; read/follow_links/graph return evidence. For multi-constraint identity questions, discover with the full requirements ranks common-subject entity candidates and should be preferred over repeated search paraphrases; preserve subject/object roles. Choose evidence actions freely; a current-turn read or graph result may support multiple requirements without a preceding search. A dedicated candidate page is not required. Every submit call requires non-empty question, answer, candidate, the full requirements array, and exactly one check per requirement. Candidate and requirement_id are optional search metadata; keep candidate only as filtering metadata and use only the requirement's event terms in query. For a negative requirement, search the positive event that would disprove it, for example 到过 花果山. Explicit negative evidence may resolve a supported check. Otherwise use not_found_in_corpus only after a current-turn relevant zero-result candidate-specific search in a ready workspace; omission in citations and pending searches cannot prove absence. A matching hit conflicts with absence and must be read or refined before submission. Submit validates only the current turn's evidence ledger and returns validation_issues when incomplete; writeback explicitly saves a validated submission.", `{"type":"object","properties":{"action":{"enum":["status","search","discover","read","list","follow_links","graph","submit","writeback"]},"query":{"type":"string","description":"For candidate-specific searches, use only the matching requirement event terms and do not repeat candidate. For a negative requirement, use the positive disproof event terms and do not add unrelated terms."},"scope":{"enum":["all","wiki","raw"],"description":"Search scope; defaults to all. Use raw for original source evidence."},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":50},"seed_paths":{"type":"array","items":{"type":"string"}},"requirements":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"kind":{"enum":["positive","negative"]}},"required":["id","text"]}},"question":{"type":"string","description":"Required and non-empty for action=submit."},"answer":{"type":"string","description":"Required and non-empty for action=submit."},"candidate":{"type":"string","description":"Required for action=submit; identify the candidate supported by current-turn evidence; a dedicated wiki page is not required. For candidate-specific searches, pass it only as filtering metadata."},"checks":{"type":"array","description":"Required for action=submit; provide exactly one check for every requirement. Supported checks must cite current-turn read, follow_links, or graph evidence. Negative supported checks need explicit negative evidence; omission only permits not_found_in_corpus after a relevant search.","items":{"type":"object","properties":{"requirement_id":{"type":"string"},"status":{"enum":["supported","contradicted","unknown","not_found_in_corpus"]},"evidence_paths":{"type":"array","items":{"type":"string"}},"explanation":{"type":"string"}},"required":["requirement_id","status"]}},"evidence_paths":{"type":"array","items":{"type":"string"}},"status":{"enum":["complete","incomplete"]},"requirement_id":{"type":"string","description":"Optional association with a submitted requirement; include for absence checks."},"title":{"type":"string"},"submission":{"type":"object"}},"required":["action"]}`),
 		)
 	}
 	definitions = append(definitions, toolDefinition("background", "Run and manage long commands on the durable workspace computer.", `{"type":"object","properties":{"action":{"enum":["start","poll","write","stop","list","watch","unwatch"]},"command":{"type":"string"},"process_id":{"type":"string"},"data":{"type":"string"},"since_cursor":{"type":"integer"},"pattern":{"type":"string"},"instructions":{"type":"string"},"monitor_id":{"type":"string"},"wait_seconds":{"type":"integer"},"max_bytes":{"type":"integer"},"signal":{"enum":["TERM","KILL","INT","HUP","QUIT"]},"timeout_seconds":{"type":"integer"}},"required":["action"]}`))
@@ -1290,7 +1206,11 @@ func coreToolDefinitions(knowledge bool) []ToolDefinition {
 }
 
 func toolDefinition(name, description, schema string) ToolDefinition {
-	return ToolDefinition{Name: name, Description: description, InputSchema: json.RawMessage(schema)}
+	mode := "sequential"
+	if name == "read" || name == "history" {
+		mode = "parallel"
+	}
+	return ToolDefinition{Name: name, Description: description, InputSchema: json.RawMessage(schema), ExecutionMode: mode}
 }
 
 func toolText(value string) ToolResult {

@@ -383,6 +383,7 @@ func (s *Server) maintainOptions(req service.WorkspaceMaintainRequest) (service.
 }
 
 type projectSearchRequest struct {
+	Scope       string `json:"scope"`
 	ProjectPath string `json:"project_path"`
 	ProjectID   string `json:"project_id"`
 	Query       string `json:"q"`
@@ -399,7 +400,7 @@ func (s *Server) handleProjectSearch(w http.ResponseWriter, r *http.Request) {
 	}
 	projectPath := s.projectPath(req.ProjectPath)
 	projectID := firstNonEmpty(req.ProjectID, s.defaultProjectID)
-	results, err := service.SearchProjectDocuments(r.Context(), projectPath, projectID, req.Query, req.Limit, s.searchStore, s.embeddingProvider)
+	results, err := service.SearchProjectDocumentsScoped(r.Context(), projectPath, projectID, req.Query, req.Limit, req.Scope, s.searchStore, s.embeddingProvider)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err)
 		return

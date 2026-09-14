@@ -227,16 +227,16 @@ func (f *largeDocumentKnowledgeFake) Read(knowlega.ScopeRef, string) (knowledges
 	return knowledgeservice.KnowledgeDocument{Path: "wiki/entities/large.md", Title: "Large", Kind: "entity", Content: f.content}, nil
 }
 
-func TestKnowledgeCandidateSearchRequiresCandidateAndRequirementIDTogether(t *testing.T) {
+func TestKnowledgeCandidateSearchAllowsOptionalRequirementID(t *testing.T) {
 	resolver, _ := NewCoreToolContextResolver(CoreToolContextOptions{WorkspaceRoot: t.TempDir(), Knowledge: deterministicKnowledgeFake{}})
 	tools, _ := resolver.ResolveToolContext(t.Context(), TurnTaskPayload{SessionID: "s1", ScopeLabel: "group:web-project-p1", OrgScopeID: "org:acme"})
 	result, err := tools.Execute(t.Context(), ToolCall{Name: "knowledge", Arguments: json.RawMessage(`{"action":"search","query":"唐僧 花果山","candidate":"唐僧"}`)})
-	if err != nil || !result.IsError || !strings.Contains(toolResultText(result), "both `candidate` and `requirement_id`") {
+	if err != nil || result.IsError {
 		t.Fatalf("unpaired candidate search was accepted: result=%+v err=%v", result, err)
 	}
 }
 
-func TestKnowledgeCandidateSearchUsesConditionQueryAndFiltersUnrelatedHits(t *testing.T) {
+func TestKnowledgeCandidateSearchUsesConditionQueryWithoutHardFiltering(t *testing.T) {
 	fake := &candidateSearchKnowledgeFake{
 		results: []knowledgecore.KnowledgeSearchResult{
 			{Path: "raw/sources/monkey.md", Title: "花果山章节", Kind: "raw-source"},
@@ -264,9 +264,10 @@ func TestKnowledgeCandidateSearchUsesConditionQueryAndFiltersUnrelatedHits(t *te
 	if err := json.Unmarshal([]byte(toolResultText(result)), &matches); err != nil {
 		t.Fatal(err)
 	}
-	if len(matches) != 1 || matches[0].Path != "raw/sources/taizong.md" || strings.Contains(toolResultText(result), "monkey.md") || strings.Contains(toolResultText(result), "heard.md") || strings.Contains(toolResultText(result), "mixed.md") {
-		t.Fatalf("candidate filter retained unrelated results: %+v", matches)
+	if len(matches) != len(fake.results) {
+		t.Fatalf("recall was filtered: %+v", matches)
 	}
+
 	if !strings.Contains(string(result.Details), `"query":"到过 花果山"`) || !strings.Contains(string(result.Details), `"candidate":"唐太宗"`) {
 		t.Fatalf("candidate search metadata=%s", result.Details)
 	}

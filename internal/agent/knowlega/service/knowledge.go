@@ -21,6 +21,7 @@ import (
 // KnowledgeSearchPlan is the complete contract needed by deterministic recall.
 // It deliberately contains no answer-planning or LLM runtime state.
 type KnowledgeSearchPlan struct {
+	Scope       string
 	Query       string
 	Limit       int
 	Terms       []string
@@ -67,10 +68,22 @@ type KnowledgeFollowResult struct {
 // SearchProjectDocuments performs candidate recall only. Its results are
 // navigation hints; callers must read a document before treating it as evidence.
 func SearchProjectDocuments(ctx context.Context, projectPath, projectID, query string, limit int, store SearchEvidenceStore, embeddingProvider EmbeddingProvider) ([]core.KnowledgeSearchResult, error) {
+	return SearchProjectDocumentsScoped(ctx, projectPath, projectID, query, limit, "all", store, embeddingProvider)
+}
+
+// SearchProjectDocumentsScoped limits retrieval before ranking, never after truncation.
+func SearchProjectDocumentsScoped(ctx context.Context, projectPath, projectID, query string, limit int, scope string, store SearchEvidenceStore, embeddingProvider EmbeddingProvider) ([]core.KnowledgeSearchResult, error) {
+	if scope == "" {
+		scope = "all"
+	}
+	if scope != "all" && scope != "wiki" && scope != "raw" {
+		return nil, fmt.Errorf("invalid knowledge search scope: %s", scope)
+	}
 	plan, err := normalizeKnowledgeSearchPlan(query, limit)
 	if err != nil {
 		return nil, err
 	}
+	plan.Scope = scope
 	backendLimit := plan.Limit * 3
 	if backendLimit < 20 {
 		backendLimit = 20
@@ -82,7 +95,7 @@ func SearchProjectDocuments(ctx context.Context, projectPath, projectID, query s
 	backendPlan.Limit = backendLimit
 	var rankedLists [][]core.KnowledgeSearchResult
 	var backendErrors []error
-	if store != nil && strings.TrimSpace(projectID) != "" {
+	if scope != "raw" && store != nil && strings.TrimSpace(projectID) != "" {
 		if vectorStore, ok := store.(VectorSearchEvidenceStore); ok && embeddingProvider != nil {
 			embedding, embedErr := embeddingProvider.EmbedText(ctx, plan.Query)
 			if embedErr != nil {
@@ -136,6 +149,9 @@ func SearchProjectDocuments(ctx context.Context, projectPath, projectID, query s
 		}
 	}
 	direct := fuseKnowledgeRankings(rankedLists, plan.Limit)
+	if scope == "raw" {
+		return direct, nil
+	}
 	return appendKnowledgeSearchExpansion(projectPath, plan, direct), nil
 }
 
@@ -195,11 +211,15 @@ func appendKnowledgeSearchExpansion(projectPath string, plan KnowledgeSearchPlan
 func searchProjectFiles(projectPath string, plan KnowledgeSearchPlan) ([]core.KnowledgeSearchResult, error) {
 	terms := knowledgeQueryTerms(plan.Query)
 	var results []core.KnowledgeSearchResult
-	if err := walkKnowledgeSearchRoot(projectPath, "wiki", ".md", plan, terms, &results); err != nil {
-		return nil, err
+	if plan.Scope != "raw" {
+		if err := walkKnowledgeSearchRoot(projectPath, "wiki", ".md", plan, terms, &results); err != nil {
+			return nil, err
+		}
 	}
-	if err := walkKnowledgeSearchRoot(projectPath, filepath.Join("raw", "sources"), "", plan, terms, &results); err != nil {
-		return nil, err
+	if plan.Scope != "wiki" {
+		if err := walkKnowledgeSearchRoot(projectPath, filepath.Join("raw", "sources"), "", plan, terms, &results); err != nil {
+			return nil, err
+		}
 	}
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Score == results[j].Score {
