@@ -66,17 +66,18 @@ After changing `configs/qm-config.yaml`, run
 the affected children. Configuration is loaded at process startup and is not
 hot-reloaded by `npm run dev`.
 
-For backend-only Go debugging, use the VS Code configuration
-`Backend: QM + Knowlega Agent (standalone)` or run:
+In the IDE's Run and Debug menu, start the two services independently:
 
-```bash
-env GOCACHE=/private/tmp/knowlega-gocache \
-  go run ./cmd/qm-backend --config configs/qm-config.yaml
-```
+- **Go 后端**: runs `cmd/qm-backend --config config.yaml` under the Go debugger,
+  after the required `local-pg guard knowledge-core` check.
+- **前端**: runs `npm start` in `plugins/web-ui` with Node 24, which builds and
+  serves the frontend at `http://localhost:18129/`. It connects to the backend
+  at `http://127.0.0.1:19829/` without waiting for it to become ready.
 
-That standalone command expects the database and listener configuration in the
-YAML to be reachable; it does not replace the full-stack `dev-instance` entry
-point.
+Both services show their output in the IDE's integrated Terminal panel.
+The backend reads the root `config.yaml` in QM format. Frontend authentication
+settings are loaded from the ignored `config.local/ide-frontend.env`.
+Use `local-pg env knowledge-core --target host` for database connection settings.
 
 ## Run the Local Application
 

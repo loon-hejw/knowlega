@@ -2,90 +2,23 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "ide: frontend prelaunch",
-      "dependsOrder": "sequence",
-      "dependsOn": [
-        "ide: build web-ui",
-        "ide: wait for core readyz"
-      ],
-      "problemMatcher": []
-    },
-    {
-      "label": "ide: wait for core readyz",
-      "type": "shell",
-      "command": "for i in $(seq 1 120); do curl -fsS http://127.0.0.1:18085/readyz >/dev/null 2>&1 && exit 0; sleep 0.5; done; echo 'core did not become ready in 60s'; exit 1",
-      "options": {
-        "cwd": "${workspaceFolder}"
-      },
-      "problemMatcher": []
-    },
-    {
-      "label": "ide: build web-ui",
+      "label": "ide: shared PostgreSQL",
       "type": "process",
-      "command": "npm",
+      "command": "local-pg",
       "args": [
-        "run",
-        "build"
+        "guard",
+        "knowledge-core"
       ],
       "options": {
-        "cwd": "${workspaceFolder}/plugins/web-ui",
+        "cwd": "${workspaceFolder}",
         "env": {
-          "WEB_UI_BASE": "/"
+          "PYTHONUNBUFFERED": "1"
         }
       },
-      "problemMatcher": []
-    },
-    {
-      "label": "qm: start full stack (no Slack)",
-      "type": "process",
-      "command": "npm",
-      "args": [
-        "run",
-        "dev-instance:no-slack",
-        "--",
-        "--force"
-      ],
-      "options": {
-        "cwd": "${workspaceFolder}/qm"
-      },
-      "problemMatcher": []
-    },
-    {
-      "label": "qm: dev status",
-      "type": "process",
-      "command": "npm",
-      "args": [
-        "run",
-        "dev-instance:status"
-      ],
-      "options": {
-        "cwd": "${workspaceFolder}/qm"
-      },
-      "problemMatcher": []
-    },
-    {
-      "label": "qm: dev doctor",
-      "type": "process",
-      "command": "npm",
-      "args": [
-        "run",
-        "dev-instance:doctor"
-      ],
-      "options": {
-        "cwd": "${workspaceFolder}/qm"
-      },
-      "problemMatcher": []
-    },
-    {
-      "label": "qm: stop full stack",
-      "type": "process",
-      "command": "npm",
-      "args": [
-        "run",
-        "dev-instance:down"
-      ],
-      "options": {
-        "cwd": "${workspaceFolder}/qm"
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated",
+        "clear": false
       },
       "problemMatcher": []
     }

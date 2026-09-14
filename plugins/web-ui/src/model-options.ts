@@ -11,6 +11,33 @@ export interface ModelOption {
   buttonLabel: string;
 }
 
+export interface ModelCatalogEntry {
+  name?: string;
+  provider?: string;
+  protocol?: string;
+}
+
+export type ModelCatalog = Readonly<Record<string, ModelCatalogEntry>> |
+  readonly (ModelCatalogEntry & { modelId: string; harnessId?: string })[];
+
+type NormalizedCatalog = Record<string, { name: string; provider: string; protocol?: string }>;
+
+export function normalizeModelCatalog(catalog: ModelCatalog): NormalizedCatalog {
+  const entries = Array.isArray(catalog)
+    ? catalog.map((entry) => [entry.modelId, entry] as const)
+    : Object.entries(catalog);
+  const normalized: NormalizedCatalog = Object.create(null);
+  for (const [id, entry] of entries) {
+    if (!id) continue;
+    normalized[id] = {
+      name: entry.name || id,
+      provider: entry.provider || "configured",
+      ...(entry.protocol ? { protocol: entry.protocol } : {}),
+    };
+  }
+  return normalized;
+}
+
 interface ModelMeta {
   label: string;
   buttonLabel: string;
@@ -82,7 +109,7 @@ function buildOption(
 ): ModelOption | null {
   try {
     const dynamic = catalog[id];
-    const meta = MODEL_CATALOG[id] ?? (dynamic ? { label: dynamic.name, buttonLabel: dynamic.name } : null);
+    const meta = dynamic ? { label: dynamic.name, buttonLabel: dynamic.name } : MODEL_CATALOG[id];
     if (!meta) return null;
     const model = getBaseModel(id, dynamic);
     return {
@@ -154,13 +181,17 @@ export function applyPickerModelIds(ids: readonly string[] | null | undefined, b
 export function runtimeModelOptions(
   approvedHarnesses: readonly string[],
   modelsByHarness: Readonly<Record<string, readonly string[]>>,
-  catalog: Readonly<Record<string, { name: string; provider: string; protocol?: string }>> = {},
+  catalog: ModelCatalog = {},
 ): ModelOption[] {
+  const normalized = normalizeModelCatalog(catalog);
   const options = approvedHarnesses.flatMap((harnessId) => {
-    const configured = buildOptions(modelsByHarness[harnessId] ?? [], harnessId, true, catalog);
+    for (const id of modelsByHarness[harnessId] ?? []) {
+      if (!normalized[id] && !MODEL_CATALOG[id]) normalized[id] = { name: id, provider: "configured" };
+    }
+    const configured = buildOptions(modelsByHarness[harnessId] ?? [], harnessId, true, normalized);
     return configured.length
       ? configured
-      : buildOptions(defaultModelIdsForHarness(harnessId), harnessId, true, catalog);
+      : buildOptions(defaultModelIdsForHarness(harnessId), harnessId, true, normalized);
   });
   return options.length ? options : buildOptions(DEFAULT_PICKER_MODEL_IDS);
 }
@@ -170,7 +201,7 @@ export function applyRuntimeOptions(
   approvedHarnesses: readonly string[],
   modelsByHarness: Readonly<Record<string, readonly string[]>>,
   effective: { harnessId: string; modelId: string },
-  catalog: Readonly<Record<string, { name: string; provider: string; protocol?: string }>> = {},
+  catalog: ModelCatalog = {},
 ): void {
   const options = runtimeModelOptions(approvedHarnesses, modelsByHarness, catalog);
   const applied = { options, defaultValue: `${effective.harnessId}:${effective.modelId}` };
@@ -181,6 +212,12 @@ export function applyRuntimeOptions(
 export function defaultModelValue(scopeKey?: string | null): ModelOptionValue {
   const { options, defaultValue } = runtimeFor(scopeKey);
   return options.find((o) => o.value === defaultValue)?.value ?? options[0]!.value;
+}
+
+export function resolveModelOption(value: ModelOptionValue, scopeKey?: string | null): ModelOption {
+  const { options, defaultValue } = runtimeFor(scopeKey);
+  return options.find((option) => option.value === value) ??
+    options.find((option) => option.value === defaultValue) ?? options[0]!;
 }
 
 export function transcriptModel(scopeKey?: string | null): Model<Api> {

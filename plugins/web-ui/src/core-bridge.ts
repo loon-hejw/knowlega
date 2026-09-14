@@ -1,3 +1,4 @@
+import type { ModelCatalog } from "./model-options.ts";
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type { Api, AssistantMessage, AssistantMessageEventStream, Context, Model, Usage } from "@earendil-works/pi-ai";
 import type { Agent, AgentMessage, StreamFn } from "@earendil-works/pi-agent-core";
@@ -513,7 +514,7 @@ export interface RuntimeConfig {
   scopeId: string;
   approvedHarnesses: string[];
   modelsByHarness: Record<string, string[]>;
-  modelCatalog: Record<string, { name: string; provider: string; protocol?: string }>;
+  modelCatalog: ModelCatalog;
   orgDefault: { harnessId: string; modelId: string; effortLevel?: string; fastMode?: boolean; revision: number };
   scopeOverride: {
     harnessId: string;

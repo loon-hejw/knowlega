@@ -33,6 +33,7 @@ import {
   applyRuntimeOptions,
   defaultEffortForModel,
   defaultModelValue,
+  resolveModelOption,
   effortLabel,
   getHarnessOptions,
   getModelOptions,
@@ -108,12 +109,7 @@ export function carryModelPick(fromThreadRef: string | null, toThreadRef: string
 }
 
 function modelOptionFor(value: ModelOptionValue, scopeKey?: string | null): ModelOption {
-  const options = getModelOptions(scopeKey);
-  return (
-    options.find((option) => option.value === value) ??
-    options.find((option) => option.value === defaultModelValue()) ??
-    options[0]
-  );
+  return resolveModelOption(value, scopeKey);
 }
 
 function loadStoredFastMode(): boolean | undefined {
@@ -296,8 +292,7 @@ export function createComposerSurface(ctx: ConvCtx): ComposerSurface {
       (config.effective.effortLevel as EffortLevel | undefined) ?? defaultEffortForModel(currentModelOption().model);
     composerState.fastMode =
       config.effective.fastMode === true && modelSupportsFastMode(scopeKey(), config.effective.modelId);
-    if (agent && (!ctx.chat.state.threadRef || !threadModelPicks.has(ctx.chat.state.threadRef)))
-      agent.state.model = currentModelOption().model;
+    if (agent) agent.state.model = currentModelOption().model;
     ctx.chat.drawActiveChat(agent);
     if (pendingComposerFocus) focusComposerEnd();
   }

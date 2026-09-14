@@ -10,8 +10,40 @@ import {
   harnessSupportsEffort,
   harnessSupportsFastMode,
   runtimeModelOptions,
+  resolveModelOption,
 } from "../src/model-options.ts";
 import { modelSupportsFastMode, setFastModeModelIds } from "../src/pi-models.ts";
+
+test("Go array catalogs display the configured custom model and select the backend default", () => {
+  applyRuntimeOptions("project:array", ["pi"], { pi: ["qwen3.8-flash-next"] },
+    { harnessId: "pi", modelId: "qwen3.8-flash-next" },
+    [{ harnessId: "pi", modelId: "qwen3.8-flash-next", name: "Project Qwen", provider: "project-config", protocol: "openai" }]);
+  const options = getModelOptions("project:array");
+  assert.equal(options.length, 1);
+  assert.equal(options[0]!.label, "Project Qwen");
+  assert.equal(options[0]!.model.provider, "project-config");
+  assert.equal(defaultModelValue("project:array"), "pi:qwen3.8-flash-next");
+});
+
+test("old Go arrays without provider metadata and missing catalog entries retain configured IDs", () => {
+  for (const catalog of [[{ modelId: "custom-model", name: "Custom" }], {}]) {
+    const options = runtimeModelOptions(["pi"], { pi: ["custom-model"] }, catalog);
+    assert.deepEqual(options.map((option) => option.value), ["pi:custom-model"]);
+    assert.equal(options[0]!.model.id, "custom-model");
+  }
+});
+
+test("catalog formats preserve independent scope defaults", () => {
+  applyRuntimeOptions("project:array", ["pi"], { pi: ["qwen3.8-flash-next"] },
+    { harnessId: "pi", modelId: "qwen3.8-flash-next" }, [{ modelId: "qwen3.8-flash-next" }]);
+  applyRuntimeOptions("project:object", ["pi"], { pi: ["other-model"] },
+    { harnessId: "pi", modelId: "other-model" },
+    { "other-model": { name: "Other", provider: "other-provider", protocol: "anthropic" } });
+  assert.equal(defaultModelValue("project:object"), "pi:other-model");
+  assert.equal(defaultModelValue("project:array"), "pi:qwen3.8-flash-next");
+  assert.equal(resolveModelOption("pi:removed-model", "project:array").value, "pi:qwen3.8-flash-next");
+  assert.equal(resolveModelOption("pi:removed-model", "project:object").value, "pi:other-model");
+});
 
 test("the built-in picker includes Fable alongside Opus/Sonnet/Haiku", () => {
   applyPickerModelIds(null);
@@ -96,7 +128,7 @@ test("runtime options preserve a fetched OpenRouter model as the selected web tu
   assert.equal(defaultModelValue(), "pi:anthropic/claude-sonnet-4.5");
 });
 
-test("runtime options hide retired persisted model ids", () => {
+test("runtime options retain every model explicitly approved by the backend", () => {
   applyRuntimeOptions(
     null,
     ["claude", "codex"],
@@ -108,11 +140,11 @@ test("runtime options hide retired persisted model ids", () => {
   );
   assert.deepEqual(
     getModelOptionsForHarness("claude").map((o) => o.label),
-    ["Fable 5", "Sonnet 5"],
+    ["Fable 5", "claude-sonnet-4-6", "Sonnet 5"],
   );
   assert.deepEqual(
     getModelOptionsForHarness("codex").map((o) => o.label),
-    ["GPT-5.6 Sol", "GPT-5.6 Terra", "GPT-5.6 Luna"],
+    ["gpt-5.5", "GPT-5.6 Sol", "GPT-5.6 Terra", "GPT-5.6 Luna"],
   );
 });
 
@@ -127,14 +159,14 @@ test("harness-only turn controls are exposed only where the adapter supports the
   assert.equal(harnessSupportsFastMode("opencode"), false);
 });
 
-test("an all-retired list falls back within the approved harness", () => {
+test("an approved model outside the built-in picker remains the default", () => {
   applyRuntimeOptions(null, ["codex"], { codex: ["gpt-5.5"] }, { harnessId: "codex", modelId: "gpt-5.5" });
   assert.deepEqual(getHarnessOptions(), [{ value: "codex", label: "Codex" }]);
   assert.deepEqual(
     getModelOptionsForHarness("codex").map((o) => o.label),
-    ["GPT-5.6 Sol", "GPT-5.6 Terra", "GPT-5.6 Luna"],
+    ["gpt-5.5"],
   );
-  assert.equal(defaultModelValue(), "codex:gpt-5.6-sol");
+  assert.equal(defaultModelValue(), "codex:gpt-5.5");
 });
 
 test("unknown ids are dropped; an all-unknown list falls back to the built-in set", () => {

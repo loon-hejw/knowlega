@@ -10427,6 +10427,8 @@ func (h *HTTPServer) getRuntimeConfig(w http.ResponseWriter, r *http.Request, id
 			modelCatalog = append(modelCatalog, map[string]interface{}{
 				"harnessId":        harness.ID,
 				"modelId":          modelID,
+				"provider":         provider.ID,
+				"protocol":         provider.Protocol,
 				"name":             modelDef.Name,
 				"contextWindow":    modelDef.ContextWindow,
 				"maxTokens":        modelDef.MaxTokens,

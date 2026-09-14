@@ -2,36 +2,44 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "IDE Core (Go)",
+      "name": "Go 后端",
       "type": "go",
       "request": "launch",
       "mode": "debug",
       "program": "${workspaceFolder}/cmd/qm-backend",
       "args": [
         "--config",
-        "${workspaceFolder}/configs/qm-config.yaml"
+        "${workspaceFolder}/config.yaml"
       ],
       "cwd": "${workspaceFolder}",
       "env": {
-        "GOCACHE": "/private/tmp/knowlega-gocache"
-      }
+        "GOCACHE": "/private/tmp/knowlega-gocache",
+        "DATABASE_URL": "",
+        "ORG_ID": "",
+        "NODE_CORE_URL": "",
+        "CORE_SIGNING_SECRET": "",
+        "CAPABILITY_SECRET": "",
+        "PORTAL_IDENTITY_SECRET": "",
+        "QM_ROUTE_MODE": "",
+        "PORT": "",
+        "MAX_CLAIMS": "",
+        "SOURCE_AUTH_REPLAY_WINDOW_SECONDS": ""
+      },
+      "preLaunchTask": "ide: shared PostgreSQL",
+      "console": "integratedTerminal",
+      "internalConsoleOptions": "neverOpen"
     },
     {
-      "name": "IDE Frontend (Node)",
+      "name": "前端",
       "type": "node",
       "request": "launch",
-      "program": "${workspaceFolder}/plugins/web-ui/server/unified.ts",
       "cwd": "${workspaceFolder}/plugins/web-ui",
-      "runtimeArgs": [
-        "--env-file-if-exists=${workspaceFolder}/qm/.env"
-      ],
       "console": "integratedTerminal",
-      "preLaunchTask": "ide: frontend prelaunch",
       "env": {
         "PORT": "18129",
         "PORTAL_PUBLIC_URL": "http://localhost:18129",
         "WEB_UI_PUBLIC_URL": "http://localhost:18129",
-        "CORE_API_URL": "http://localhost:18085",
+        "CORE_API_URL": "http://127.0.0.1:19829",
         "CORE_ORG_ID": "local",
         "WEB_UI_BASE": "/",
         "WEB_UI_PRINCIPALS": "",
@@ -46,32 +54,16 @@
         "OPENROUTER_API_KEY": null,
         "OPENROUTER_BASE_URL": null,
         "SLACK_BOT_TOKEN": null,
-        "SLACK_APP_TOKEN": null
-      }
-    },
-    {
-      "name": "QM: Full Stack (No Slack)",
-      "type": "node-terminal",
-      "request": "launch",
-      "command": "npm run dev-instance:no-slack -- --force",
-      "cwd": "${workspaceFolder}/qm"
-    },
-    {
-      "name": "QM: Dev Status",
-      "type": "node-terminal",
-      "request": "launch",
-      "command": "npm run dev-status",
-      "cwd": "${workspaceFolder}/qm"
-    }
-  ],
-  "compounds": [
-    {
-      "name": "IDE: Full Stack (Go backend + Frontend)",
-      "configurations": [
-        "IDE Core (Go)",
-        "IDE Frontend (Node)"
+        "SLACK_APP_TOKEN": null,
+        "PATH": "${env:HOME}/.nvm/versions/node/v24.13.0/bin:${env:PATH}"
+      },
+      "runtimeExecutable": "${env:HOME}/.nvm/versions/node/v24.13.0/bin/npm",
+      "envFile": "${workspaceFolder}/config.local/ide-frontend.env",
+      "internalConsoleOptions": "neverOpen",
+      "runtimeArgs": [
+        "start"
       ],
-      "stopAll": true
+      "autoAttachChildProcesses": true
     }
   ]
 }
