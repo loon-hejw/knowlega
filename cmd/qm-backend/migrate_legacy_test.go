@@ -256,7 +256,7 @@ func TestConvergeLegacyKnowledgeProjectUpgradesV1MarkerAndSingularLayout(t *test
 		t.Fatal(err)
 	}
 	var marker legacyImportMarker
-	if json.Unmarshal(raw, &marker) != nil || marker.Version != 5 || marker.ConvergedAt == "" {
+	if json.Unmarshal(raw, &marker) != nil || marker.Version != 6 || marker.ConvergedAt == "" {
 		t.Fatalf("marker=%s", raw)
 	}
 }

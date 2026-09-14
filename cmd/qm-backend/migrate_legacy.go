@@ -160,13 +160,16 @@ func convergeLegacyKnowledgeProject(sourcePath, targetPath string) error {
 	if marker.SourcePath != sourcePath {
 		return errors.New("knowledge scope was imported from a different legacy project")
 	}
-	if marker.Version >= 5 {
+	if marker.Version >= 6 {
 		return nil
+	}
+	if _, err := knowledgecompiler.RestoreQuarantinedSourcePages(targetPath); err != nil {
+		return err
 	}
 	if _, err := knowledgecompiler.ConvergeWikiArtifacts(targetPath); err != nil {
 		return err
 	}
-	marker.Version = 5
+	marker.Version = 6
 	marker.ConvergedAt = time.Now().UTC().Format(time.RFC3339Nano)
 	raw, err = json.MarshalIndent(marker, "", "  ")
 	if err != nil {

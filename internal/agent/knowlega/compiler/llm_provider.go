@@ -130,6 +130,9 @@ Rules:
 - Review type must be exactly one of: contradiction, duplicate, missing-page, stale-claim, source-gap, review-needed.
 - Every file must have YAML frontmatter.
 - Emit every YAML frontmatter key exactly once. Never repeat type, title, sources, aliases, or confidence.
+- Write in the primary language of the raw source, preserving original names and aliases.
+- Preserve event subjects, actions, refusals, coercion, outcomes, and explicit negations; do not replace the event sequence with only a broad theme.
+- Never include placeholders, generation instructions, planning commentary, or unfinished paragraphs in page bodies.
 - Keep source provenance in sources.
 - The sources list must contain the current supplied raw source. Never invent, guess, copy from prose, or synthesize raw/sources paths; the compiler owns provenance unioning.
 - The first ---FILE block MUST be the current source's single source-summary under wiki/sources/. Emit it before every entity, concept, synthesis, or review block so it cannot be lost if output is truncated.

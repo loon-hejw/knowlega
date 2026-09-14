@@ -538,3 +538,50 @@ func containsString(values []string, want string) bool {
 	}
 	return false
 }
+
+func TestConvergenceRestoresArchivedProvenanceAndKeepsEntityQueryable(t *testing.T) {
+	root := t.TempDir()
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	raw := "raw/sources/chapter.txt"
+	if err := os.WriteFile(filepath.Join(root, raw), []byte("source evidence"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	manifest := SourceManifest{Sources: map[string]SourceManifestEntry{"source": {RawPath: raw, Files: []string{"wiki/sources/chapter.md"}}}}
+	if err := saveSourceManifest(root, manifest); err != nil {
+		t.Fatal(err)
+	}
+	page := "wiki/entities/ruler.md"
+	original := "---\ntitle: Ruler\ntype: entity\naliases: [Old King]\nsources: [" + raw + "]\n---\n\nThe ruler welcomed the travellers.\n"
+	if err := wiki.WriteVersionedPage(root, page, []byte(original), "fixture"); err != nil {
+		t.Fatal(err)
+	}
+	if err := wiki.WriteVersionedPage(root, page, []byte(strings.Replace(original, "["+raw+"]", "[]", 1)), "legacy provenance loss"); err != nil {
+		t.Fatal(err)
+	}
+	if err := wiki.QuarantineVersionedPage(root, page, "manifest ownership reconciliation"); err != nil {
+		t.Fatal(err)
+	}
+	count, err := RestoreQuarantinedSourcePages(root)
+	if err != nil || count != 1 {
+		t.Fatalf("restored=%d err=%v", count, err)
+	}
+	if _, err := ConvergeWikiArtifacts(root); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(filepath.Join(root, page))
+	if err != nil || !strings.Contains(string(content), raw) || !strings.Contains(string(content), "Old King") {
+		t.Fatalf("page lost: %s err=%v", content, err)
+	}
+	manifest, err = loadSourceManifest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(manifest.Sources["source"].Files, " "), page) {
+		t.Fatal("manifest ownership was not repaired")
+	}
+	if n, err := RestoreQuarantinedSourcePages(root); err != nil || n != 0 {
+		t.Fatalf("repeat restored=%d err=%v", n, err)
+	}
+}

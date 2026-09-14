@@ -371,6 +371,9 @@ func ParseBlocks(text string) (ParsedBlocks, error) {
 	flush()
 
 	for _, file := range parsed.Files {
+		if err := ValidateGeneratedPageContent(file.Content); err != nil {
+			return ParsedBlocks{}, fmt.Errorf("file block %s: %w", file.Path, err)
+		}
 		if !hasFrontmatter(file.Content) {
 			return ParsedBlocks{}, fmt.Errorf("file block %s is missing YAML frontmatter", file.Path)
 		}

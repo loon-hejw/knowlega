@@ -159,7 +159,9 @@ func ConvergeWikiArtifacts(projectPath string) (WikiConvergenceResult, error) {
 			}
 			for _, source := range frontmatterStrings(candidate.fm["sources"]) {
 				source = filepath.ToSlash(strings.TrimSpace(source))
-				if source != "" && !sources[source] {
+				if validExistingRawSource(projectPath, source) {
+					sources[source] = true
+				} else if source != "" {
 					result.RemovedBadSources++
 				}
 			}
@@ -167,7 +169,12 @@ func ConvergeWikiArtifacts(projectPath string) (WikiConvergenceResult, error) {
 		body := strings.TrimSpace(base.body)
 		for _, candidate := range candidates[1:] {
 			other := strings.TrimSpace(candidate.body)
-			if other == "" || strings.Contains(body, other) || strings.Contains(other, body) {
+			if other == "" || strings.Contains(body, other) {
+				continue
+			}
+			if strings.Contains(other, body) {
+				body = other
+				result.MergedPages++
 				continue
 			}
 			body += "\n\n## Preserved evidence from " + candidate.title + "\n\n" + stripLeadingH1(other)
@@ -182,6 +189,7 @@ func ConvergeWikiArtifacts(projectPath string) (WikiConvergenceResult, error) {
 			delete(base.fm, "ambiguous_aliases")
 		}
 		base.fm["sources"] = sortedSet(sources)
+		owners[dest] = sources
 		fmYAML, marshalErr := yaml.Marshal(base.fm)
 		if marshalErr != nil {
 			return result, marshalErr
@@ -206,6 +214,12 @@ func ConvergeWikiArtifacts(projectPath string) (WikiConvergenceResult, error) {
 	}
 
 	for key, entry := range manifest.Sources {
+		// Frontmatter provenance is durable; repair stale manifest ownership before quarantine.
+		for dest, sources := range owners {
+			if sources[filepath.ToSlash(entry.RawPath)] {
+				entry.Files = append(entry.Files, dest)
+			}
+		}
 		seen := map[string]bool{}
 		files := make([]string, 0, len(entry.Files))
 		for _, oldPath := range entry.Files {
