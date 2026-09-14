@@ -697,12 +697,8 @@ func validateKnowledgeSubmission(submission knowledgecore.KnowledgeSubmission, l
 		}
 		malformed = true
 		addIssue("missing_candidate", "", "submit requires a non-empty candidate")
-	} else if len(requirements) > 1 && !knowledgeCandidateWasRead(submission.Candidate, ledger.Evidence) {
-		for _, id := range orderedIDs {
-			unresolved[id] = true
-		}
-		addIssue("candidate_page_not_read", "", "multi-condition candidate must match the path, title, or alias of a non-aggregate wiki page read in the current turn")
 	}
+
 	used := map[string]bool{}
 	for _, requested := range submission.EvidencePaths {
 		path := normalizeKnowledgeLedgerPath(requested)
@@ -718,14 +714,14 @@ func validateKnowledgeSubmission(submission knowledgecore.KnowledgeSubmission, l
 			addIssue("missing_check", id, "provide exactly one evidence check for this requirement")
 			continue
 		}
-		allowedStatus := requirement.Kind == "positive" && check.Status == "supported"
-		if requirement.Kind == "negative" {
+		allowedStatus := check.Status == "supported"
+		if requirement.Kind == "negative" && check.Status != "supported" {
 			if check.Status != "not_found_in_corpus" {
-				addIssue("negative_check_requires_not_found", id, "a negative requirement is resolved only by not_found_in_corpus after a current-turn candidate-specific zero-result search; selected citations that merely omit the event do not prove corpus-wide absence")
+				addIssue("negative_check_requires_not_found", id, "negative checks need supported with explicit negative evidence, or not_found_in_corpus with a current-turn relevant zero-result search; omission from selected citations is not evidence")
 			} else {
-				allowedStatus = knowledgeNegativeSearchRecorded(ledger.Searches, submission.Candidate, id, requirement.Text, ledger.Evidence)
+				allowedStatus = knowledgeNegativeSearchRecorded(ledger.Searches, submission.Candidate, id, ledger.Evidence)
 				if !allowedStatus {
-					if knowledgeNegativeSearchFoundResults(ledger.Searches, submission.Candidate, id, requirement.Text, ledger.Evidence) {
+					if knowledgeNegativeSearchFoundResults(ledger.Searches, submission.Candidate, id, ledger.Evidence) {
 						addIssue("negative_search_found_results", id, "a current-turn candidate-specific search returned results; read the hit and refine the search to the positive event terms from the requirement before claiming not_found_in_corpus")
 					} else {
 						addIssue("negative_search_not_recorded", id, "not_found_in_corpus requires a current-turn zero-result search for the positive event terms, carrying the same candidate and requirement_id while the workspace is ready")
@@ -756,39 +752,16 @@ func validateKnowledgeSubmission(submission knowledgecore.KnowledgeSubmission, l
 			if _, ok := ledger.Evidence[normalized]; ok {
 				validPath = true
 				used[normalized] = true
+			} else {
+				unresolved[id] = true
+				addIssue("evidence_not_in_current_turn", id, "every cited check path must be current-turn read, follow_links, or graph evidence")
 			}
 		}
 		if check.Status == "supported" && !validPath {
 			unresolved[id] = true
 			addIssue("evidence_not_in_current_turn", id, "supported checks must cite at least one current-turn read, follow_links, or graph evidence path")
 		}
-		if requirement.Kind == "positive" && check.Status == "supported" && validPath {
-			grounded, repairPath := knowledgePositiveEvidenceGrounded(ledger, submission.Candidate, id, requirement.Text, check.EvidencePaths)
-			if !grounded {
-				unresolved[id] = true
-				if repairPath != "" {
-					addIssue("positive_evidence_not_read", id, "a supported positive check must cite a path returned by the same candidate-specific requirement search and read after that search")
-					for index := range submission.ValidationIssues {
-						issue := &submission.ValidationIssues[index]
-						if issue.Code == "positive_evidence_not_read" && issue.RequirementID == id {
-							issue.Repair = &knowledgecore.KnowledgeRepairAction{Action: "read", Path: repairPath}
-							break
-						}
-					}
-				} else {
-					addIssue("positive_search_not_recorded", id, "a supported positive check requires a current-turn candidate-specific search carrying the same requirement_id before reading and citing one of its result paths")
-					for index := range submission.ValidationIssues {
-						issue := &submission.ValidationIssues[index]
-						if issue.Code == "positive_search_not_recorded" && issue.RequirementID == id {
-							issue.Repair = &knowledgecore.KnowledgeRepairAction{
-								Action: "search", Query: requirement.Text, Candidate: firstKnowledgeCandidateName(submission.Candidate), RequirementID: id,
-							}
-							break
-						}
-					}
-				}
-			}
-		}
+
 	}
 	if submission.Question == "" {
 		for _, id := range orderedIDs {
@@ -842,82 +815,11 @@ func knowledgeEvidenceCheckStatus(status string) bool {
 	}
 }
 
-func knowledgeCandidateWasRead(candidate string, evidence map[string]knowledgecore.KnowledgeCitation) bool {
-	candidateNames := knowledgeCandidateIdentityNames(candidate)
-	if len(candidateNames) == 0 {
-		return false
-	}
-	for path, citation := range evidence {
-		// A multi-condition candidate must be grounded in its durable wiki page.
-		// Raw source excerpts can support an individual requirement, but their
-		// title/path must not satisfy the candidate-page guard.
-		if !strings.HasPrefix(normalizeKnowledgeLedgerPath(path), "wiki/") || knowledgeservice.IsAggregateKnowledgePath(path) {
-			continue
-		}
-		for _, candidateName := range candidateNames {
-			if path == normalizeKnowledgeLedgerPath(candidateName) || strings.EqualFold(strings.TrimSpace(citation.Title), candidateName) {
-				return true
-			}
-			for _, alias := range citation.Aliases {
-				if strings.EqualFold(strings.TrimSpace(alias), candidateName) {
-					return true
-				}
-			}
-		}
-	}
-	return false
-}
-
-func knowledgePositiveEvidenceGrounded(ledger knowledgeLedger, candidate, requirementID, requirementText string, evidencePaths []string) (bool, string) {
-	candidateNames := knowledgeCandidateSearchNames(candidate, ledger.Evidence)
-	requirementID = strings.TrimSpace(requirementID)
-	requestedPaths := map[string]bool{}
-	for _, path := range evidencePaths {
-		if path = normalizeKnowledgeLedgerPath(path); path != "" {
-			requestedPaths[path] = true
-		}
-	}
-	repairPath := ""
-	for _, record := range ledger.Searches {
-		// Positive requirements may be searched with a paraphrase or an exact
-		// event phrase (for example, “有结义的情节” -> “拜为兄弟”).  The
-		// candidate-specific search has already stripped the candidate name and
-		// filtered hits to the candidate's local evidence, so requiring every
-		// literal query token to occur in the user's natural-language condition
-		// rejects valid evidence and traps the model in repeated searches.  Keep
-		// the protocol requirements that matter here: same requirement id and
-		// candidate, a non-empty condition query, a returned path, and a read
-		// after that search.
-		if record.Action != "search" || strings.TrimSpace(record.RequirementID) != requirementID || record.ResultCount <= 0 || len(candidateNames) == 0 || !knowledgeSearchCandidateMatches(record.Candidate, candidateNames) || knowledgeCandidateConditionQuery(record.Query, candidateNames) == "" {
-			continue
-		}
-		for _, resultPath := range record.ResultPaths {
-			resultPath = normalizeKnowledgeLedgerPath(resultPath)
-			if resultPath == "" {
-				continue
-			}
-			if repairPath == "" {
-				repairPath = resultPath
-			}
-			if !requestedPaths[resultPath] {
-				continue
-			}
-			if _, ok := ledger.Evidence[resultPath]; !ok {
-				continue
-			}
-			if ledger.EvidenceSequence[resultPath] > record.Sequence {
-				return true, ""
-			}
-		}
-	}
-	return false, repairPath
-}
-
-func knowledgeNegativeSearchRecorded(records []knowledgecore.KnowledgeActionRecord, candidate, requirementID, requirementText string, evidence map[string]knowledgecore.KnowledgeCitation) bool {
+func knowledgeNegativeSearchRecorded(records []knowledgecore.KnowledgeActionRecord, candidate, requirementID string, evidence map[string]knowledgecore.KnowledgeCitation) bool {
 	candidateNames := knowledgeCandidateSearchNames(candidate, evidence)
 	requirementID = strings.TrimSpace(requirementID)
 	for _, record := range records {
-		if record.Action != "search" || strings.TrimSpace(record.RequirementID) != requirementID || len(candidateNames) == 0 || record.ResultCount != 0 || knowledgeWorkspaceStillPending(record.WorkspaceStatus) || !knowledgeSearchCandidateMatches(record.Candidate, candidateNames) || !knowledgeSearchQueryMatchesRequirement(record.Query, requirementText, candidateNames) {
+		if record.Action != "search" || strings.TrimSpace(record.RequirementID) != requirementID || len(candidateNames) == 0 || record.ResultCount != 0 || record.WorkspaceStatus != knowledgeservice.KnowledgeWorkspaceReady || !knowledgeSearchCandidateMatches(record.Candidate, candidateNames) || knowledgeCandidateConditionQuery(record.Query, candidateNames) == "" {
 			continue
 		}
 		return true
@@ -925,11 +827,11 @@ func knowledgeNegativeSearchRecorded(records []knowledgecore.KnowledgeActionReco
 	return false
 }
 
-func knowledgeNegativeSearchFoundResults(records []knowledgecore.KnowledgeActionRecord, candidate, requirementID, requirementText string, evidence map[string]knowledgecore.KnowledgeCitation) bool {
+func knowledgeNegativeSearchFoundResults(records []knowledgecore.KnowledgeActionRecord, candidate, requirementID string, evidence map[string]knowledgecore.KnowledgeCitation) bool {
 	candidateNames := knowledgeCandidateSearchNames(candidate, evidence)
 	requirementID = strings.TrimSpace(requirementID)
 	for _, record := range records {
-		if record.Action != "search" || strings.TrimSpace(record.RequirementID) != requirementID || record.ResultCount <= 0 || knowledgeWorkspaceStillPending(record.WorkspaceStatus) || !knowledgeSearchCandidateMatches(record.Candidate, candidateNames) || !knowledgeSearchQueryMatchesRequirement(record.Query, requirementText, candidateNames) {
+		if record.Action != "search" || strings.TrimSpace(record.RequirementID) != requirementID || record.ResultCount <= 0 || record.WorkspaceStatus != knowledgeservice.KnowledgeWorkspaceReady || !knowledgeSearchCandidateMatches(record.Candidate, candidateNames) || knowledgeCandidateConditionQuery(record.Query, candidateNames) == "" {
 			continue
 		}
 		return true
@@ -944,36 +846,6 @@ func knowledgeSearchCandidateMatches(candidate string, candidateNames []string) 
 		}
 	}
 	return false
-}
-
-func knowledgeSearchQueryMatchesRequirement(query, requirementText string, candidateNames []string) bool {
-	query = strings.ToLower(knowledgeCandidateConditionQuery(query, candidateNames))
-	requirementText = strings.ToLower(knowledgeCandidateConditionQuery(knowledgeNegativeConditionProbe(requirementText), candidateNames))
-	if query == "" || requirementText == "" {
-		return false
-	}
-	requirementCompact := strings.Map(func(r rune) rune {
-		if unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r) {
-			return -1
-		}
-		return r
-	}, requirementText)
-	fields := knowledgeCandidateConditionFields(query)
-	if len(fields) == 0 {
-		return false
-	}
-	for _, field := range fields {
-		field = strings.Map(func(r rune) rune {
-			if unicode.IsSpace(r) || unicode.IsPunct(r) || unicode.IsSymbol(r) {
-				return -1
-			}
-			return r
-		}, field)
-		if field == "" || !strings.Contains(requirementCompact, field) {
-			return false
-		}
-	}
-	return true
 }
 
 func knowledgeNegativeConditionProbe(requirementText string) string {
@@ -1182,7 +1054,7 @@ func containsStringFold(values []string, want string) bool {
 
 func knowledgeRecallReturnedNoCandidates(records []knowledgecore.KnowledgeActionRecord) bool {
 	for _, record := range records {
-		if knowledgeWorkspaceStillPending(record.WorkspaceStatus) {
+		if record.WorkspaceStatus != knowledgeservice.KnowledgeWorkspaceReady {
 			continue
 		}
 		if record.Action == "search" && record.ResultCount > 0 {
@@ -1190,7 +1062,7 @@ func knowledgeRecallReturnedNoCandidates(records []knowledgecore.KnowledgeAction
 		}
 	}
 	for _, record := range records {
-		if record.Action == "search" && !knowledgeWorkspaceStillPending(record.WorkspaceStatus) {
+		if record.Action == "search" && record.WorkspaceStatus == knowledgeservice.KnowledgeWorkspaceReady {
 			return true
 		}
 	}
@@ -1410,7 +1282,7 @@ func coreToolDefinitions(knowledge bool) []ToolDefinition {
 	}
 	if knowledge {
 		definitions = append(definitions,
-			toolDefinition("knowledge", "Use deterministic project knowledge facts. Status distinguishes empty/queued/processing/ready/failed; a pending search is not proof of absence. Search/discover/list are navigation only; read/follow_links/graph return evidence. For multi-constraint identity questions, discover with the full requirements ranks common-subject entity candidates and should be preferred over repeated search paraphrases; preserve subject/object roles. Verify every positive requirement with a candidate-specific search carrying the same requirement_id, then read and cite one path returned by that search. Every submit call requires non-empty question, answer, candidate, the full requirements array, and exactly one check per requirement. A candidate-specific search must provide both candidate and requirement_id; keep candidate only as filtering metadata and use only the requirement's event terms in query. For a negative requirement, search the positive event that would disprove it, for example 到过 花果山. It resolves only as not_found_in_corpus after a current-turn zero-result candidate-specific search in a ready workspace; supported, citations that omit the event, a pending search, or a query padded with unrelated terms cannot resolve it. A matching hit conflicts with absence and must be read or refined before submission. Submit validates only the current turn's evidence ledger and returns validation_issues when incomplete; writeback explicitly saves a validated submission.", `{"type":"object","properties":{"action":{"enum":["status","search","discover","read","list","follow_links","graph","submit","writeback"]},"query":{"type":"string","description":"For candidate-specific searches, use only the matching requirement event terms and do not repeat candidate. For a negative requirement, use the positive disproof event terms and do not add unrelated terms."},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":50},"seed_paths":{"type":"array","items":{"type":"string"}},"requirements":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"kind":{"enum":["positive","negative"]}},"required":["id","text"]}},"question":{"type":"string","description":"Required and non-empty for action=submit."},"answer":{"type":"string","description":"Required and non-empty for action=submit."},"candidate":{"type":"string","description":"Required for action=submit; use the exact title or alias of the candidate wiki page read this turn. For candidate-specific searches, pass it only as filtering metadata."},"checks":{"type":"array","description":"Required for action=submit; provide exactly one check for every requirement. Positive supported checks must cite a path returned by the matching candidate-specific search and read afterward. Negative requirements require not_found_in_corpus, never supported.","items":{"type":"object","properties":{"requirement_id":{"type":"string"},"status":{"enum":["supported","contradicted","unknown","not_found_in_corpus"]},"evidence_paths":{"type":"array","items":{"type":"string"}},"explanation":{"type":"string"}},"required":["requirement_id","status"]}},"evidence_paths":{"type":"array","items":{"type":"string"}},"status":{"enum":["complete","incomplete"]},"requirement_id":{"type":"string","description":"Required together with candidate on every candidate-specific positive or negative search; must match the submitted requirement id."},"title":{"type":"string"},"submission":{"type":"object"}},"required":["action"]}`),
+			toolDefinition("knowledge", "Use deterministic project knowledge facts. Status distinguishes empty/queued/processing/ready/failed; a pending search is not proof of absence. Search/discover/list are navigation only; read/follow_links/graph return evidence. For multi-constraint identity questions, discover with the full requirements ranks common-subject entity candidates and should be preferred over repeated search paraphrases; preserve subject/object roles. Choose evidence actions freely; a current-turn read or graph result may support multiple requirements without a preceding search. A dedicated candidate page is not required. Every submit call requires non-empty question, answer, candidate, the full requirements array, and exactly one check per requirement. A candidate-specific search must provide both candidate and requirement_id; keep candidate only as filtering metadata and use only the requirement's event terms in query. For a negative requirement, search the positive event that would disprove it, for example 到过 花果山. Explicit negative evidence may resolve a supported check. Otherwise use not_found_in_corpus only after a current-turn relevant zero-result candidate-specific search in a ready workspace; omission in citations and pending searches cannot prove absence. A matching hit conflicts with absence and must be read or refined before submission. Submit validates only the current turn's evidence ledger and returns validation_issues when incomplete; writeback explicitly saves a validated submission.", `{"type":"object","properties":{"action":{"enum":["status","search","discover","read","list","follow_links","graph","submit","writeback"]},"query":{"type":"string","description":"For candidate-specific searches, use only the matching requirement event terms and do not repeat candidate. For a negative requirement, use the positive disproof event terms and do not add unrelated terms."},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":50},"seed_paths":{"type":"array","items":{"type":"string"}},"requirements":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"text":{"type":"string"},"kind":{"enum":["positive","negative"]}},"required":["id","text"]}},"question":{"type":"string","description":"Required and non-empty for action=submit."},"answer":{"type":"string","description":"Required and non-empty for action=submit."},"candidate":{"type":"string","description":"Required for action=submit; identify the candidate supported by current-turn evidence; a dedicated wiki page is not required. For candidate-specific searches, pass it only as filtering metadata."},"checks":{"type":"array","description":"Required for action=submit; provide exactly one check for every requirement. Supported checks must cite current-turn read, follow_links, or graph evidence. Negative supported checks need explicit negative evidence; omission only permits not_found_in_corpus after a relevant search.","items":{"type":"object","properties":{"requirement_id":{"type":"string"},"status":{"enum":["supported","contradicted","unknown","not_found_in_corpus"]},"evidence_paths":{"type":"array","items":{"type":"string"}},"explanation":{"type":"string"}},"required":["requirement_id","status"]}},"evidence_paths":{"type":"array","items":{"type":"string"}},"status":{"enum":["complete","incomplete"]},"requirement_id":{"type":"string","description":"Required together with candidate on every candidate-specific positive or negative search; must match the submitted requirement id."},"title":{"type":"string"},"submission":{"type":"object"}},"required":["action"]}`),
 		)
 	}
 	definitions = append(definitions, toolDefinition("background", "Run and manage long commands on the durable workspace computer.", `{"type":"object","properties":{"action":{"enum":["start","poll","write","stop","list","watch","unwatch"]},"command":{"type":"string"},"process_id":{"type":"string"},"data":{"type":"string"},"since_cursor":{"type":"integer"},"pattern":{"type":"string"},"instructions":{"type":"string"},"monitor_id":{"type":"string"},"wait_seconds":{"type":"integer"},"max_bytes":{"type":"integer"},"signal":{"enum":["TERM","KILL","INT","HUP","QUIT"]},"timeout_seconds":{"type":"integer"}},"required":["action"]}`))

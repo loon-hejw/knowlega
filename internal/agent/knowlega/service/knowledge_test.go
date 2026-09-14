@@ -175,6 +175,34 @@ func TestKnowledgeReadAndFollowResolveEverySupportedReferenceShape(t *testing.T)
 	}
 }
 
+func TestKnowledgeReadResolvesMovedPathBySameDirectoryAlias(t *testing.T) {
+	root := t.TempDir()
+	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	writeKnowledgeFixture(t, root, "wiki/entities/current.md", "---\ntitle: Current\ntype: entity\naliases: [old-name]\n---\n\nPreserved evidence.\n")
+	for _, target := range []string{"wiki/entities/old-name.md", "[[wiki/entities/old-name.md#Section|Old name]]"} {
+		doc, err := ReadProjectDocument(root, target)
+		if err != nil || doc.Path != "wiki/entities/current.md" {
+			t.Fatalf("target=%q path=%q err=%v", target, doc.Path, err)
+		}
+	}
+	for _, target := range []string{"wiki/concepts/old-name.md", "raw/sources/old-name.md", "wiki/../../old-name.md"} {
+		if _, err := ReadProjectDocument(root, target); err == nil {
+			t.Fatalf("unexpectedly resolved %q", target)
+		}
+	}
+	writeKnowledgeFixture(t, root, "wiki/entities/another.md", "---\ntitle: Another\ntype: entity\naliases: [old-name]\n---\n\nOther evidence.\n")
+	if _, err := ReadProjectDocument(root, "wiki/entities/old-name.md"); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("expected ambiguous alias error, got %v", err)
+	}
+	writeKnowledgeFixture(t, root, "wiki/entities/old-name.md", "---\ntitle: Exact\ntype: entity\n---\n\nExact evidence.\n")
+	doc, err := ReadProjectDocument(root, "wiki/entities/old-name.md")
+	if err != nil || doc.Path != "wiki/entities/old-name.md" {
+		t.Fatalf("exact file must win: path=%q err=%v", doc.Path, err)
+	}
+}
+
 func TestKnowledgeFollowLinksAcceptsRawSourcePath(t *testing.T) {
 	root := t.TempDir()
 	if err := wiki.InitProject(wiki.ProjectOptions{Path: root, Name: "test"}); err != nil {

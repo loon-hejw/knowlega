@@ -580,6 +580,7 @@ func resolveKnowledgeReadPath(projectPath, target string) (string, error) {
 	if target == "" {
 		return "", fmt.Errorf("knowledge read requires path")
 	}
+	aliasDir, aliasName := "", ""
 	if strings.HasPrefix(target, "wiki/") || strings.HasPrefix(target, "raw/sources/") {
 		rel, err := normalizeKnowledgeToolPath(target)
 		if err != nil {
@@ -587,6 +588,12 @@ func resolveKnowledgeReadPath(projectPath, target string) (string, error) {
 		}
 		if _, err := os.Stat(filepath.Join(projectPath, filepath.FromSlash(rel))); err == nil {
 			return rel, nil
+		} else if !os.IsNotExist(err) {
+			return "", err
+		}
+		if strings.HasPrefix(rel, "wiki/") && filepath.Ext(rel) == ".md" {
+			aliasDir = filepath.ToSlash(filepath.Dir(rel))
+			aliasName = knowledgeLinkID(filepath.Base(rel))
 		}
 	}
 	pages, err := wiki.ScanWikiPages(wiki.ScanOptions{ProjectPath: projectPath})
@@ -601,6 +608,22 @@ func resolveKnowledgeReadPath(projectPath, target string) (string, error) {
 			if knowledgeLinkID(key) == wanted {
 				matches = append(matches, page.Path)
 				break
+			}
+		}
+	}
+	// A moved page can retain its old filename as a frontmatter alias. Resolve
+	// missing explicit paths only within the requested directory, after exact
+	// references have been checked; never guess across page types or raw sources.
+	if len(matches) == 0 && aliasDir != "" {
+		for _, page := range pages {
+			if filepath.ToSlash(filepath.Dir(page.Path)) != aliasDir {
+				continue
+			}
+			for _, alias := range frontmatterStringList(page.Frontmatter, "aliases") {
+				if knowledgeLinkID(alias) == aliasName {
+					matches = append(matches, page.Path)
+					break
+				}
 			}
 		}
 	}

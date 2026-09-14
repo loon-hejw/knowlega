@@ -19,11 +19,6 @@ const (
 	duplicateActionLimit      = 3
 	knowledgeSubmitStallLimit = 3
 	knowledgeNoProgressLimit  = 12
-	knowledgePreSubmitLimit   = 24
-	// After enough navigation, give the model a tiny submit-only window so it
-	// cannot spend the remaining budget on more searches without producing a
-	// validation result.
-	knowledgeSubmitOnlyLimit  = 1
 	knowledgeBlockedToolLimit = 16
 	piConversationCharLimit   = 240000
 	piRecentFullMessageCount  = 24
@@ -85,6 +80,7 @@ type piKnowledgeValidation struct {
 	status                   string
 	unresolvedRequirementIDs []string
 	validationIssueCodes     []string
+	requirementText          map[string]string
 }
 
 type piKnowledgeResultPayload struct {
@@ -92,7 +88,11 @@ type piKnowledgeResultPayload struct {
 	Answer                   string   `json:"answer"`
 	Code                     string   `json:"code"`
 	UnresolvedRequirementIDs []string `json:"unresolved_requirement_ids"`
-	ValidationIssues         []struct {
+	Requirements             []struct {
+		ID   string `json:"id"`
+		Text string `json:"text"`
+	} `json:"requirements"`
+	ValidationIssues []struct {
 		Code string `json:"code"`
 	} `json:"validation_issues"`
 	Workspace struct {
@@ -233,11 +233,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 	knowledgeSubmitStalls := 0
 	knowledgeSubmitEvidence := -1
 	knowledgeNoProgress := 0
-	knowledgeCallsBeforeSubmit := 0
-	knowledgeSubmitAttempted := false
 	knowledgeFinalizationPrompted := false
-	knowledgeSubmitOnly := false
-	knowledgeSubmitOnlyAttempts := 0
 	knowledgeValidation := piKnowledgeValidation{}
 	knowledgeBlockedAtToolCall := -1
 	for step := 0; step < modelLimit && result.ModelCalls < modelLimit && toolCalls < toolLimit; step++ {
@@ -518,26 +514,9 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 				}
 				continue
 			}
-			if knowledgeSubmitOnly && knowledgeValidation.needsSubmit() && !knowledgeValidation.blocked && !knowledgeValidation.halt {
-				// Keep a bounded submit-only window even when the model emits
-				// prose instead of a tool call. Candidate text remains withheld
-				// until a complete submit is observed.
-				knowledgeSubmitOnlyAttempts++
-				if knowledgeSubmitOnlyAttempts >= knowledgeSubmitOnlyLimit || result.ModelCalls >= modelLimit || toolCalls >= toolLimit {
-					loopStopReason = "project knowledge validation did not produce a submit call"
-					break
-				}
-				messages = append(messages, PiMessage{Role: "user", Content: "[system] Submission mode is active. Do not answer or search/read. Call knowledge action=submit now with the full question, candidate, requirements, and exactly one check per requirement. The candidate is withheld until submit returns status=complete."})
-				if input.OnProgress != nil {
-					input.OnProgress(Progress{ToolCalls: toolCalls, ModelCalls: result.ModelCalls, EvidenceCount: result.EvidenceCount, ModelLimit: modelLimit, ToolLimit: toolLimit, Model: model, Step: step, Phase: "finalizing", Strategy: "submit", Stalled: true})
-				}
-				continue
-			}
 			if knowledgeValidation.needsSubmit() && !knowledgeValidation.halt && !knowledgeFinalizationPrompted && result.ModelCalls < modelLimit && toolCalls < toolLimit {
 				knowledgeFinalizationPrompted = true
-				knowledgeSubmitOnly = !knowledgeValidation.blocked
-				knowledgeSubmitOnlyAttempts = 0
-				messages = append(messages, PiMessage{Role: "user", Content: "[system] You attempted to finish before validating the project answer. Do not repeat the answer yet. Call knowledge action=submit now with the full question, answer, candidate, requirements, and exactly one check per requirement. If submit is incomplete, follow only its validation_issues."})
+				messages = append(messages, PiMessage{Role: "user", Content: "[system] You attempted to finish before validating the project answer. Do not repeat the answer yet. Call knowledge action=submit now with the full question, answer, candidate, requirements, and exactly one check per requirement. If submit is incomplete, use its validation_issues to choose evidence actions or correct the submission."})
 				if input.OnProgress != nil {
 					input.OnProgress(Progress{ToolCalls: toolCalls, ModelCalls: result.ModelCalls, EvidenceCount: result.EvidenceCount, ModelLimit: modelLimit, ToolLimit: toolLimit, Model: model, Step: step, Phase: "finalizing", Strategy: "submit", Stalled: true})
 				}
@@ -642,22 +621,11 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 			knowledgeAction := piKnowledgeAction(call)
 			if call.Name == "knowledge" {
 				if knowledgeAction == "submit" {
-					knowledgeSubmitAttempted = true
-					knowledgeCallsBeforeSubmit = 0
 					knowledgeFinalizationPrompted = false
-					knowledgeSubmitOnly = false
-					knowledgeSubmitOnlyAttempts = 0
-				} else if !knowledgeSubmitAttempted {
-					knowledgeCallsBeforeSubmit++
 				}
 			}
 			priorEvidence := result.EvidenceCount
-			if knowledgeSubmitOnly && knowledgeValidation.needsSubmit() && !knowledgeValidation.blocked && (call.Name != "knowledge" || knowledgeAction != "submit") {
-				// Once convergence has been requested, navigation is no longer
-				// useful. Feed a recoverable error back to the model so it can
-				// issue the required submit without bypassing the evidence gate.
-				toolResult = ToolResult{Content: []ToolContent{{Type: "text", Text: "[system] Submission mode is active; this action was skipped. Call knowledge action=submit now. Do not search, read, or use another tool."}}, IsError: true}
-			} else if approval {
+			if approval {
 				const reason = "strict posture: this tool call requires human approval"
 				result.PendingApprovals = append(result.PendingApprovals, PendingApproval{Command: call.Name, Reason: reason, Kind: "approval", ApprovalKey: "tool:" + call.Name})
 				result.PausedOnApproval = true
@@ -724,27 +692,11 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 				loopStopReason = "project knowledge workspace is not ready for validation"
 			}
 		}
-		knowledgeNeedsFinalization := !knowledgeValidation.submitComplete && (knowledgeNoProgress >= knowledgeNoProgressLimit || (!knowledgeSubmitAttempted && knowledgeCallsBeforeSubmit >= knowledgePreSubmitLimit))
-		if loopStopReason == "" && knowledgeNeedsFinalization {
-			if knowledgeSubmitOnly && knowledgeValidation.needsSubmit() && !knowledgeValidation.blocked && !knowledgeValidation.halt && !terminated && !result.PausedOnApproval && !result.Silent && result.ModelCalls < modelLimit && toolCalls < toolLimit {
-				knowledgeSubmitOnlyAttempts++
-				if knowledgeSubmitOnlyAttempts >= knowledgeSubmitOnlyLimit {
-					loopStopReason = "project knowledge validation did not produce a submit call"
-				} else {
-					knowledgeNoProgress = 0
-					knowledgeCallsBeforeSubmit = 0
-					messages = append(messages, PiMessage{Role: "user", Content: "[system] Submission mode is active. Stop all navigation and call knowledge action=submit now. Include exactly one check for every requirement; do not provide a final answer until status=complete."})
-					if input.OnProgress != nil {
-						input.OnProgress(Progress{ToolCalls: toolCalls, ModelCalls: result.ModelCalls, EvidenceCount: result.EvidenceCount, ModelLimit: modelLimit, ToolLimit: toolLimit, Model: model, Step: step, Phase: "finalizing", Strategy: "submit", Stalled: true})
-					}
-				}
-			} else if knowledgeValidation.needsSubmit() && !knowledgeValidation.halt && !knowledgeFinalizationPrompted && !terminated && !result.PausedOnApproval && !result.Silent && result.ModelCalls < modelLimit && toolCalls < toolLimit {
+		if loopStopReason == "" && !knowledgeValidation.submitComplete && knowledgeNoProgress >= knowledgeNoProgressLimit {
+			if knowledgeValidation.needsSubmit() && !knowledgeValidation.halt && !knowledgeFinalizationPrompted && !terminated && !result.PausedOnApproval && !result.Silent && result.ModelCalls < modelLimit && toolCalls < toolLimit {
 				knowledgeFinalizationPrompted = true
-				knowledgeSubmitOnly = !knowledgeValidation.blocked
-				knowledgeSubmitOnlyAttempts = 0
 				knowledgeNoProgress = 0
-				knowledgeCallsBeforeSubmit = 0
-				messages = append(messages, PiMessage{Role: "user", Content: "[system] Enough knowledge navigation has been attempted without a validation submission. Stop broad searching. Choose the best candidate supported by the evidence already collected and call knowledge action=submit now with the full question, answer, candidate, requirements, and exactly one check per requirement. If submit is incomplete, follow only its validation_issues."})
+				messages = append(messages, PiMessage{Role: "user", Content: "[system] Knowledge actions have not added evidence. Choose a targeted evidence action or correct the candidate and checks, then call knowledge action=submit. Do not give a definite answer until submit returns complete."})
 				if input.OnProgress != nil {
 					input.OnProgress(Progress{ToolCalls: toolCalls, ModelCalls: result.ModelCalls, EvidenceCount: result.EvidenceCount, ModelLimit: modelLimit, ToolLimit: toolLimit, Model: model, Step: step, Phase: "finalizing", Strategy: "submit", Stalled: true})
 				}
@@ -811,7 +763,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 		result.CompletionStatus = "incomplete"
 		result.Status = "incomplete"
 		result.Reason = loopStopReason
-		result.NextAction = "follow validation_issues and run the requested repair action"
+		result.NextAction = "补充未确认条件的证据或修正候选"
 		result.Partial = reply
 	}
 	if (result.ModelCalls >= modelLimit || toolCalls >= toolLimit) && reply == "" && !result.Silent && !result.PausedOnApproval {
@@ -854,7 +806,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 		if result.Reason == "" {
 			result.Reason = knowledgeValidation.reason()
 		}
-		result.NextAction = "follow validation_issues and submit again until status=complete"
+		result.NextAction = "补充未确认条件的证据后重新核验"
 		result.Partial = reply
 	}
 	if result.CompletionStatus == "" {
@@ -1022,6 +974,12 @@ func (s *piKnowledgeValidation) observe(action string, result ToolResult) {
 	var unresolved []string
 	var issues []string
 	for _, payload := range payloads {
+		if action == "submit" && len(payload.Requirements) > 0 {
+			s.requirementText = make(map[string]string, len(payload.Requirements))
+			for _, requirement := range payload.Requirements {
+				s.requirementText[requirement.ID] = requirement.Text
+			}
+		}
 		if value := strings.ToLower(strings.TrimSpace(payload.Status)); value != "" {
 			status = value
 		}
@@ -1110,19 +1068,23 @@ func (s piKnowledgeValidation) reason() string {
 }
 
 func (s piKnowledgeValidation) summary() string {
-	lines := []string{
-		"项目知识核验尚未完成，因此不能给出确定的候选答案。",
-		"当前验证状态：" + firstNonEmpty(s.status, "incomplete") + "。",
-	}
+	lines := []string{"目前的项目证据还不足以确认答案。"}
 	if len(s.unresolvedRequirementIDs) > 0 {
-		lines = append(lines, "未解决条件："+strings.Join(s.unresolvedRequirementIDs, "、")+"。")
+		labels := make([]string, 0, len(s.unresolvedRequirementIDs))
+		for _, id := range s.unresolvedRequirementIDs {
+			label := id
+			if text := strings.TrimSpace(s.requirementText[id]); text != "" {
+				label += "（" + text + "）"
+			}
+			labels = append(labels, label)
+		}
+		lines = append(lines, "尚未确认的条件："+strings.Join(labels, "、")+"。")
 	}
-	if len(s.validationIssueCodes) > 0 {
-		lines = append(lines, "验证问题："+strings.Join(s.validationIssueCodes, "、")+"。")
-	} else if s.needsSubmit() {
-		lines = append(lines, "验证问题：submit_required。")
+	if s.halt {
+		lines = append(lines, "项目知识暂时不可用，相关事实仍需核实。")
+	} else {
+		lines = append(lines, "需要补充这些条件的原文或关系证据后，才能给出确定结论。")
 	}
-	lines = append(lines, "请按 validation_issues 补齐本轮证据并重新提交；只有 knowledge submit 返回 status=complete 后才能给出结论。")
 	return strings.Join(lines, "\n")
 }
 

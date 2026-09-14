@@ -26,7 +26,7 @@ func TestProjectKnowledgePreparerAddsStaticInstructionsWithoutCallingTools(t *te
 	if tools.calls != 0 {
 		t.Fatalf("preparer called tools %d times", tools.calls)
 	}
-	for _, want := range []string{"single knowledge tool", "Search snippets", "common grammatical subject", "action=discover", "paraphrased searches", "reports pending", "raw sources", "do not guess a candidate", "action=submit", "returned status to be complete", "validation_issues", "present its candidate as the answer", "question, answer, candidate", "positive event", "unrelated extra conditions", "not enough for supported", "writeback"} {
+	for _, want := range []string{"single knowledge tool", "Search snippets", "common grammatical subject", "action=discover", "no prescribed sequence", "dedicated candidate entity page is not required", "reports pending", "raw sources", "do not guess a candidate", "action=submit", "returned status to be complete", "validation_issues", "present its candidate as the answer", "question, answer, candidate", "positive event", "unrelated extra conditions", "not enough for supported", "writeback"} {
 		if !strings.Contains(input.Environment, want) {
 			t.Fatalf("environment missing %q: %s", want, input.Environment)
 		}

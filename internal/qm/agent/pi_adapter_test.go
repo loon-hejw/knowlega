@@ -555,7 +555,7 @@ func TestPiAdapterStopsWhenKnowledgeValidationDoesNotAdvance(t *testing.T) {
 	if !strings.Contains(result.Reason, "validation did not advance") {
 		t.Fatalf("reason=%q", result.Reason)
 	}
-	if strings.Contains(result.Reply, "金鼻白毛老鼠精") || !strings.Contains(result.Reply, "未解决条件：9") || !strings.Contains(result.Reply, "negative_search_not_recorded") {
+	if strings.Contains(result.Reply, "金鼻白毛老鼠精") || !strings.Contains(result.Reply, "尚未确认的条件：9") || strings.Contains(result.Reply, "negative_search_not_recorded") {
 		t.Fatalf("unsafe incomplete reply=%q", result.Reply)
 	}
 }
@@ -583,7 +583,7 @@ func TestPiAdapterEvaluatesKnowledgeProgressAfterEntireToolBatch(t *testing.T) {
 		t.Fatalf("calls=%d requests=%d", tools.calls, len(transport.requests))
 	}
 	for _, message := range transport.requests[1].Messages {
-		if strings.Contains(message.Content, "Enough knowledge navigation") {
+		if strings.Contains(message.Content, "Knowledge actions have not added evidence") {
 			t.Fatalf("late evidence action should clear the batch stall: %#v", transport.requests[1].Messages)
 		}
 	}
@@ -612,7 +612,7 @@ func TestPiAdapterPromptsForSubmitBeforeStoppingStalledKnowledgeNavigation(t *te
 		t.Fatalf("calls=%d requests=%d", tools.calls, len(transport.requests))
 	}
 	lastMessage := transport.requests[1].Messages[len(transport.requests[1].Messages)-1]
-	if lastMessage.Role != "user" || !strings.Contains(lastMessage.Content, "call knowledge action=submit now") {
+	if lastMessage.Role != "user" || !strings.Contains(lastMessage.Content, "call knowledge action=submit") {
 		t.Fatalf("redirect=%#v", lastMessage)
 	}
 	redirected := false
@@ -624,9 +624,9 @@ func TestPiAdapterPromptsForSubmitBeforeStoppingStalledKnowledgeNavigation(t *te
 	}
 }
 
-func TestPiAdapterPromptsForSubmitAfterBoundedPreSubmitEvidenceCollection(t *testing.T) {
+func TestPiAdapterDoesNotForceSubmitWhileEvidenceAdvances(t *testing.T) {
 	transport := &fakePiTransport{completions: []PiCompletion{
-		{ToolCalls: knowledgeReadCalls(knowledgePreSubmitLimit)},
+		{ToolCalls: knowledgeReadCalls((knowledgeNoProgressLimit * 2))},
 		{ToolCalls: []ToolCall{{ID: "submit-after-evidence-limit", Name: "knowledge", Arguments: json.RawMessage(`{"action":"submit","question":"q"}`)}}},
 		{Text: "答案：候选。"},
 	}}
@@ -641,12 +641,13 @@ func TestPiAdapterPromptsForSubmitAfterBoundedPreSubmitEvidenceCollection(t *tes
 	if err != nil || result.Status == "incomplete" || result.Reply != "答案：候选。" {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
-	if tools.calls != knowledgePreSubmitLimit+1 || len(transport.requests) != 2 {
+	if tools.calls != (knowledgeNoProgressLimit*2)+1 || len(transport.requests) != 2 {
 		t.Fatalf("calls=%d requests=%d", tools.calls, len(transport.requests))
 	}
-	lastMessage := transport.requests[1].Messages[len(transport.requests[1].Messages)-1]
-	if lastMessage.Role != "user" || !strings.Contains(lastMessage.Content, "Enough knowledge navigation") || !strings.Contains(lastMessage.Content, "action=submit now") {
-		t.Fatalf("redirect=%#v", lastMessage)
+	for _, message := range transport.requests[1].Messages {
+		if strings.Contains(message.Content, "Knowledge actions have not added evidence") {
+			t.Fatalf("evidence collection triggered a premature submit reminder: %#v", message)
+		}
 	}
 }
 
@@ -720,7 +721,7 @@ func TestPiAdapterReplacesCandidateReturnedAfterIncompleteKnowledgeSubmit(t *tes
 	if strings.Contains(result.Reply, "金鼻白毛老鼠精") || len(deltas) != 0 {
 		t.Fatalf("reply=%q deltas=%#v", result.Reply, deltas)
 	}
-	if !strings.Contains(result.Reply, "未解决条件：9") || !strings.Contains(result.Reply, "negative_search_not_recorded") {
+	if !strings.Contains(result.Reply, "尚未确认的条件：9") || strings.Contains(result.Reply, "negative_search_not_recorded") {
 		t.Fatalf("incomplete details missing from reply=%q", result.Reply)
 	}
 }
@@ -1210,4 +1211,23 @@ func piTestModelsWithFallback() config.ModelsConfig {
 	models.Harnesses[0].ModelIDs = append(models.Harnesses[0].ModelIDs, "fallback-pi")
 	models.Harnesses[0].Runtime.FallbackModels = []string{"fallback-pi"}
 	return models
+}
+
+func TestPiAdapterAllowsEvidenceAfterSubmitReminder(t *testing.T) {
+	transport := &fakePiTransport{completions: []PiCompletion{
+		{ToolCalls: knowledgeSearchCalls(knowledgeNoProgressLimit)},
+		{ToolCalls: []ToolCall{{ID: "repair-read", Name: "knowledge", Arguments: json.RawMessage(`{"action":"read","path":"wiki/evidence.md"}`)}}},
+		{ToolCalls: []ToolCall{{ID: "submit", Name: "knowledge", Arguments: json.RawMessage(`{"action":"submit"}`)}}},
+	}}
+	adapter, _ := NewPiAdapter(piTestModels(), transport)
+	tools := &knowledgeNavigationTools{}
+	result, err := adapter.RunTurn(context.Background(), TurnInput{
+		SessionID: "repair-after-reminder", Input: "verify", SystemPrompt: "system", ScopeLabel: "group:web-project-p1", Model: "model-pi", Tools: tools,
+		Emit: func(_ context.Context, entry NewEntry) (SessionEntry, error) {
+			return SessionEntry{Sequence: 1, Type: entry.Type}, nil
+		},
+	})
+	if err != nil || result.Status == "incomplete" || tools.calls != knowledgeNoProgressLimit+2 || result.EvidenceCount == 0 {
+		t.Fatalf("repair was blocked: result=%+v calls=%d err=%v", result, tools.calls, err)
+	}
 }

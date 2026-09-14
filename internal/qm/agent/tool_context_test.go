@@ -457,7 +457,7 @@ func TestKnowledgeSubmitReportsRequiredCandidateRequirementsAndChecks(t *testing
 	}
 }
 
-func TestKnowledgePositiveSupportedRequiresMatchingCandidateSearchThenRead(t *testing.T) {
+func TestKnowledgePositiveSupportedAcceptsCurrentTurnEvidenceInAnyOrder(t *testing.T) {
 	base := knowledgecore.KnowledgeSubmission{
 		Question: "谁？", Answer: "唐僧", Candidate: "唐僧",
 		Requirements:  []knowledgecore.KnowledgeRequirement{{ID: "1", Text: "见过孙悟空", Kind: "positive"}},
@@ -471,8 +471,8 @@ func TestKnowledgePositiveSupportedRequiresMatchingCandidateSearchThenRead(t *te
 	withoutSearch := validateKnowledgeSubmission(base, knowledgeLedger{
 		Evidence: evidence, EvidenceSequence: map[string]int{"wiki/entities/tang.md": 1, "raw/sources/chapter-001.txt": 2},
 	})
-	if withoutSearch.Status != "incomplete" || !hasValidationIssue(withoutSearch.ValidationIssues, "positive_search_not_recorded", "1") {
-		t.Fatalf("positive check completed without matching search: %+v", withoutSearch)
+	if withoutSearch.Status != "complete" {
+		t.Fatalf("current-turn read should not need a matching search: %+v", withoutSearch)
 	}
 
 	search := knowledgecore.KnowledgeActionRecord{
@@ -482,11 +482,8 @@ func TestKnowledgePositiveSupportedRequiresMatchingCandidateSearchThenRead(t *te
 	readTooEarly := validateKnowledgeSubmission(base, knowledgeLedger{
 		Evidence: evidence, EvidenceSequence: map[string]int{"wiki/entities/tang.md": 1, "raw/sources/chapter-001.txt": 2}, Searches: []knowledgecore.KnowledgeActionRecord{search},
 	})
-	if readTooEarly.Status != "incomplete" || !hasValidationIssue(readTooEarly.ValidationIssues, "positive_evidence_not_read", "1") {
-		t.Fatalf("pre-search read satisfied positive check: %+v", readTooEarly)
-	}
-	if issue := validationIssue(readTooEarly.ValidationIssues, "positive_evidence_not_read", "1"); issue == nil || issue.Repair == nil || issue.Repair.Action != "read" || issue.Repair.Path != "raw/sources/chapter-001.txt" {
-		t.Fatalf("positive read repair missing: %+v", readTooEarly.ValidationIssues)
+	if readTooEarly.Status != "complete" {
+		t.Fatalf("pre-search read should satisfy positive check: %+v", readTooEarly)
 	}
 
 	validated := validateKnowledgeSubmission(base, knowledgeLedger{
@@ -585,29 +582,25 @@ func TestKnowledgeNegativeNotFoundReturnsRepairAction(t *testing.T) {
 	}
 }
 
-func TestKnowledgeNegativeRequirementCannotUseSupportedStatus(t *testing.T) {
+func TestKnowledgeNegativeRequirementAcceptsExplicitEvidence(t *testing.T) {
 	base := knowledgecore.KnowledgeSubmission{
 		Question: "谁？", Answer: "唐太宗", Candidate: "唐太宗",
 		Requirements:  []knowledgecore.KnowledgeRequirement{{ID: "9", Text: "不曾到过花果山", Kind: "negative"}},
-		Checks:        []knowledgecore.KnowledgeEvidenceCheck{{RequirementID: "9", Status: "supported", EvidencePaths: []string{"wiki/entities/tang-taizong.md"}}},
+		Checks:        []knowledgecore.KnowledgeEvidenceCheck{{RequirementID: "9", Status: "supported", Explanation: "原文明确陈述他未到过花果山", EvidencePaths: []string{"wiki/entities/tang-taizong.md"}}},
 		EvidencePaths: []string{"wiki/entities/tang-taizong.md"},
 	}
 	ledger := knowledgeLedger{
 		Evidence: map[string]knowledgecore.KnowledgeCitation{
 			"wiki/entities/tang-taizong.md": {Path: "wiki/entities/tang-taizong.md", Title: "唐太宗", Kind: "entity"},
 		},
-		Searches: []knowledgecore.KnowledgeActionRecord{{
-			Action: "search", Query: "到过 花果山", Candidate: "唐太宗", RequirementID: "9",
-			ResultCount: 0, WorkspaceStatus: knowledgeservice.KnowledgeWorkspaceReady,
-		}},
 	}
 	validated := validateKnowledgeSubmission(base, ledger)
-	if validated.Status != "incomplete" || !containsString(validated.UnresolvedRequirementIDs, "9") || !hasValidationIssue(validated.ValidationIssues, "negative_check_requires_not_found", "9") {
-		t.Fatalf("negative supported check bypassed absence validation: %+v", validated)
+	if validated.Status != "complete" {
+		t.Fatalf("explicit negative evidence should not need an absence search: %+v", validated)
 	}
 }
 
-func TestKnowledgeNegativeNotFoundRejectsPaddedSearchQuery(t *testing.T) {
+func TestKnowledgeNegativeNotFoundAllowsPiSelectedParaphrase(t *testing.T) {
 	base := knowledgecore.KnowledgeSubmission{
 		Question: "谁？", Answer: "唐太宗", Candidate: "唐太宗",
 		Requirements:  []knowledgecore.KnowledgeRequirement{{ID: "9", Text: "不曾到过花果山", Kind: "negative"}},
@@ -619,13 +612,13 @@ func TestKnowledgeNegativeNotFoundRejectsPaddedSearchQuery(t *testing.T) {
 			"wiki/entities/tang-taizong.md": {Path: "wiki/entities/tang-taizong.md", Title: "唐太宗", Kind: "entity"},
 		},
 		Searches: []knowledgecore.KnowledgeActionRecord{{
-			Action: "search", Query: "到过 花果山 皇帝", Candidate: "唐太宗", RequirementID: "9",
+			Action: "search", Query: "踏足水帘洞", Candidate: "唐太宗", RequirementID: "9",
 			ResultCount: 0, WorkspaceStatus: knowledgeservice.KnowledgeWorkspaceReady,
 		}},
 	}
 	validated := validateKnowledgeSubmission(base, ledger)
-	if validated.Status != "incomplete" || !hasValidationIssue(validated.ValidationIssues, "negative_search_not_recorded", "9") {
-		t.Fatalf("padded zero-result query was accepted: %+v", validated)
+	if validated.Status != "complete" {
+		t.Fatalf("Pi-selected paraphrase was rejected: %+v", validated)
 	}
 }
 
@@ -742,7 +735,7 @@ func TestKnowledgeSubmitRejectsMalformedRequirementAndCheckIDs(t *testing.T) {
 	}
 }
 
-func TestKnowledgeSubmitMultiConditionRequiresReadCandidatePage(t *testing.T) {
+func TestKnowledgeSubmitMultiConditionAcceptsSharedRawEvidence(t *testing.T) {
 	base := knowledgecore.KnowledgeSubmission{
 		Question: "谁符合？", Answer: "唐僧", Candidate: "唐僧",
 		Requirements: []knowledgecore.KnowledgeRequirement{{ID: "1", Text: "取经成员"}, {ID: "2", Text: "师父"}},
@@ -763,8 +756,8 @@ func TestKnowledgeSubmitMultiConditionRequiresReadCandidatePage(t *testing.T) {
 		},
 	}
 	validated := validateKnowledgeSubmission(base, ledger)
-	if validated.Status != "incomplete" {
-		t.Fatalf("multi-condition candidate completed without reading its page: %+v", validated)
+	if validated.Status != "complete" {
+		t.Fatalf("shared raw evidence should not require a candidate page: %+v", validated)
 	}
 
 	ledger.Evidence["wiki/entities/tang.md"] = knowledgecore.KnowledgeCitation{Path: "wiki/entities/tang.md", Title: "唐僧", Kind: "entity"}
@@ -796,4 +789,24 @@ func validationIssue(issues []knowledgecore.KnowledgeValidationIssue, code, requ
 		}
 	}
 	return nil
+}
+
+func TestKnowledgeNineRequirementsReuseEvidenceAndRejectForgedPaths(t *testing.T) {
+	base := knowledgecore.KnowledgeSubmission{Question: "Which candidate satisfies nine conditions?", Answer: "Candidate", Candidate: "Candidate"}
+	for i := 1; i <= 9; i++ {
+		id := fmt.Sprint(i)
+		base.Requirements = append(base.Requirements, knowledgecore.KnowledgeRequirement{ID: id, Text: "condition " + id})
+		base.Checks = append(base.Checks, knowledgecore.KnowledgeEvidenceCheck{RequirementID: id, Status: "supported", EvidencePaths: []string{"raw/sources/evidence.txt"}})
+	}
+	ledger := knowledgeLedger{Evidence: map[string]knowledgecore.KnowledgeCitation{"raw/sources/evidence.txt": {Path: "raw/sources/evidence.txt", Kind: "raw-source"}}}
+	if got := validateKnowledgeSubmission(base, ledger); got.Status != "complete" {
+		t.Fatalf("shared current-turn evidence rejected: %+v", got)
+	}
+	base.Checks[8].EvidencePaths = append(base.Checks[8].EvidencePaths, "wiki/invented.md")
+	if got := validateKnowledgeSubmission(base, ledger); got.Status != "incomplete" || !hasValidationIssue(got.ValidationIssues, "evidence_not_in_current_turn", "9") {
+		t.Fatalf("mixed real and invented citations accepted: %+v", got)
+	}
+	if got := validateKnowledgeSubmission(base, knowledgeLedger{}); got.Status != "incomplete" || len(got.UnresolvedRequirementIDs) != 9 {
+		t.Fatalf("previous-turn evidence accepted: %+v", got)
+	}
 }
