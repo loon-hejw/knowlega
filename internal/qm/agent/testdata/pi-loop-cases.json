@@ -1,0 +1,118 @@
+[
+  {
+    "name": "complete submit continues",
+    "payload": "{\"status\":\"complete\",\"answer\":\"draft\"}",
+    "completions": [
+      {
+        "calls": [
+          {
+            "id": "1",
+            "action": "submit"
+          }
+        ]
+      },
+      {
+        "text": "model final"
+      }
+    ]
+  },
+  {
+    "name": "incomplete submit continues",
+    "payload": "{\"status\":\"incomplete\"}",
+    "completions": [
+      {
+        "calls": [
+          {
+            "id": "1",
+            "action": "submit"
+          }
+        ]
+      },
+      {
+        "text": "evidence is insufficient"
+      }
+    ]
+  },
+  {
+    "name": "recoverable error",
+    "payload": "page not found",
+    "failed": true,
+    "completions": [
+      {
+        "calls": [
+          {
+            "id": "1",
+            "action": "read"
+          }
+        ]
+      },
+      {
+        "calls": [
+          {
+            "id": "2",
+            "action": "search"
+          }
+        ]
+      },
+      {
+        "text": "model final"
+      }
+    ]
+  },
+  {
+    "name": "repeated calls",
+    "payload": "ok",
+    "completions": [
+      {
+        "calls": [
+          {
+            "id": "1",
+            "action": "read"
+          },
+          {
+            "id": "2",
+            "action": "read"
+          },
+          {
+            "id": "3",
+            "action": "read"
+          },
+          {
+            "id": "4",
+            "action": "read"
+          }
+        ]
+      },
+      {
+        "text": "model final"
+      }
+    ]
+  },
+  {
+    "name": "truncated arguments",
+    "payload": "ok",
+    "completions": [
+      {
+        "stopReason": "length",
+        "calls": [
+          {
+            "id": "1",
+            "action": "read"
+          }
+        ]
+      },
+      {
+        "text": "model final"
+      }
+    ]
+  },
+  {
+    "name": "empty model end",
+    "payload": "ok",
+    "completions": [
+      {
+        "text": ""
+      }
+    ]
+  }
+]

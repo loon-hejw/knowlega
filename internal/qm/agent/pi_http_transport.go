@@ -486,7 +486,8 @@ func parseOpenAIPiResponse(data []byte) (PiCompletion, error) {
 	var response struct {
 		Model   string `json:"model"`
 		Choices []struct {
-			Message struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
 				Content          json.RawMessage `json:"content"`
 				ReasoningContent string          `json:"reasoning_content"`
 				ToolCalls        []struct {
@@ -512,12 +513,10 @@ func parseOpenAIPiResponse(data []byte) (PiCompletion, error) {
 		return PiCompletion{}, errors.New("OpenAI response contained no choices")
 	}
 	choice := response.Choices[0].Message
-	completion := PiCompletion{Text: openAIPiText(choice.Content), Thinking: choice.ReasoningContent, Model: response.Model, Usage: PiUsage{Input: response.Usage.PromptTokens, Output: response.Usage.CompletionTokens, CacheRead: response.Usage.PromptTokensDetails.CachedTokens}}
+	completion := PiCompletion{StopReason: response.Choices[0].FinishReason, Text: openAIPiText(choice.Content), Thinking: choice.ReasoningContent, Model: response.Model, Usage: PiUsage{Input: response.Usage.PromptTokens, Output: response.Usage.CompletionTokens, CacheRead: response.Usage.PromptTokensDetails.CachedTokens}}
 	for _, call := range choice.ToolCalls {
 		arguments := json.RawMessage(call.Function.Arguments)
-		if !json.Valid(arguments) {
-			arguments = json.RawMessage(`{}`)
-		}
+		arguments = piToolArguments(arguments)
 		completion.ToolCalls = append(completion.ToolCalls, ToolCall{ID: call.ID, Name: call.Function.Name, Arguments: arguments})
 	}
 	if completion.Text == "" && len(completion.ToolCalls) == 0 && completion.Thinking == "" {
@@ -528,8 +527,9 @@ func parseOpenAIPiResponse(data []byte) (PiCompletion, error) {
 
 func parseAnthropicPiResponse(data []byte) (PiCompletion, error) {
 	var response struct {
-		Model   string `json:"model"`
-		Content []struct {
+		Model      string `json:"model"`
+		StopReason string `json:"stop_reason"`
+		Content    []struct {
 			Type, Text, Thinking, ID, Name string
 			Input                          json.RawMessage `json:"input"`
 		} `json:"content"`
@@ -544,7 +544,7 @@ func parseAnthropicPiResponse(data []byte) (PiCompletion, error) {
 		return PiCompletion{}, fmt.Errorf("decode Anthropic response: %w", err)
 	}
 	var texts, thinking []string
-	completion := PiCompletion{Model: response.Model, Usage: PiUsage{Input: response.Usage.InputTokens, Output: response.Usage.OutputTokens, CacheRead: response.Usage.CacheReadInputTokens, CacheWrite: response.Usage.CacheCreationInputTokens}}
+	completion := PiCompletion{StopReason: response.StopReason, Model: response.Model, Usage: PiUsage{Input: response.Usage.InputTokens, Output: response.Usage.OutputTokens, CacheRead: response.Usage.CacheReadInputTokens, CacheWrite: response.Usage.CacheCreationInputTokens}}
 	for _, block := range response.Content {
 		switch block.Type {
 		case "text":
@@ -552,9 +552,7 @@ func parseAnthropicPiResponse(data []byte) (PiCompletion, error) {
 		case "thinking":
 			thinking = append(thinking, block.Thinking)
 		case "tool_use":
-			if !json.Valid(block.Input) {
-				block.Input = json.RawMessage(`{}`)
-			}
+			block.Input = piToolArguments(block.Input)
 			completion.ToolCalls = append(completion.ToolCalls, ToolCall{ID: block.ID, Name: block.Name, Arguments: block.Input})
 		}
 	}
@@ -583,7 +581,8 @@ func parseOpenAIPiStream(reader io.Reader, onDelta func(string), onTextBlockStar
 		var event struct {
 			Model   string `json:"model"`
 			Choices []struct {
-				Delta struct {
+				FinishReason string `json:"finish_reason"`
+				Delta        struct {
 					Content          json.RawMessage `json:"content"`
 					ReasoningContent string          `json:"reasoning_content"`
 					ToolCalls        []struct {
@@ -614,6 +613,9 @@ func parseOpenAIPiStream(reader io.Reader, onDelta func(string), onTextBlockStar
 			completion.Usage = PiUsage{Input: event.Usage.PromptTokens, Output: event.Usage.CompletionTokens, CacheRead: event.Usage.PromptDetails.CachedTokens}
 		}
 		for _, choice := range event.Choices {
+			if choice.FinishReason != "" {
+				completion.StopReason = choice.FinishReason
+			}
 			delta := openAIPiDeltaText(choice.Delta.Content)
 			if delta != "" {
 				if !textStarted {
@@ -653,9 +655,7 @@ func parseOpenAIPiStream(reader io.Reader, onDelta func(string), onTextBlockStar
 	for _, index := range order {
 		call := calls[index]
 		arguments := json.RawMessage(call.arguments)
-		if !json.Valid(arguments) {
-			arguments = json.RawMessage(`{}`)
-		}
+		arguments = piToolArguments(arguments)
 		completion.ToolCalls = append(completion.ToolCalls, ToolCall{ID: call.id, Name: call.name, Arguments: arguments})
 	}
 	if completion.Text == "" && len(completion.ToolCalls) == 0 && completion.Thinking == "" {
@@ -749,6 +749,7 @@ func parseAnthropicPiStream(reader io.Reader, onDelta func(string), onTextBlockS
 				block.input += event.Delta.PartialJSON
 			}
 		case "message_delta":
+			completion.StopReason = event.Delta.StopReason
 			if event.Usage.OutputTokens != 0 {
 				completion.Usage.Output = event.Usage.OutputTokens
 			}
@@ -764,9 +765,7 @@ func parseAnthropicPiStream(reader io.Reader, onDelta func(string), onTextBlockS
 			continue
 		}
 		arguments := json.RawMessage(block.input)
-		if !json.Valid(arguments) {
-			arguments = json.RawMessage(`{}`)
-		}
+		arguments = piToolArguments(arguments)
 		completion.ToolCalls = append(completion.ToolCalls, ToolCall{ID: block.id, Name: block.name, Arguments: arguments})
 	}
 	if completion.Text == "" && len(completion.ToolCalls) == 0 && completion.Thinking == "" {
@@ -921,4 +920,17 @@ func piEffort(level string) string {
 	default:
 		return strings.TrimSpace(strings.ToLower(level))
 	}
+}
+
+// Preserve malformed JSON as a JSON string so it can be recorded and returned
+// to the model without corrupting the transcript. Object validation rejects it.
+func piToolArguments(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return json.RawMessage(`{}`)
+	}
+	if json.Valid(raw) {
+		return raw
+	}
+	encoded, _ := json.Marshal(string(raw))
+	return encoded
 }

@@ -77,9 +77,10 @@ type ToolOptions struct {
 }
 
 type ToolDefinition struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
-	InputSchema json.RawMessage `json:"inputSchema"`
+	ExecutionMode string          `json:"executionMode,omitempty"`
+	Name          string          `json:"name"`
+	Description   string          `json:"description"`
+	InputSchema   json.RawMessage `json:"inputSchema"`
 }
 
 type ToolCall struct {

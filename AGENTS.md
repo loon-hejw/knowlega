@@ -108,6 +108,7 @@ Borrow these behaviors:
   exposes one deterministic `knowledge` tool and must not run a nested query
   model, hidden classifier, candidate-hypothesis/audit pipeline, verifier, or
   fixed multi-pass query workflow.
+- Pi follows the pinned TypeScript Pi loop: knowledge `submit` is optional self-check feedback and never terminates a turn or replaces the model reply. The model chooses evidence actions and explains uncertainty. Only explicit wiki writeback requires a complete validated submission. Do not add knowledge-specific retry counters or forced-submit/final-answer gates.
 - The `knowledge` actions are `status`, `search`, `discover`, `read`, `list`,
   `follow_links`, `graph`, `submit`, and `writeback`. `search`, `discover`, and
   `list` are navigation only. Only `read`, `follow_links`, and `graph` create

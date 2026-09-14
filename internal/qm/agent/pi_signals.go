@@ -13,6 +13,7 @@ type piSignalController struct {
 	input       TurnInput
 	cancelModel context.CancelFunc
 	steers      chan TurnSignal
+	followUps   chan TurnSignal
 	cancelPoll  context.CancelFunc
 	done        chan struct{}
 	aborted     atomic.Bool
@@ -23,7 +24,7 @@ func startPiSignals(ctx context.Context, input TurnInput, cancelModel context.Ca
 		return nil
 	}
 	pollCtx, cancelPoll := context.WithCancel(ctx)
-	controller := &piSignalController{input: input, cancelModel: cancelModel, steers: make(chan TurnSignal, 64), cancelPoll: cancelPoll, done: make(chan struct{})}
+	controller := &piSignalController{input: input, cancelModel: cancelModel, steers: make(chan TurnSignal, 64), followUps: make(chan TurnSignal, 64), cancelPoll: cancelPoll, done: make(chan struct{})}
 	go controller.run(pollCtx)
 	return controller
 }
@@ -57,8 +58,12 @@ func (c *piSignalController) poll(ctx context.Context) {
 			if signal.Text == "" {
 				continue
 			}
+			queue := c.steers
+			if signal.Kind == "followUp" {
+				queue = c.followUps
+			}
 			select {
-			case c.steers <- signal:
+			case queue <- signal:
 			case <-ctx.Done():
 				return
 			}
@@ -78,10 +83,21 @@ func (c *piSignalController) applySteers(ctx context.Context, input TurnInput, m
 	if c == nil {
 		return 0, nil
 	}
+	return c.applyQueued(ctx, input, messages, c.steers)
+}
+
+func (c *piSignalController) applyFollowUps(ctx context.Context, input TurnInput, messages *[]PiMessage) (int, error) {
+	if c == nil {
+		return 0, nil
+	}
+	return c.applyQueued(ctx, input, messages, c.followUps)
+}
+
+func (c *piSignalController) applyQueued(ctx context.Context, input TurnInput, messages *[]PiMessage, queue <-chan TurnSignal) (int, error) {
 	count := 0
 	for {
 		select {
-		case signal := <-c.steers:
+		case signal := <-queue:
 			payload := map[string]any{"text": signal.Text, "steered": true}
 			var source map[string]json.RawMessage
 			if json.Unmarshal(signal.Payload, &source) == nil {

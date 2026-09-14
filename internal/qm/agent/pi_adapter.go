@@ -13,16 +13,9 @@ import (
 )
 
 const (
-	defaultPiSoftModelCalls   = 48
-	defaultPiMaxModelCalls    = 96
-	defaultPiMaxToolCalls     = 128
-	duplicateActionLimit      = 3
-	knowledgeSubmitStallLimit = 3
-	knowledgeNoProgressLimit  = 12
-	knowledgeBlockedToolLimit = 16
-	piConversationCharLimit   = 240000
-	piRecentFullMessageCount  = 24
-	piOldMessageCharLimit     = 1400
+	defaultPiSoftModelCalls = 48
+	defaultPiMaxModelCalls  = 96
+	defaultPiMaxToolCalls   = 128
 )
 
 type PiMessage struct {
@@ -55,6 +48,7 @@ type PiCompletion struct {
 	ToolCalls             []ToolCall
 	Request               json.RawMessage
 	Truncated             bool
+	StopReason            string
 	Transport             json.RawMessage
 	Usage                 PiUsage
 	TTFTMS, DurationMS    *int
@@ -69,36 +63,6 @@ type PiAdapter struct {
 	models    config.ModelsConfig
 	harness   config.ModelHarnessConfig
 	transport PiModelTransport
-}
-
-type piKnowledgeValidation struct {
-	blocked                  bool
-	halt                     bool
-	knowledgeUsed            bool
-	submitComplete           bool
-	answer                   string
-	status                   string
-	unresolvedRequirementIDs []string
-	validationIssueCodes     []string
-	requirementText          map[string]string
-}
-
-type piKnowledgeResultPayload struct {
-	Status                   string   `json:"status"`
-	Answer                   string   `json:"answer"`
-	Code                     string   `json:"code"`
-	UnresolvedRequirementIDs []string `json:"unresolved_requirement_ids"`
-	Requirements             []struct {
-		ID   string `json:"id"`
-		Text string `json:"text"`
-	} `json:"requirements"`
-	ValidationIssues []struct {
-		Code string `json:"code"`
-	} `json:"validation_issues"`
-	Workspace struct {
-		Status string `json:"status"`
-	} `json:"workspace"`
-	WorkspaceStatus string `json:"workspace_status"`
 }
 
 func NewPiAdapter(models config.ModelsConfig, transport PiModelTransport) (*PiAdapter, error) {
@@ -194,13 +158,6 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 		}
 	}
 	definitions = piLifecycleTools(definitions, input.SurfaceTools)
-	knowledgeToolAvailable := false
-	for _, definition := range definitions {
-		if definition.Name == "knowledge" {
-			knowledgeToolAvailable = true
-			break
-		}
-	}
 	compileMS := int(time.Since(compileStarted).Milliseconds())
 	if input.RecordModelCall != nil {
 		input.RecordModelCall(ModelCallRecord{Model: model, InputTokens: estimatePiTokens(input.SystemPrompt, messages), EntryCount: historyEntryCount(input.History)})
@@ -221,30 +178,13 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 	result.ModelLimit, result.ToolLimit = modelLimit, toolLimit
 	var reply string
 	var previousEnd time.Time
-	terminatedTurn := false
 	toolCalls := 0
 	tokens := 0
-	emptyEndingRetried := false
-	lastActions := map[string]int{}
 	softBudgetPrompted := false
-	stalledPrompted := false
 	fallbackAttempted := false
 	loopStopReason := ""
-	knowledgeSubmitStalls := 0
-	knowledgeSubmitEvidence := -1
-	knowledgeNoProgress := 0
-	knowledgeFinalizationPrompted := false
-	knowledgeValidation := piKnowledgeValidation{}
-	knowledgeBlockedAtToolCall := -1
 	for step := 0; step < modelLimit && result.ModelCalls < modelLimit && toolCalls < toolLimit; step++ {
-		if knowledgeValidation.halt {
-			loopStopReason = "project knowledge workspace is not ready for validation"
-			break
-		}
-		if knowledgeValidation.blocked && knowledgeBlockedAtToolCall >= 0 && toolCalls-knowledgeBlockedAtToolCall >= knowledgeBlockedToolLimit {
-			loopStopReason = "project knowledge validation is blocked after bounded evidence collection"
-			break
-		}
+
 		if _, err := signals.applySteers(turnCtx, input, &messages); err != nil {
 			return TurnResult{}, err
 		}
@@ -287,18 +227,33 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 			input.OnProgress(Progress{ToolCalls: toolCalls, ModelCalls: result.ModelCalls, EvidenceCount: result.EvidenceCount, ModelLimit: modelLimit, ToolLimit: toolLimit, Model: model, Tokens: tokens, Step: step, Phase: "thinking", Strategy: "reason"})
 		}
 		if result.ModelCalls >= softModelLimit && !softBudgetPrompted {
-			messages = append(messages, PiMessage{Role: "user", Content: "[system] The execution budget is nearly exhausted. Stop broad searching, use only missing evidence actions, submit the current verification, and provide the best supported answer now."})
+			messages = append(messages, PiMessage{Role: "user", Content: "[system] The execution budget is nearly exhausted. Finish the current task within the remaining budget; explain any unfinished work honestly."})
 			softBudgetPrompted = true
 			if input.OnProgress != nil {
 				input.OnProgress(Progress{ToolCalls: toolCalls, ModelCalls: result.ModelCalls, EvidenceCount: result.EvidenceCount, ModelLimit: modelLimit, ToolLimit: toolLimit, Model: model, Step: step, Phase: "finalizing", Strategy: "submit"})
 			}
 		}
-		suppressModelText := knowledgeValidation.blocked
 		bufferedModelText := []string{}
 		bufferedTextBlockStart := false
 		streamedModelText := 0
 		streamedTextBlockStart := false
-		requestMessages := compactPiMessages(messages, piConversationCharLimit)
+		requestMessages, compaction, contextErr := a.preparePiContext(modelCtx, model, input, messages, modelDefinition.ContextWindow)
+		if contextErr != nil {
+			return TurnResult{}, &NonRetryableError{Err: contextErr}
+		}
+		if compaction != nil {
+			result.ModelCalls++
+			result.CacheUsage = addPiCacheUsage(result.CacheUsage, compaction.Usage)
+			messages = requestMessages
+			payload, _ := json.Marshal(map[string]any{"kind": "compaction", "summary": compaction.Text})
+			if !writePiTape(turnCtx, input, TapeRecord{Kind: "annotation", Harness: "pi", ScopeLabel: input.ScopeLabel, Payload: payload}) {
+				result.TapeWriteFailed = true
+			}
+			if result.ModelCalls >= modelLimit {
+				loopStopReason = "model budget reached during context compaction"
+				break
+			}
+		}
 		completion, err := a.transport.Complete(modelCtx, PiCompletionRequest{
 			Model: model, SystemPrompt: input.SystemPrompt, Messages: requestMessages, Tools: definitions,
 			MaxOutputTokens: a.models.Request.MaxOutputTokens, DisableThinking: a.models.Request.DisableThinking,
@@ -312,13 +267,13 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 		}, func(delta string) {
 			partialReply += delta
 			bufferedModelText = append(bufferedModelText, delta)
-			if !knowledgeToolAvailable && !knowledgeValidation.withholdModelText() && input.OnDelta != nil {
+			if input.OnDelta != nil {
 				input.OnDelta(delta)
 				streamedModelText++
 			}
 		}, func() {
 			bufferedTextBlockStart = true
-			if !knowledgeToolAvailable && !knowledgeValidation.withholdModelText() && input.OnTextBlockStart != nil {
+			if input.OnTextBlockStart != nil {
 				input.OnTextBlockStart()
 				streamedTextBlockStart = true
 			}
@@ -326,9 +281,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 		if err != nil {
 			if signals != nil && signals.aborted.Load() {
 				reply := partialReply
-				if knowledgeValidation.withholdModelText() {
-					reply = knowledgeValidation.summary()
-				}
+
 				if strings.TrimSpace(reply) == "" {
 					reply = "(stopped)"
 				}
@@ -431,18 +384,8 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 		if input.OnProgress != nil {
 			input.OnProgress(Progress{ToolCalls: toolCalls, ModelCalls: result.ModelCalls, EvidenceCount: result.EvidenceCount, ModelLimit: modelLimit, ToolLimit: toolLimit, Model: model, Tokens: tokens, Step: step, Phase: "working", Strategy: "tools"})
 		}
-		completionHasKnowledge := false
-		for _, call := range completion.ToolCalls {
-			completionHasKnowledge = completionHasKnowledge || call.Name == "knowledge"
-			if call.Name == "knowledge" {
-				knowledgeValidation.noteCall(piKnowledgeAction(call))
-			}
-		}
-		deferModelText := completionHasKnowledge
 		emitBufferedModelContent := func() error {
-			if knowledgeValidation.withholdModelText() {
-				return nil
-			}
+
 			if bufferedTextBlockStart && !streamedTextBlockStart && input.OnTextBlockStart != nil {
 				input.OnTextBlockStart()
 			}
@@ -468,10 +411,8 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 			}
 			return nil
 		}
-		if !deferModelText {
-			if err := emitBufferedModelContent(); err != nil {
-				return TurnResult{}, err
-			}
+		if err := emitBufferedModelContent(); err != nil {
+			return TurnResult{}, err
 		}
 		stepGap := optionalMilliseconds(started.Sub(previousEnd), !previousEnd.IsZero())
 		duration := completion.DurationMS
@@ -494,9 +435,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 		previousEnd = time.Now()
 		result.CacheUsage = addPiCacheUsage(result.CacheUsage, completion.Usage)
 		assistantContent := completion.Text
-		if suppressModelText || knowledgeValidation.withholdModelText() || completionHasKnowledge {
-			assistantContent = ""
-		}
+
 		assistantMessage := PiMessage{Role: "assistant", Content: assistantContent, ToolCalls: completion.ToolCalls}
 		messages = append(messages, assistantMessage)
 		if !writePiTape(turnCtx, input, TapeRecord{Kind: "message", Harness: "pi", ScopeLabel: input.ScopeLabel, Payload: piTapeMessage(assistantMessage)}) {
@@ -506,7 +445,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 			if steered, err := signals.applySteers(turnCtx, input, &messages); err != nil {
 				return TurnResult{}, err
 			} else if steered > 0 {
-				if !knowledgeValidation.withholdModelText() && completion.Text != "" {
+				if completion.Text != "" {
 					payload, _ := json.Marshal(map[string]string{"text": completion.Text})
 					if _, err := input.Emit(turnCtx, NewEntry{Type: "text", Payload: payload, ScopeLabel: input.ScopeLabel}); err != nil {
 						return TurnResult{}, err
@@ -514,59 +453,22 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 				}
 				continue
 			}
-			if knowledgeValidation.needsSubmit() && !knowledgeValidation.halt && !knowledgeFinalizationPrompted && result.ModelCalls < modelLimit && toolCalls < toolLimit {
-				knowledgeFinalizationPrompted = true
-				messages = append(messages, PiMessage{Role: "user", Content: "[system] You attempted to finish before validating the project answer. Do not repeat the answer yet. Call knowledge action=submit now with the full question, answer, candidate, requirements, and exactly one check per requirement. If submit is incomplete, use its validation_issues to choose evidence actions or correct the submission."})
-				if input.OnProgress != nil {
-					input.OnProgress(Progress{ToolCalls: toolCalls, ModelCalls: result.ModelCalls, EvidenceCount: result.EvidenceCount, ModelLimit: modelLimit, ToolLimit: toolLimit, Model: model, Step: step, Phase: "finalizing", Strategy: "submit", Stalled: true})
-				}
-				continue
-			}
-			if strings.TrimSpace(completion.Text) == "" && !emptyEndingRetried && !input.SurfaceTools && (result.ModelCalls > 1 || !input.PollFire) {
-				note := "[system] The turn ended with an empty message. If the work above is unfinished, continue it — without redoing steps that already succeeded; otherwise reply with your answer now."
-				if input.PollFire {
-					note = "[system] The turn ended with an empty message. If the work above produced something worth reporting (or is still mid-flight), reply with a brief status now; if there is genuinely nothing to report, call finish_silently."
-				}
-				emptyEndingRetried = true
-				messages = append(messages, PiMessage{Role: "user", Content: note})
+
+			if followed, err := signals.applyFollowUps(turnCtx, input, &messages); err != nil {
+				return TurnResult{}, err
+			} else if followed > 0 {
 				continue
 			}
 			reply = completion.Text
 			break
 		}
 		terminated := false
+		parallelResults, err := parallelPiTools(turnCtx, input, definitions, completion.ToolCalls, allowedToolCalls, completion.StopReason == "length" || completion.StopReason == "max_tokens")
+		if err != nil {
+			return TurnResult{}, err
+		}
 		for callIndex, call := range completion.ToolCalls {
-			if knowledgeValidation.submitComplete {
-				toolResult := piRuntimeSkipResult("post_validation_call_skipped", "[system] Project knowledge validation is already complete; this later action was skipped.", 1)
-				text := toolResultText(toolResult)
-				if _, err := input.Emit(turnCtx, NewEntry{Type: "tool_call", Payload: callPayloadForPi(call), ScopeLabel: input.ScopeLabel}); err != nil {
-					return TurnResult{}, err
-				}
-				if _, err := input.Emit(turnCtx, NewEntry{Type: "tool_result", Payload: toolResultEntryPayload(call, toolResult), ScopeLabel: input.ScopeLabel}); err != nil {
-					return TurnResult{}, err
-				}
-				messages = append(messages, PiMessage{Role: "tool", Content: text, ToolCallID: call.ID})
-				if !writePiTape(turnCtx, input, TapeRecord{Kind: "message", Harness: "pi", ScopeLabel: input.ScopeLabel, Payload: piTapeMessage(PiMessage{Role: "toolResult", Content: text, ToolCallID: call.ID})}) {
-					result.TapeWriteFailed = true
-				}
-				continue
-			}
-			if knowledgeValidation.halt {
-				loopStopReason = "project knowledge workspace is not ready for validation"
-				toolResult := ToolResult{Content: []ToolContent{{Type: "text", Text: "[system] The project knowledge workspace is not ready; this action was skipped."}}, IsError: true}
-				text := toolResultText(toolResult)
-				if _, err := input.Emit(turnCtx, NewEntry{Type: "tool_call", Payload: callPayloadForPi(call), ScopeLabel: input.ScopeLabel}); err != nil {
-					return TurnResult{}, err
-				}
-				if _, err := input.Emit(turnCtx, NewEntry{Type: "tool_result", Payload: toolResultEntryPayload(call, toolResult), ScopeLabel: input.ScopeLabel}); err != nil {
-					return TurnResult{}, err
-				}
-				messages = append(messages, PiMessage{Role: "tool", Content: text, ToolCallID: call.ID})
-				if !writePiTape(turnCtx, input, TapeRecord{Kind: "message", Harness: "pi", ScopeLabel: input.ScopeLabel, Payload: piTapeMessage(PiMessage{Role: "toolResult", Content: text, ToolCallID: call.ID})}) {
-					result.TapeWriteFailed = true
-				}
-				continue
-			}
+
 			if callIndex >= allowedToolCalls {
 				toolResult := ToolResult{Content: []ToolContent{{Type: "text", Text: "[system] The tool budget was reached. This action was skipped; provide the best supported result now."}}, IsError: true}
 				text := toolResultText(toolResult)
@@ -582,50 +484,21 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 				messages = append(messages, PiMessage{Role: "tool", Content: text, ToolCallID: call.ID})
 				continue
 			}
-			actionKey := piToolActionKey(call)
-			lastActions[actionKey]++
-			if lastActions[actionKey] >= duplicateActionLimit {
-				if !stalledPrompted {
-					stalledPrompted = true
-					if input.OnProgress != nil {
-						input.OnProgress(Progress{ToolCalls: toolCalls, ModelCalls: result.ModelCalls, EvidenceCount: result.EvidenceCount, ModelLimit: modelLimit, ToolLimit: toolLimit, Model: model, Step: step, Phase: "retrying", Strategy: "redirect", Stalled: true})
-					}
-				}
-				toolResult := piRuntimeSkipResult("duplicate_action_skipped", "[system] This identical tool action was skipped after repeated use. Choose a different action that advances the answer.", lastActions[actionKey])
-				text := toolResultText(toolResult)
-				resultPayload := toolResultEntryPayload(call, toolResult)
-				if _, err := input.Emit(turnCtx, NewEntry{Type: "tool_call", Payload: callPayloadForPi(call), ScopeLabel: input.ScopeLabel}); err != nil {
-					return TurnResult{}, err
-				}
-				if _, err := input.Emit(turnCtx, NewEntry{Type: "tool_result", Payload: resultPayload, ScopeLabel: input.ScopeLabel}); err != nil {
-					return TurnResult{}, err
-				}
-				if !writePiTape(turnCtx, input, TapeRecord{Kind: "message", Harness: "pi", ScopeLabel: input.ScopeLabel, Payload: piTapeMessage(PiMessage{Role: "toolResult", Content: text, ToolCallID: call.ID})}) {
-					result.TapeWriteFailed = true
-				}
-				messages = append(messages, PiMessage{Role: "tool", Content: text, ToolCallID: call.ID})
-				if piKnowledgeAction(call) == "submit" {
-					knowledgeSubmitStalls++
-					if knowledgeSubmitStalls >= knowledgeSubmitStallLimit {
-						loopStopReason = "knowledge validation did not advance after repeated incomplete submissions"
-					}
-				}
-				continue
-			}
 			approval := input.ToolApprovalGate != nil && !toolApprovalExempt(call.Name) && !input.ToolApprovalGate(call.Name)
 			callPayload, _ := json.Marshal(map[string]any{"tool": call.Name, "callId": call.ID, "arguments": rawJSONObject(call.Arguments)})
-			if _, err := input.Emit(turnCtx, NewEntry{Type: "tool_call", Payload: callPayload, ScopeLabel: input.ScopeLabel}); err != nil {
-				return TurnResult{}, err
-			}
-			var toolResult ToolResult
-			knowledgeAction := piKnowledgeAction(call)
-			if call.Name == "knowledge" {
-				if knowledgeAction == "submit" {
-					knowledgeFinalizationPrompted = false
+			if parallelResults == nil {
+				if _, err := input.Emit(turnCtx, NewEntry{Type: "tool_call", Payload: callPayload, ScopeLabel: input.ScopeLabel}); err != nil {
+					return TurnResult{}, err
 				}
 			}
-			priorEvidence := result.EvidenceCount
-			if approval {
+			var toolResult ToolResult
+			if parallelResults != nil {
+				toolResult = parallelResults[callIndex]
+			} else if completion.StopReason == "length" || completion.StopReason == "max_tokens" {
+				toolResult = toolError("Model output was truncated; no tool calls from this message were executed. Reissue the complete call.")
+			} else if validationErr := validatePiToolCall(call, definitions); validationErr != nil {
+				toolResult = toolError(validationErr.Error())
+			} else if approval {
 				const reason = "strict posture: this tool call requires human approval"
 				result.PendingApprovals = append(result.PendingApprovals, PendingApproval{Command: call.Name, Reason: reason, Kind: "approval", ApprovalKey: "tool:" + call.Name})
 				result.PausedOnApproval = true
@@ -641,42 +514,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 				}
 			}
 			text := toolResultText(toolResult)
-			if call.Name == "knowledge" {
-				wasBlocked := knowledgeValidation.blocked
-				knowledgeValidation.observe(knowledgeAction, toolResult)
-				if knowledgeValidation.submitComplete && knowledgeValidation.answer == "" {
-					knowledgeValidation.answer = piKnowledgeCallAnswer(call)
-				}
-				if !knowledgeValidation.blocked {
-					knowledgeBlockedAtToolCall = -1
-				} else if !wasBlocked {
-					knowledgeBlockedAtToolCall = toolCalls
-				} else if !toolResult.IsError && piKnowledgeRepairProgress(call, toolResult) {
-					knowledgeBlockedAtToolCall = toolCalls
-				}
-			}
 			result.EvidenceCount += evidenceCountFromDetails(toolResult.Details)
-			if call.Name == "knowledge" {
-				if !toolResult.IsError && (result.EvidenceCount > priorEvidence || piKnowledgeRepairProgress(call, toolResult)) {
-					knowledgeNoProgress = 0
-				} else {
-					knowledgeNoProgress++
-				}
-				if knowledgeAction == "submit" && piKnowledgeSubmitIncomplete(toolResult) {
-					if knowledgeSubmitEvidence == result.EvidenceCount {
-						knowledgeSubmitStalls++
-					} else {
-						knowledgeSubmitEvidence = result.EvidenceCount
-						knowledgeSubmitStalls = 1
-					}
-					if knowledgeSubmitStalls >= knowledgeSubmitStallLimit {
-						loopStopReason = "knowledge validation did not advance after repeated incomplete submissions"
-					}
-				} else if knowledgeAction == "submit" {
-					knowledgeSubmitStalls = 0
-					knowledgeSubmitEvidence = result.EvidenceCount
-				}
-			}
 			resultPayload := toolResultEntryPayload(call, toolResult)
 			if _, err := input.Emit(turnCtx, NewEntry{Type: "tool_result", Payload: resultPayload, ScopeLabel: input.ScopeLabel}); err != nil {
 				return TurnResult{}, err
@@ -688,59 +526,11 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 			}
 			result.Silent = result.Silent || toolResult.Silent
 			terminated = terminated || toolResult.Terminate
-			if knowledgeValidation.halt {
-				loopStopReason = "project knowledge workspace is not ready for validation"
-			}
-		}
-		if loopStopReason == "" && !knowledgeValidation.submitComplete && knowledgeNoProgress >= knowledgeNoProgressLimit {
-			if knowledgeValidation.needsSubmit() && !knowledgeValidation.halt && !knowledgeFinalizationPrompted && !terminated && !result.PausedOnApproval && !result.Silent && result.ModelCalls < modelLimit && toolCalls < toolLimit {
-				knowledgeFinalizationPrompted = true
-				knowledgeNoProgress = 0
-				messages = append(messages, PiMessage{Role: "user", Content: "[system] Knowledge actions have not added evidence. Choose a targeted evidence action or correct the candidate and checks, then call knowledge action=submit. Do not give a definite answer until submit returns complete."})
-				if input.OnProgress != nil {
-					input.OnProgress(Progress{ToolCalls: toolCalls, ModelCalls: result.ModelCalls, EvidenceCount: result.EvidenceCount, ModelLimit: modelLimit, ToolLimit: toolLimit, Model: model, Step: step, Phase: "finalizing", Strategy: "submit", Stalled: true})
-				}
-			} else {
-				loopStopReason = "project knowledge actions did not add new evidence"
-			}
-		}
-		if deferModelText {
-			if !knowledgeValidation.submitComplete && !knowledgeValidation.withholdModelText() {
-				assistantMessage.Content = completion.Text
-				messages[len(messages)-1] = assistantMessage
-			}
-			if !knowledgeValidation.submitComplete {
-				if err := emitBufferedModelContent(); err != nil {
-					return TurnResult{}, err
-				}
-			}
-		}
-		if knowledgeValidation.submitComplete {
-			reply = knowledgeValidation.answer
-			if strings.TrimSpace(reply) == "" {
-				return TurnResult{}, &NonRetryableError{Err: errors.New("complete knowledge submission returned an empty answer")}
-			}
-			if input.OnTextBlockStart != nil {
-				input.OnTextBlockStart()
-			}
-			if input.OnDelta != nil {
-				input.OnDelta(reply)
-			}
-			finalMessage := PiMessage{Role: "assistant", Content: reply}
-			messages = append(messages, finalMessage)
-			if !writePiTape(turnCtx, input, TapeRecord{Kind: "message", Harness: "pi", ScopeLabel: input.ScopeLabel, Payload: piTapeMessage(finalMessage)}) {
-				result.TapeWriteFailed = true
-			}
-			break
+
 		}
 		if terminated || result.PausedOnApproval || result.Silent {
-			terminatedTurn = terminated
 			reply = completion.Text
-			if knowledgeValidation.withholdModelText() {
-				reply = knowledgeValidation.summary()
-				result.CompletionStatus = "incomplete"
-				result.Status = "incomplete"
-			}
+
 			break
 		}
 		if loopStopReason != "" {
@@ -752,9 +542,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 	}
 	if loopStopReason != "" && reply == "" && !result.Silent && !result.PausedOnApproval {
 		result.ToolCalls = toolCalls
-		if knowledgeValidation.withholdModelText() {
-			reply = knowledgeValidation.summary()
-		} else if result.ModelCalls < modelLimit {
+		if result.ModelCalls < modelLimit {
 			result.ModelCalls++
 			reply = a.finalizePiTurn(turnCtx, model, thinkingLevel, input, messages, result, loopStopReason)
 		} else {
@@ -768,9 +556,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 	}
 	if (result.ModelCalls >= modelLimit || toolCalls >= toolLimit) && reply == "" && !result.Silent && !result.PausedOnApproval {
 		result.ToolCalls = toolCalls
-		if knowledgeValidation.withholdModelText() {
-			reply = knowledgeValidation.summary()
-		} else if result.ModelCalls < modelLimit {
+		if result.ModelCalls < modelLimit {
 			result.ModelCalls++
 			reply = a.finalizePiTurn(turnCtx, model, thinkingLevel, input, messages, result, "execution budget reached")
 		} else {
@@ -781,34 +567,7 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 		result.NextAction = "continue verification"
 		result.Partial = reply
 	}
-	if !result.Silent && !result.PausedOnApproval && !terminatedTurn && strings.TrimSpace(reply) == "" {
-		result.ToolCalls = toolCalls
-		if knowledgeValidation.withholdModelText() {
-			reply = knowledgeValidation.summary()
-		} else if result.ModelCalls < modelLimit {
-			result.ModelCalls++
-			reply = a.finalizePiTurn(turnCtx, model, thinkingLevel, input, messages, result, "the model returned no final text")
-		} else {
-			reply = staticPiIncompleteSummary(result)
-		}
-		if strings.TrimSpace(reply) == "" {
-			return TurnResult{}, &NonRetryableError{Err: errors.New("pi returned an empty final response")}
-		}
-		result.CompletionStatus = "incomplete"
-		result.Reason = "the model returned no final text after tool execution"
-		result.NextAction = "retry with another model"
-		result.Partial = reply
-	}
-	if knowledgeValidation.withholdModelText() && !result.Silent {
-		reply = knowledgeValidation.summary()
-		result.CompletionStatus = "incomplete"
-		result.Status = "incomplete"
-		if result.Reason == "" {
-			result.Reason = knowledgeValidation.reason()
-		}
-		result.NextAction = "补充未确认条件的证据后重新核验"
-		result.Partial = reply
-	}
+
 	if result.CompletionStatus == "" {
 		result.CompletionStatus = "ok"
 	}
@@ -834,12 +593,6 @@ func (a *PiAdapter) RunTurn(ctx context.Context, input TurnInput) (TurnResult, e
 	return result, nil
 }
 
-func piToolActionKey(call ToolCall) string {
-	arguments := rawJSONObject(call.Arguments)
-	encoded, _ := json.Marshal(arguments)
-	return call.Name + "\x00" + string(encoded)
-}
-
 func piKnowledgeAction(call ToolCall) string {
 	if call.Name != "knowledge" {
 		return ""
@@ -851,257 +604,6 @@ func piKnowledgeAction(call ToolCall) string {
 		return ""
 	}
 	return strings.ToLower(strings.TrimSpace(input.Action))
-}
-
-func piKnowledgeEvidenceAction(action string) bool {
-	switch action {
-	case "read", "follow_links", "graph":
-		return true
-	default:
-		return false
-	}
-}
-
-func piKnowledgeCandidateSearch(call ToolCall) bool {
-	if call.Name != "knowledge" {
-		return false
-	}
-	var input struct {
-		Action        string `json:"action"`
-		Candidate     string `json:"candidate"`
-		RequirementID string `json:"requirement_id"`
-	}
-	if json.Unmarshal(call.Arguments, &input) != nil {
-		return false
-	}
-	return strings.EqualFold(strings.TrimSpace(input.Action), "search") && strings.TrimSpace(input.Candidate) != "" && strings.TrimSpace(input.RequirementID) != ""
-}
-
-func piKnowledgeRepairProgress(call ToolCall, result ToolResult) bool {
-	action := piKnowledgeAction(call)
-	if piKnowledgeEvidenceAction(action) {
-		return true
-	}
-	return piKnowledgeCandidateSearchReturnedResults(call, result)
-}
-
-// Candidate-specific searches are only repair progress when they actually
-// return a result. A zero-result search is meaningful for a negative
-// requirement, but treating every such search as progress lets a model cycle
-// through paraphrases forever without reaching submit/blocked convergence.
-func piKnowledgeCandidateSearchReturnedResults(call ToolCall, result ToolResult) bool {
-	if !piKnowledgeCandidateSearch(call) || result.IsError || len(result.Details) == 0 || string(result.Details) == "null" {
-		return false
-	}
-	var details struct {
-		Action  string            `json:"action"`
-		Sources []json.RawMessage `json:"sources"`
-	}
-	if json.Unmarshal(result.Details, &details) != nil {
-		return false
-	}
-	if action := strings.TrimSpace(details.Action); action != "" && !strings.EqualFold(action, "search") {
-		return false
-	}
-	return len(details.Sources) > 0
-}
-
-func piKnowledgeSubmitIncomplete(result ToolResult) bool {
-	var value struct {
-		Status string `json:"status"`
-	}
-	if json.Unmarshal([]byte(toolResultText(result)), &value) != nil {
-		return false
-	}
-	return strings.EqualFold(strings.TrimSpace(value.Status), "incomplete")
-}
-
-func piRuntimeSkipResult(code, message string, attempts int) ToolResult {
-	details, _ := json.Marshal(map[string]any{
-		"kind":      "runtime",
-		"errorCode": code,
-		"attempts":  attempts,
-		"retryable": false,
-	})
-	return ToolResult{Content: []ToolContent{{Type: "text", Text: message}}, Details: details, IsError: true}
-}
-
-func piKnowledgeCallAnswer(call ToolCall) string {
-	if call.Name != "knowledge" {
-		return ""
-	}
-	var input struct {
-		Action string `json:"action"`
-		Answer string `json:"answer"`
-	}
-	if json.Unmarshal(call.Arguments, &input) != nil || !strings.EqualFold(strings.TrimSpace(input.Action), "submit") {
-		return ""
-	}
-	return strings.TrimSpace(input.Answer)
-}
-
-func (s *piKnowledgeValidation) noteCall(action string) {
-	if s == nil {
-		return
-	}
-	s.knowledgeUsed = true
-	if action == "" {
-		s.status = "incomplete"
-	}
-}
-
-func (s piKnowledgeValidation) needsSubmit() bool {
-	return s.knowledgeUsed && !s.submitComplete
-}
-
-func (s piKnowledgeValidation) withholdModelText() bool {
-	return s.blocked || s.needsSubmit()
-}
-
-func (s *piKnowledgeValidation) observe(action string, result ToolResult) {
-	s.noteCall(action)
-	payloads := make([]piKnowledgeResultPayload, 0, 2)
-	for _, raw := range []json.RawMessage{json.RawMessage(toolResultText(result)), result.Details} {
-		var payload piKnowledgeResultPayload
-		if len(raw) > 0 && json.Unmarshal(raw, &payload) == nil {
-			payloads = append(payloads, payload)
-		}
-	}
-	status := ""
-	answer := ""
-	code := ""
-	workspaceStatus := ""
-	var unresolved []string
-	var issues []string
-	for _, payload := range payloads {
-		if action == "submit" && len(payload.Requirements) > 0 {
-			s.requirementText = make(map[string]string, len(payload.Requirements))
-			for _, requirement := range payload.Requirements {
-				s.requirementText[requirement.ID] = requirement.Text
-			}
-		}
-		if value := strings.ToLower(strings.TrimSpace(payload.Status)); value != "" {
-			status = value
-		}
-		if value := strings.TrimSpace(payload.Answer); value != "" {
-			answer = value
-		}
-		if value := strings.ToLower(strings.TrimSpace(payload.Code)); value != "" {
-			code = value
-		}
-		if value := strings.ToLower(strings.TrimSpace(payload.Workspace.Status)); value != "" {
-			workspaceStatus = value
-		}
-		if value := strings.ToLower(strings.TrimSpace(payload.WorkspaceStatus)); value != "" {
-			workspaceStatus = value
-		}
-		unresolved = appendUniqueStrings(unresolved, payload.UnresolvedRequirementIDs...)
-		for _, issue := range payload.ValidationIssues {
-			issues = appendUniqueStrings(issues, issue.Code)
-		}
-	}
-	if action == "submit" && status == "complete" && !result.IsError {
-		s.blocked = false
-		s.halt = false
-		s.submitComplete = true
-		s.answer = answer
-		s.status = ""
-		s.unresolvedRequirementIDs = nil
-		s.validationIssueCodes = nil
-		return
-	}
-	if action == "submit" && status == "incomplete" {
-		s.block("submit=incomplete", unresolved, issues, false)
-		return
-	}
-	switch code {
-	case "knowledge_unavailable":
-		if action == "status" {
-			s.block("unavailable", unresolved, issues, true)
-		}
-		return
-	case "knowledge_empty":
-		s.block("empty", unresolved, issues, true)
-		return
-	case "knowledge_failed":
-		s.block("failed", unresolved, issues, true)
-		return
-	}
-	if result.IsError {
-		if action == "status" {
-			s.block("failed", unresolved, issues, true)
-		}
-		return
-	}
-	for _, value := range []string{status, workspaceStatus} {
-		switch value {
-		case "empty":
-			s.block("empty", unresolved, issues, true)
-			return
-		case "queued", "processing", "pending":
-			s.block("pending", unresolved, issues, true)
-			return
-		case "failed":
-			s.block("failed", unresolved, issues, true)
-			return
-		}
-	}
-}
-
-func (s *piKnowledgeValidation) block(status string, unresolved, issues []string, halt bool) {
-	s.blocked = true
-	s.halt = s.halt || halt
-	s.status = status
-	if len(unresolved) > 0 {
-		s.unresolvedRequirementIDs = append([]string(nil), unresolved...)
-	}
-	if len(issues) > 0 {
-		s.validationIssueCodes = append([]string(nil), issues...)
-	}
-}
-
-func (s piKnowledgeValidation) reason() string {
-	if s.needsSubmit() && !s.blocked {
-		return "project knowledge validation requires a complete submit"
-	}
-	return "project knowledge validation remains " + firstNonEmpty(s.status, "incomplete")
-}
-
-func (s piKnowledgeValidation) summary() string {
-	lines := []string{"目前的项目证据还不足以确认答案。"}
-	if len(s.unresolvedRequirementIDs) > 0 {
-		labels := make([]string, 0, len(s.unresolvedRequirementIDs))
-		for _, id := range s.unresolvedRequirementIDs {
-			label := id
-			if text := strings.TrimSpace(s.requirementText[id]); text != "" {
-				label += "（" + text + "）"
-			}
-			labels = append(labels, label)
-		}
-		lines = append(lines, "尚未确认的条件："+strings.Join(labels, "、")+"。")
-	}
-	if s.halt {
-		lines = append(lines, "项目知识暂时不可用，相关事实仍需核实。")
-	} else {
-		lines = append(lines, "需要补充这些条件的原文或关系证据后，才能给出确定结论。")
-	}
-	return strings.Join(lines, "\n")
-}
-
-func appendUniqueStrings(values []string, candidates ...string) []string {
-	seen := make(map[string]bool, len(values)+len(candidates))
-	for _, value := range values {
-		seen[value] = true
-	}
-	for _, candidate := range candidates {
-		candidate = strings.TrimSpace(candidate)
-		if candidate == "" || seen[candidate] {
-			continue
-		}
-		seen[candidate] = true
-		values = append(values, candidate)
-	}
-	return values
 }
 
 func callPayloadForPi(call ToolCall) json.RawMessage {
@@ -1314,80 +816,11 @@ func estimatePiTokens(system string, messages []PiMessage) int {
 	characters := len(system)
 	for _, message := range messages {
 		characters += len(message.Content)
+		for _, call := range message.ToolCalls {
+			characters += len(call.ID) + len(call.Name) + len(call.Arguments)
+		}
 	}
 	return (characters + 3) / 4
-}
-
-func compactPiMessages(messages []PiMessage, limit int) []PiMessage {
-	if limit <= 0 {
-		return messages
-	}
-	result := append([]PiMessage(nil), messages...)
-	total := piMessageChars(result)
-	if total <= limit {
-		return result
-	}
-	protected := max(0, len(result)-piRecentFullMessageCount)
-	for index := 0; index < protected && total > limit; index++ {
-		content := result[index].Content
-		if len(content) <= piOldMessageCharLimit {
-			continue
-		}
-		compacted := compactPiMessageContent(content, piOldMessageCharLimit)
-		total -= len(content) - len(compacted)
-		result[index].Content = compacted
-	}
-	if total <= limit {
-		return result
-	}
-	// If a single recent evidence block is exceptionally large, trim the oldest
-	// remaining content while preserving tool-call structure and recent turns.
-	for index := protected; index < len(result) && total > limit; index++ {
-		content := result[index].Content
-		if len(content) == 0 {
-			continue
-		}
-		remaining := max(256, len(content)-(total-limit))
-		if remaining >= len(content) {
-			continue
-		}
-		compacted := compactPiMessageContent(content, remaining)
-		total -= len(content) - len(compacted)
-		result[index].Content = compacted
-	}
-	if total > limit {
-		keepRecent := min(4, len(result))
-		for index := 0; index < len(result)-keepRecent && total > limit; index++ {
-			content := result[index].Content
-			if len(content) == 0 {
-				continue
-			}
-			compacted := compactPiMessageContent(content, 64)
-			total -= len(content) - len(compacted)
-			result[index].Content = compacted
-		}
-	}
-	return result
-}
-
-func piMessageChars(messages []PiMessage) int {
-	total := 0
-	for _, message := range messages {
-		total += len(message.Content)
-		for _, call := range message.ToolCalls {
-			total += len(call.Name) + len(call.ID) + len(call.Arguments)
-		}
-	}
-	return total
-}
-
-func compactPiMessageContent(content string, limit int) string {
-	if limit <= 0 || len(content) <= limit {
-		return content
-	}
-	head := limit * 2 / 3
-	tail := limit - head
-	return content[:head] + "\n[… earlier tool output compacted …]\n" + content[len(content)-tail:]
 }
 
 func historyEntryCount(raw json.RawMessage) int {

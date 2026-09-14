@@ -1,0 +1,174 @@
+{
+  "version": "0.85.1",
+  "commit": "d981de1229ef899957bbe968bc8dcda02a21f477",
+  "cases": [
+    {
+      "name": "complete submit continues",
+      "modelCalls": 2,
+      "executed": [
+        "1"
+      ],
+      "reply": "model final",
+      "events": [
+        "agent_start",
+        "turn_start",
+        "message_start",
+        "message_end",
+        "message_start",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_end",
+        "message_start",
+        "message_end",
+        "turn_end",
+        "turn_start",
+        "message_start",
+        "message_end",
+        "turn_end",
+        "agent_end"
+      ]
+    },
+    {
+      "name": "incomplete submit continues",
+      "modelCalls": 2,
+      "executed": [
+        "1"
+      ],
+      "reply": "evidence is insufficient",
+      "events": [
+        "agent_start",
+        "turn_start",
+        "message_start",
+        "message_end",
+        "message_start",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_end",
+        "message_start",
+        "message_end",
+        "turn_end",
+        "turn_start",
+        "message_start",
+        "message_end",
+        "turn_end",
+        "agent_end"
+      ]
+    },
+    {
+      "name": "recoverable error",
+      "modelCalls": 3,
+      "executed": [
+        "1",
+        "2"
+      ],
+      "reply": "model final",
+      "events": [
+        "agent_start",
+        "turn_start",
+        "message_start",
+        "message_end",
+        "message_start",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_end",
+        "message_start",
+        "message_end",
+        "turn_end",
+        "turn_start",
+        "message_start",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_end",
+        "message_start",
+        "message_end",
+        "turn_end",
+        "turn_start",
+        "message_start",
+        "message_end",
+        "turn_end",
+        "agent_end"
+      ]
+    },
+    {
+      "name": "repeated calls",
+      "modelCalls": 2,
+      "executed": [
+        "1",
+        "2",
+        "3",
+        "4"
+      ],
+      "reply": "model final",
+      "events": [
+        "agent_start",
+        "turn_start",
+        "message_start",
+        "message_end",
+        "message_start",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_end",
+        "message_start",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_end",
+        "message_start",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_end",
+        "message_start",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_end",
+        "message_start",
+        "message_end",
+        "turn_end",
+        "turn_start",
+        "message_start",
+        "message_end",
+        "turn_end",
+        "agent_end"
+      ]
+    },
+    {
+      "name": "truncated arguments",
+      "modelCalls": 2,
+      "executed": [],
+      "reply": "model final",
+      "events": [
+        "agent_start",
+        "turn_start",
+        "message_start",
+        "message_end",
+        "message_start",
+        "message_end",
+        "tool_execution_start",
+        "tool_execution_end",
+        "message_start",
+        "message_end",
+        "turn_end",
+        "turn_start",
+        "message_start",
+        "message_end",
+        "turn_end",
+        "agent_end"
+      ]
+    },
+    {
+      "name": "empty model end",
+      "modelCalls": 1,
+      "executed": [],
+      "reply": "",
+      "events": [
+        "agent_start",
+        "turn_start",
+        "message_start",
+        "message_end",
+        "message_start",
+        "message_end",
+        "turn_end",
+        "agent_end"
+      ]
+    }
+  ]
+}

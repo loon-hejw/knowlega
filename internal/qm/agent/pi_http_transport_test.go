@@ -157,3 +157,14 @@ func TestAnthropicPiThinkingMatchesLegacyAndAdaptiveModes(t *testing.T) {
 		t.Fatalf("disabled=%#v", disabled)
 	}
 }
+
+func TestPiTransportKeepsOutputStopReasonSeparateFromRequestCapture(t *testing.T) {
+	c, err := parseOpenAIPiResponse([]byte(`{"choices":[{"finish_reason":"length","message":{"tool_calls":[{"id":"1","function":{"name":"read","arguments":"{}"}}]}}]}`))
+	if err != nil || c.StopReason != "length" || c.Truncated {
+		t.Fatalf("completion=%+v err=%v", c, err)
+	}
+	c, err = parseAnthropicPiResponse([]byte(`{"stop_reason":"max_tokens","content":[{"type":"tool_use","id":"1","name":"read","input":{}}]}`))
+	if err != nil || c.StopReason != "max_tokens" {
+		t.Fatalf("completion=%+v err=%v", c, err)
+	}
+}
