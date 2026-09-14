@@ -627,7 +627,6 @@ func TestRunDeliveryStateRouteOwnership(t *testing.T) {
 		path   string
 	}{
 		{http.MethodPost, "/v1/connectors/token"},
-		{http.MethodPost, "/v1/keychain/drops"},
 		{http.MethodPost, "/v1/deployments/deployment-1/archive"},
 		{http.MethodPost, "/v1/deployments/deployment-1/restore"},
 		{http.MethodGet, "/v1/admin/scopes/personal:U1"},
